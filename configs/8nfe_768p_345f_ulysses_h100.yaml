@@ -6,7 +6,7 @@
 # is the factor to apply when comparing the 480p result to a published H200 number.
 #
 #   torchrun --standalone --nproc_per_node=8 src/inference/infer_ulysses.py \
-#       --config configs/inference/8nfe_768p_144s_ulysses_h100.yaml \
+#       --config configs/inference/8nfe_768p_345f_ulysses_h100.yaml \
 #       checkpoint=ckpts/stage-dmd-step-250 \
 #       render.prompt_file=prompts/example_2.pt render.out=results/768p_144s.mp4
 

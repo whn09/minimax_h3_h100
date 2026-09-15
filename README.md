@@ -31,20 +31,34 @@ The model is **`ckpts/stage-dmd-step-250`** = VDN-H3-8-step, the Stage-DMD disti
 
 ## What had to change for this box
 
-Two patches, in `patches/`. Both are needed; neither is upstream.
+Three patches, in `patches/`. All are needed; none is upstream. Patch 1 is about the
+workload; patches 2 and 3 are both the same underlying fact — **80 GiB is not 141 GiB**,
+and Ulysses replicates the whole DiT on every rank — showing up at two different moments.
 
 | # | patch | why |
 |---|---|---|
 | 1 | `0001-vdn-render-resolution-as-a-config-field.patch` | **480P does not exist upstream.** `src/inference/render.py` hardcodes `LATENT_H, LATENT_W = 48, 84` — the 768x1344 canvas — as a module constant. Everything downstream is already resolution-agnostic (the softmax window is per *frame*, the layout carries its own spatial grid, Ulysses shards by row), so this only lifts the constant into `render.height` / `render.width` and threads it through both entrypoints, with a `latent_grid()` that rejects anything not a multiple of 32 (16x VAE, then the 2x2 transformer patch) |
 | 2 | `0002-vdn-assemble-and-quantise-on-the-host.patch` | **fp8 assembly does not fit 80 GB.** Ulysses shards the sequence, not the weights, so every rank replicates the whole DiT: 63 GiB in bf16, ~78 GiB once the hybrid branch and the two `stage-dmd-step-250` LoRAs are merged. `convert_linear_to_fp8` then needs one Linear's bf16 weight *and* its fp8 copy alive together — about 1 GiB more than an H100 has. It fits a 141 GiB H200, which is why upstream never hit it. The patch assembles and quantises **on the host** and moves only the finished model to the card. Order is untouched (transform → branch → LoRA → fp8) and every step is elementwise or a small matmul, so the weights come out identical; only the device the arithmetic ran on differs. Without fp8 there is nothing to gain, so the released bf16 path is left exactly as it was |
 
-The failure patch 2 fixes, for the record:
+| 3 | `0003-vdn-load-ulysses-decoders-after-denoising.patch` | **the decoders do not fit next to a 768p render.** `install_ulysses` gives every rank the same transformer (55.5 GiB in fp8 at 768p) but only the main rank loads the video and audio VAEs, and those are ~11 GiB. That leaves rank 0 about 13 GiB for activations where a block wants 10.33 GiB plus everything already live — so **rank 0 dies and ranks 1–7 finish**. The decoders are idle during the loop, so load them when they are first needed. `denoise_seconds` is untouched (the VAE never runs during denoising), and the load is timed as its own `decoder_load_seconds` so nothing is hidden by the move |
+
+The two failures, for the record. Patch 2's, during assembly:
 
 ```
 torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 294.00 MiB. GPU 5 has a
 total capacity of 79.18 GiB of which 24.06 MiB is free.
   File "src/models/ops/fp8_linear.py", line 263, in __init__
 ```
+
+Patch 3's, at 768p, on rank 0 only, after patch 2 had already done its job:
+
+```
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 10.33 GiB. GPU 0
+has a total capacity of 79.18 GiB of which 8.69 GiB is free.
+  File "src/models/ops/fused_block.py", line 106, in fast_block_forward
+```
+
+480p needs only patches 1 and 2 — it has the headroom. 768p needs all three.
 
 **H100 is sm90, the same compute capability as H200**, so every *kernel* choice in
 upstream's H200 config carries over untouched: `softmax_backend: flex` is the FA4-CuTe

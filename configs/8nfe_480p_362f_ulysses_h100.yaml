@@ -1,0 +1,34 @@
+# 480p at 362 frames = 15.083 s: the smallest clip that actually REACHES 15 seconds.
+#
+#   torchrun --standalone --nproc_per_node=8 src/inference/infer_ulysses.py \
+#       --config configs/inference/8nfe_480p_362f_ulysses_h100.yaml \
+#       checkpoint=ckpts/stage-dmd-step-250 \
+#       render.prompt_file=prompts/example_2.pt render.out=results/480p_362f.mp4
+#
+# Identical to 8nfe_480p_345f_ulysses_h100.yaml apart from num_frames. That file is the
+# one to quote against upstream's published 768p number, because it holds the clip length
+# fixed at their 14.375 s and moves only the canvas. This file is the one to quote when
+# the requirement is literally "15 seconds", since 14.375 s is short of it and
+# align_num_frames(n, 17, 5) offers nothing between the two.
+
+kernels:
+  inference_kernels: true
+  softmax_backend: flex
+
+precision:
+  fp8:
+    enabled: true
+    skip_end_blocks: 0
+
+parallel:
+  softmax_ranks: 0
+  profile: false
+
+render:
+  height: 480
+  width: 864
+  num_frames: 362      # already aligned: 362 = 5 + 17*21 -> 107 latent frames
+  num_steps: 8
+  warmup_steps: 2
+  video_shift: 12.0
+  audio_shift: 3.0

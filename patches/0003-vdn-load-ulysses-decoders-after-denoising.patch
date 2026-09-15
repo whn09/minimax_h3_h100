@@ -1,0 +1,119 @@
+From 6120dae0d0fd2cb283e8f91f7e2cc99d3bb6dae7 Mon Sep 17 00:00:00 2001
+From: vdn-h100 <none@local>
+Date: Tue, 15 Sep 2026 10:39:04 +0800
+Subject: [PATCH 3/3] vdn: load the Ulysses decoders after denoising, not
+ before
+
+At 768p on an 80 GiB card rank 0 dies and ranks 1-7 do not:
+
+  [rank0]: torch.OutOfMemoryError: Tried to allocate 10.33 GiB.
+  GPU 0 has a total capacity of 79.18 GiB of which 8.69 GiB is free.
+    File "src/models/ops/fused_block.py", line 106, in fast_block_forward
+
+The asymmetry is the decoders. install_ulysses gives every rank the same
+transformer -- 55.5 GiB in fp8 at 768p -- but only the main rank loads the video
+and audio VAEs, and those are ~11 GiB. That leaves rank 0 about 13 GiB for
+activations where a block wants 10.33 GiB plus everything already live.
+
+The decoders do nothing during the denoising loop, so load them when they are
+first needed instead. Rank 0 then has the same headroom as every other rank.
+Timed as its own `decoder_load_seconds` rather than folded into setup or decode,
+so nothing is hidden by the move; `denoise_seconds` is untouched, which is what
+the published comparison is measured on.
+
+A 141 GiB H200 fits both at once, which is why upstream loads them up front.
+src/inference/infer.py is single-GPU and unchanged.
+---
+ src/inference/infer_ulysses.py | 17 +++++++++++++----
+ src/inference/render.py        | 18 ++++++++++++++++--
+ 2 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
+index 7a14b0d..288ea42 100644
+--- a/src/inference/infer_ulysses.py
++++ b/src/inference/infer_ulysses.py
+@@ -36,7 +36,7 @@ from src.inference.utils.assemble import (
+     write_json,
+ )
+ from src.inference.render import (decode_and_save, generate_latents, latent_grid,
+-                                  load_prompt)
++                                  load_decoders_only, load_prompt)
+ from src.inference.utils.ulysses import init_ulysses, install_ulysses
+ 
+ 
+@@ -57,9 +57,11 @@ def main():
+     device = runtime.device
+     torch.set_grad_enabled(False)
+ 
+-    model = build_inference_model(
+-        cfg, device, load_decoders=runtime.is_main, log=runtime.is_main
+-    )
++    # No rank loads decoders here, not even the main one: they are ~11 GiB, they are idle
++    # until the loop is over, and on an 80 GiB card at 768p they are the difference between
++    # rank 0 finishing and rank 0 dying in a block's activations while ranks 1-7 are fine.
++    # Loaded below, after denoising, and timed separately so the split stays visible.
++    model = build_inference_model(cfg, device, load_decoders=False, log=runtime.is_main)
+     if not model.is_hybrid:
+         raise ValueError("Ulysses path currently requires a HybridAttention checkpoint")
+ 
+@@ -137,6 +139,12 @@ def main():
+         os.makedirs(os.path.dirname(lpath) or ".", exist_ok=True)
+         torch.save({"video": latents.cpu(), "audio": audio_latents.cpu()}, lpath)
+ 
++    # The denoising activations are gone by now, so the decoders have room.
++    decoder_load_started = time.perf_counter()
++    if runtime.is_main:
++        model.vae, model.audio_vae = load_decoders_only(cfg.vae_source, str(device))
++    timings["decoder_load_seconds"] = time.perf_counter() - decoder_load_started
++
+     decode_started = time.perf_counter()
+     if runtime.is_main:
+         decode_and_save(
+@@ -174,6 +182,7 @@ def main():
+             f"denoise {timings['denoise_seconds']:.2f}s "
+             f"({timings['seconds_per_step']:.2f}s/step; per NFE "
+             + " ".join(f"{x:.2f}" for x in timings["step_seconds"]) + "), "
++            f"decoder load {timings['decoder_load_seconds']:.2f}s, "
+             f"decode+encode {timings['decode_and_encode_seconds']:.2f}s, "
+             f"E2E {timings['end_to_end_seconds']:.2f}s",
+             flush=True,
+diff --git a/src/inference/render.py b/src/inference/render.py
+index cb1ead0..7587aa7 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -62,7 +62,6 @@ def load_models(model_root: str, device: str, vae_source: str = None,
+     `transformer_device` puts the transformer somewhere other than the decoders --
+     "cpu", so that assembly and fp8 quantisation happen on the host and only the
+     finished model is moved to an 80 GiB card (see build_inference_model)."""
+-    vae_source = resolve_weights(vae_source or DEFAULT_MODEL_ROOT)
+     model_root = resolve_weights(model_root)
+     transformer = MiniMaxH3Transformer3DModel.from_pretrained(
+         model_root, subfolder="transformer", torch_dtype=torch.bfloat16
+@@ -72,11 +71,26 @@ def load_models(model_root: str, device: str, vae_source: str = None,
+     if not load_decoders:
+         return transformer, None, None
+ 
++    vae, audio_vae = load_decoders_only(vae_source, device)
++    return transformer, vae, audio_vae
++
++
++def load_decoders_only(vae_source: str, device: str):
++    """The two decoders, without touching the transformer -- for loading them AFTER the
++    denoising loop instead of before it.
++
++    Under Ulysses only the main rank carries decoders, and they are ~11 GiB. At 768p on
++    an 80 GiB card that is exactly what does not fit: the fp8 transformer lands at
++    55.5 GiB, and a block's activations want 10.33 GiB, so rank 0 dies where ranks 1-7
++    are fine. The decoders are idle during denoising, so keeping them off the card until
++    the loop is over costs nothing and evens the ranks out. A 141 GiB H200 has room for
++    both, which is why upstream loads them up front."""
++    vae_source = resolve_weights(vae_source or DEFAULT_MODEL_ROOT)
+     vae = AutoencoderKLMiniMaxH3.from_pretrained(vae_source, subfolder="vae").to(device)
+     audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(vae_source, subfolder="audio_vae").to(device)
+     vae.eval()
+     audio_vae.eval()
+-    return transformer, vae, audio_vae
++    return vae, audio_vae
+ 
+ 
+ def load_prompt(prompt_file: str, device: str):

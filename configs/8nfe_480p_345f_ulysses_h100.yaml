@@ -1,0 +1,52 @@
+# THE DELIVERABLE: 480p, 345 frames (14.375 s), 8 NFE, 8x H100 80GB (p5.48xlarge).
+#
+#   torchrun --standalone --nproc_per_node=8 src/inference/infer_ulysses.py \
+#       --config configs/inference/8nfe_480p_345f_ulysses_h100.yaml \
+#       checkpoint=ckpts/stage-dmd-step-250 \
+#       render.prompt_file=prompts/example_2.pt render.out=results/480p_345f.mp4
+#
+# 345 frames, not 362, so this differs from upstream's published 768p number in EXACTLY
+# ONE variable: the canvas. Same clip length, same step count, same checkpoint, same
+# kernels. 362 frames (15.083 s) is the smallest clip that actually reaches 15 s and is
+# measured too -- see 8nfe_480p_362f_ulysses_h100.yaml -- but it cannot be compared to a
+# published number without moving two things at once.
+#
+# The frame count is not free-form: align_num_frames(n, 17, 5) snaps up to the VAE's
+# 17-frames-to-5-latents chunking, so the reachable lengths are 5 + 17k frames. Around
+# 15 s that is 345 (14.375 s) or 362 (15.083 s), with nothing in between.
+#
+# Differences from the upstream 8nfe_tuned_fp8_ulysses_h200.yaml:
+#   * render.height/width 480x864 instead of the released 768x1344 -- needs
+#     patches/0001-vdn-render-resolution-as-a-config-field.patch, which turns
+#     render.py's hardcoded LATENT_H, LATENT_W = 48, 84 into a config field.
+#   * parallel.softmax_ranks is a sweep variable, not a constant. The H200 file's 6+2 was
+#     tuned on a 104k-row 768p sequence; 480p is 44k rows, and measured here the split
+#     that file recommends is NOT the fastest one -- see RESULTS.md. The value below is
+#     whatever won; scripts/h100_grid.sh is what decides it.
+#
+# H100 is sm90, the same capability H200 is, so every kernel choice in the upstream H200
+# file carries over unchanged: `softmax_backend: flex` is the FA4-CuTe static variant and
+# fp8 e4m3 uses rowwise scale granularity on sm90. What differs is HBM (80 vs 141 GB) and
+# bandwidth (3.35 vs 4.8 TB/s), neither of which changes which kernel is correct.
+
+kernels:
+  inference_kernels: true
+  softmax_backend: flex
+
+precision:
+  fp8:
+    enabled: true
+    skip_end_blocks: 0
+
+parallel:
+  softmax_ranks: 0     # standard Ulysses; measured faster than 6+2 at this size
+  profile: false
+
+render:
+  height: 480
+  width: 864
+  num_frames: 345      # -> 345 frames = 14.375 s, upstream's clip length exactly
+  num_steps: 8
+  warmup_steps: 2
+  video_shift: 12.0
+  audio_shift: 3.0
