@@ -1,0 +1,1 @@
+upstream base: 2f740c9291431d89d4f2330743b093fac4390d09  (github.com/OpenVDN/vdn-minimax-h3)

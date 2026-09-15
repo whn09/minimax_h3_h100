@@ -1,0 +1,33 @@
+# CONTROL: the upstream 768p / 14.4 s headline workload, re-measured on H100 so the 480p
+# number has an anchor in the published table. Upstream reports 2.29 s/NFE on 8x H200 and
+# 1.40 s/NFE on 8x B200 for exactly this shape; this file is equivalent to their
+# 8nfe_tuned_fp8_ulysses_h200.yaml apart from carrying the (default) height/width
+# explicitly. Any gap here is the H100-vs-H200 gap, measured rather than assumed, and it
+# is the factor to apply when comparing the 480p result to a published H200 number.
+#
+#   torchrun --standalone --nproc_per_node=8 src/inference/infer_ulysses.py \
+#       --config configs/inference/8nfe_768p_144s_ulysses_h100.yaml \
+#       checkpoint=ckpts/stage-dmd-step-250 \
+#       render.prompt_file=prompts/example_2.pt render.out=results/768p_144s.mp4
+
+kernels:
+  inference_kernels: true
+  softmax_backend: flex
+
+precision:
+  fp8:
+    enabled: true
+    skip_end_blocks: 0
+
+parallel:
+  softmax_ranks: 6
+  profile: false
+
+render:
+  height: 768
+  width: 1344
+  num_frames: 345      # -> 345 frames = 14.375 s, the upstream headline workload
+  num_steps: 8
+  warmup_steps: 2
+  video_shift: 12.0
+  audio_shift: 3.0

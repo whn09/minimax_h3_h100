@@ -1,0 +1,6 @@
+# artifacts pulled off the box; the mp4s and logs live under runs/ when they are evidence
+out/
+*.log
+.DS_Store
+__pycache__/
+ckpts/

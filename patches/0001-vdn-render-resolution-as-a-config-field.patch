@@ -1,0 +1,183 @@
+diff --git a/src/config/inference.py b/src/config/inference.py
+index 6b881e8..7d56c95 100644
+--- a/src/config/inference.py
++++ b/src/config/inference.py
+@@ -75,6 +75,13 @@ class RenderConfig:
+     prompt_file: str = MISSING
+     out: str = MISSING
+     num_frames: int = 345
++    height: int = 768                    # pixel canvas. The release is 768x1344 ("768p");
++    width: int = 1344                    # 480p is 480x864. Both must be a multiple of 32
++                                         # (the 16x VAE then the 2x2 transformer patch),
++                                         # enforced by src.inference.render.latent_grid.
++                                         # H3-Base is trained at 768p, so any other
++                                         # canvas is out of distribution -- it renders,
++                                         # but there is no reference output for it.
+     num_steps: int = 50
+     warmup_steps: int = 0                # NFE run and discarded first: 2 for any timing
+                                          # (compile + the 2nd-timestep re-specialisation)
+diff --git a/src/inference/infer.py b/src/inference/infer.py
+index ec54dda..29fa966 100644
+--- a/src/inference/infer.py
++++ b/src/inference/infer.py
+@@ -21,7 +21,8 @@ from src.config.inference import (InferenceConfig, validate_ablation, validate_k
+                                   validate_single_process)
+ from src.inference.utils.assemble import (build_inference_model, latents_path, render_record,
+                                     write_json)
+-from src.inference.render import decode_and_save, generate_latents, load_prompt
++from src.inference.render import (decode_and_save, generate_latents, latent_grid,
++                                  load_prompt)
+ 
+ 
+ def main():
+@@ -30,6 +31,9 @@ def main():
+     device = cfg.render.device
+     torch.set_grad_enabled(False)
+ 
++    latent_hw = latent_grid(cfg.render.height, cfg.render.width)
++    print(f"canvas {cfg.render.height}x{cfg.render.width} -> latent {latent_hw[0]}x{latent_hw[1]}", flush=True)
++
+     model = build_inference_model(cfg, device)
+     prompt_embeds, text_token_tags, conditions = load_prompt(cfg.render.prompt_file, device)
+     if conditions:
+@@ -42,14 +46,14 @@ def main():
+             model.transformer, prompt_embeds, text_token_tags,
+             cfg.render.num_frames, cfg.render.warmup_steps, cfg.render.seed, device,
+             video_shift=cfg.render.video_shift, audio_shift=cfg.render.audio_shift,
+-            conditions=conditions)
++            conditions=conditions, latent_hw=latent_hw)
+ 
+     step_seconds: list[float] = []
+     latents, audio_latents = generate_latents(
+         model.transformer, prompt_embeds, text_token_tags,
+         cfg.render.num_frames, cfg.render.num_steps, cfg.render.seed, device,
+         video_shift=cfg.render.video_shift, audio_shift=cfg.render.audio_shift,
+-        step_seconds=step_seconds, conditions=conditions)
++        step_seconds=step_seconds, conditions=conditions, latent_hw=latent_hw)
+ 
+     denoise = sum(step_seconds)
+     print(f"timing: denoise {denoise:.2f}s ({denoise / len(step_seconds):.2f}s/NFE; per NFE "
+diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
+index 061c8b2..7a14b0d 100644
+--- a/src/inference/infer_ulysses.py
++++ b/src/inference/infer_ulysses.py
+@@ -35,7 +35,8 @@ from src.inference.utils.assemble import (
+     render_record,
+     write_json,
+ )
+-from src.inference.render import decode_and_save, generate_latents, load_prompt
++from src.inference.render import (decode_and_save, generate_latents, latent_grid,
++                                  load_prompt)
+ from src.inference.utils.ulysses import init_ulysses, install_ulysses
+ 
+ 
+@@ -50,6 +51,8 @@ def main():
+     if cfg.behavior.teacher_mode:
+         raise ValueError("teacher_mode is not supported by inference-only Ulysses")
+ 
++    latent_hw = latent_grid(cfg.render.height, cfg.render.width)
++
+     runtime = init_ulysses(profile_enabled=cfg.parallel.profile)
+     device = runtime.device
+     torch.set_grad_enabled(False)
+@@ -61,6 +64,9 @@ def main():
+         raise ValueError("Ulysses path currently requires a HybridAttention checkpoint")
+ 
+     install_ulysses(model.transformer, runtime, softmax_ranks=cfg.parallel.softmax_ranks)
++    if runtime.is_main:
++        print(f"canvas {cfg.render.height}x{cfg.render.width} -> latent "
++              f"{latent_hw[0]}x{latent_hw[1]}", flush=True)
+     if runtime.is_main and runtime.branch_parallel:
+         print(
+             f"branch-parallel Ulysses: {runtime.softmax_ranks} softmax ranks + "
+@@ -96,6 +102,7 @@ def main():
+             runtime=runtime,
+             step_seconds=step_seconds,
+             conditions=conditions,
++            latent_hw=latent_hw,
+         )
+ 
+     warmup_steps = cfg.render.warmup_steps
+diff --git a/src/inference/render.py b/src/inference/render.py
+index 10e08ca..3cde6c3 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -27,6 +27,23 @@ from src.models.hybrid_transform import iter_hybrids, set_layout
+ DEFAULT_MODEL_ROOT = H3_BASE
+ # The production canvas, 768x1344, through the 16x spatial VAE.
+ LATENT_H, LATENT_W = 48, 84
++# The VAE's spatial compression. Not read off vae.config here on purpose: the Ulysses
++# ranks that never decode are built with load_decoders=False, so the geometry has to be
++# derivable from the config alone, on every rank.
++VAE_SPATIAL = 16
++
++
++def latent_grid(height: int, width: int):
++    """Pixel canvas -> (latent_h, latent_w). Both must be a multiple of 2*VAE_SPATIAL:
++    the VAE takes 16x and the transformer then patchifies 2x2 (patch_size (1, 2, 2)),
++    so an odd latent extent would silently truncate a row of tokens. 480p is
++    864x480 -> 54x30 -> 27x15 patched tokens per frame; 768p is 1344x768 -> 84x48."""
++    step = 2 * VAE_SPATIAL
++    for name, value in (("height", height), ("width", width)):
++        if value <= 0 or value % step:
++            raise ValueError(f"render.{name}={value} must be a positive multiple of {step} "
++                             f"(the 16x VAE followed by the 2x2 transformer patch)")
++    return height // VAE_SPATIAL, width // VAE_SPATIAL
+ # Mirrors of MiniMaxH3ModularPipeline.pixel_mean / pixel_std / keyframe_noise_aug: those
+ # are properties of an assembled pipeline, which the inlined blocks below never build.
+ # 0.999 is the t the fl2va keyframes are held at, just short of clean.
+@@ -72,10 +89,14 @@ def load_prompt(prompt_file: str, device: str):
+ @torch.no_grad()
+ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, num_steps, seed, device,
+                      video_shift=12.0, audio_shift=3.0, runtime=None, step_seconds=None,
+-                     conditions=None):
++                     conditions=None, latent_hw=None):
+     """The sampler. `runtime` (Ulysses) adds a barrier before and after the loop so every
+     rank enters and leaves together; `step_seconds`, if a list, receives the
+     device-synchronised wall time of every NFE (for the timing log and the record).
++    `latent_hw` is the latent canvas from `latent_grid()`; None keeps the released
++    768p one. Nothing below this line is resolution-specific — the window bounds are
++    per frame, the layout carries the spatial grid, and Ulysses shards by row — so a
++    smaller canvas only shortens the sequence.
+ 
+     `conditions` = (keyframe_anchors, condition_latents) from load_prompt turns the
+     request into i2va / fl2va: the layout reserves one frame of conditioning rows per
+@@ -85,17 +106,18 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
+     conditioning rows fall outside the layout's video span, i.e. they are attended like
+     text and audio: dense in both directions by the window softmax and absent from the
+     linear scan."""
++    latent_h, latent_w = latent_hw if latent_hw else (LATENT_H, LATENT_W)
+     num_frames = align_num_frames(num_frames, 17, 5)
+     num_latent_frames = video_latent_num_frames(num_frames, 17, 5)
+     num_audio_latents = audio_latent_num_frames(num_frames)
+     anchors, condition_latents = conditions if conditions else ((), [])
+     patch = tuple(transformer.config.patch_size)                    # (1, 2, 2)
+     channels = transformer.config.in_channels                       # 24
+-    frame_h, frame_w = LATENT_H // patch[1], LATENT_W // patch[2]
++    frame_h, frame_w = latent_h // patch[1], latent_w // patch[2]
+ 
+     position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, _ = (
+         MiniMaxH3PrepareLayoutStep.build_packed_sequence(
+-            text_token_tags, num_latent_frames, LATENT_H, LATENT_W, num_audio_latents,
++            text_token_tags, num_latent_frames, latent_h, latent_w, num_audio_latents,
+             patch, AUDIO_CHANNELS, AUDIO_TAG, VIDEO_TAG, keyframe_anchors=anchors,
+         )
+     )
+@@ -130,7 +152,7 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
+         noise = torch.randn(condition.shape, generator=generator, device=device, dtype=torch.float32)
+         noised = scheduler.scale_noise(condition, KEYFRAME_NOISE_AUG, noise)
+         condition_rows.append(patchify_video_latents(noised, patch))
+-    latents = torch.randn((1, channels, num_latent_frames, LATENT_H, LATENT_W),
++    latents = torch.randn((1, channels, num_latent_frames, latent_h, latent_w),
+                           generator=generator, device=device, dtype=torch.float32)
+     video_rows = patchify_video_latents(latents, patch)
+     if condition_rows:
+@@ -184,7 +206,7 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
+     video_rows = video_rows[num_condition_rows:]
+     rows = video_rows.reshape(-1, num_latent_frames, frame_h, frame_w, channels, *patch)
+     rows = rows.permute(0, 4, 1, 5, 2, 6, 3, 7)
+-    latents = rows.reshape(-1, channels, num_latent_frames, LATENT_H, LATENT_W).contiguous()
++    latents = rows.reshape(-1, channels, num_latent_frames, latent_h, latent_w).contiguous()
+     audio_latents = audio_rows.reshape(AUDIO_CHANNELS, num_audio_latents, 32).permute(0, 2, 1).contiguous()
+     return latents, audio_latents
+ 
