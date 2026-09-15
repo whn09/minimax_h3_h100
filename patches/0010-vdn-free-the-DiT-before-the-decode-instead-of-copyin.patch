@@ -1,0 +1,130 @@
+From 072bd6e4472b19e6a605416333da540cb72cfa78 Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Tue, 15 Sep 2026 16:23:09 +0800
+Subject: [PATCH 10/10] vdn: free the DiT before the decode instead of copying
+ it to the host
+
+At 768p on an 80 GiB card the DiT and a full-length decode do not fit, so patch
+3 parked the weights on the host first. That costs 26.33 s, and it buys nothing
+this path uses: nothing downstream of the denoise reads the transformer, and the
+GPU memory released is identical either way. Releasing without the host copy
+takes 2.81 s -- the 23.5 s difference is `.to("cpu")` allocating thousands of
+separate pageable host tensors at ~1.7 GB/s.
+
+parallel.offload_transformer_before_decode (bool) becomes
+parallel.transformer_before_decode (keep | free | offload). The bool cannot carry
+three states and silently changing its meaning would misreport old records, so
+the field is renamed; "offload" is kept because it is the measured comparison and
+because a server that will denoise again may still want it -- though a pinned
+host copy retained from patch 2's assembly would be the cheaper way to have that.
+
+"free" uses to_empty(device="meta") rather than `del model.transformer`: the
+sampler closure and the Ulysses hooks still hold references, so dropping the
+attribute frees nothing. Repointing every parameter and buffer releases the CUDA
+storages with the module graph intact.
+
+Measured, 768p / 345 f / 8 NFE / 5+3 / parallel decode: the request goes
+56.29 -> 32.32 s post-warmup and 53.10 -> 29.50 s steady, 1.80x, with the
+denoise unchanged at 2.471 s/NFE. Output verified with clipinfo.py.
+
+Renames the timing key to transformer_release_seconds and adds
+transformer_release_mode, so a record says which of the three ran.
+---
+ src/config/inference.py        | 22 +++++++++++++-----
+ src/inference/infer_ulysses.py | 42 +++++++++++++++++++++++++---------
+ 2 files changed, 47 insertions(+), 17 deletions(-)
+
+diff --git a/src/config/inference.py b/src/config/inference.py
+index 4beb423..d2a9a24 100644
+--- a/src/config/inference.py
++++ b/src/config/inference.py
+@@ -57,12 +57,22 @@ class ParallelConfig:
+     """torchrun layout for infer_ulysses.py."""
+     softmax_ranks: int = 6               # 0 = standard Ulysses; n = n softmax + (world-n) linear
+     profile: bool = False                # per-section CUDA events: profiling only
+-    # Park the DiT on the host after denoising, so the main rank can hold the decoders and
+-    # a full-length decode. Needed at 768p on an 80 GiB card and nowhere else: 45.2 GiB of
+-    # fp8 weights, plus ~11 GiB of decoders, plus a 345-frame 1344x768 decode is ~4 GiB
+-    # over. Costs ~27 s of PCIe, all of it after the measured denoise -- so leave it off
+-    # when the canvas has headroom, which 480p does.
+-    offload_transformer_before_decode: bool = False
++    # What to do with the DiT's 45.2 GiB once denoising is done, so the main rank can hold
++    # the decoders and a full-length decode. Needed at 768p on an 80 GiB card and nowhere
++    # else: 45.2 GiB of weights, plus ~11 GiB of decoders, plus a 345-frame 1344x768 decode
++    # is ~100 MiB over -- measured, and it OOMs in the assembly rather than the chunk decode.
++    #
++    #   "keep"     leave it on the card. 480p has the headroom.
++    #   "free"     drop the CUDA storages. Frees exactly as much as "offload" does, in
++    #              2.81 s instead of 26.33 s (measured at 768p), because most of the 26 s is
++    #              the host-side allocation rather than the release. The weights are gone
++    #              afterwards, which for a one-shot render costs nothing: nothing downstream
++    #              of the denoise reads them.
++    #   "offload"  copy to the host first, then release. Its extra 23.5 s only buys something
++    #              for a process that will denoise again and wants the weights back without
++    #              re-reading the checkpoint -- and even then a pinned host copy retained from
++    #              patch 2's assembly would be the cheaper way to have that.
++    transformer_before_decode: str = "keep"
+     # Spread the video VAE's temporal chunks over the ranks instead of decoding all of them
+     # on rank 0. The decode is the bigger half of a 480p render's post-warmup latency and it
+     # is a grid of independent non-causal ViT forwards, so this is nearly free parallelism:
+diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
+index 02a27ec..a9ee7ff 100644
+--- a/src/inference/infer_ulysses.py
++++ b/src/inference/infer_ulysses.py
+@@ -150,17 +150,36 @@ def main():
+         os.makedirs(os.path.dirname(lpath) or ".", exist_ok=True)
+         torch.save({"video": latents.cpu(), "audio": audio_latents.cpu()}, lpath)
+ 
+-    # ... and the transformer goes the other way, when the config asks. At 768p on an
+-    # 80 GiB card the DiT (45.2 GiB in fp8) and the decoders (~11 GiB) plus a 345-frame
+-    # 1344x768 decode do not fit together either -- the decode wants ~4 GiB more than what
+-    # is left. Denoising is finished, so the main rank parks the transformer on the host
+-    # first. Every other rank is already waiting at the barrier below and holds nothing that
+-    # matters. Off by default: it is ~27 s of PCIe, and 480p does not need it.
+-    offload_started = time.perf_counter()
+-    if runtime.is_main and cfg.parallel.offload_transformer_before_decode:
+-        model.transformer.to("cpu")
++    # ... and the transformer goes away, when the config asks. At 768p on an 80 GiB card the
++    # DiT (45.2 GiB) and the decoders (~11 GiB) plus a 345-frame 1344x768 decode do not fit
++    # together -- measured, it OOMs about 100 MiB short in the assembly. Denoising is
++    # finished, so the main rank releases the weights first. Every other rank is already
++    # waiting at the barrier below and holds nothing that matters.
++    #
++    # "free" and "offload" free the same 45.2 GiB; the difference is only whether a host copy
++    # is made on the way out, and that copy is nearly the whole cost -- measured at 768p,
++    # 26.33 s for "offload" against 2.81 s for "free", because `.to("cpu")` allocates
++    # thousands of separate pageable host tensors at ~1.7 GB/s. "free" is not instant either:
++    # repointing every parameter and running empty_cache() over a 45.2 GiB arena is those
++    # 2.81 s. Nothing after this point reads the weights, so "free" is what the 768p configs
++    # use and the offload stays only as the measured comparison.
++    release_started = time.perf_counter()
++    mode = cfg.parallel.transformer_before_decode
++    if mode not in ("keep", "free", "offload"):
++        raise ValueError(f"parallel.transformer_before_decode must be one of "
++                         f"keep/free/offload, got {mode!r}")
++    if runtime.is_main and mode != "keep":
++        if mode == "offload":
++            model.transformer.to("cpu")
++        else:
++            # to_empty() over the module rather than `del model.transformer`: the sampler
++            # closure and the Ulysses hooks still hold references, so dropping the attribute
++            # would free nothing. Repointing every parameter and buffer at meta releases the
++            # CUDA storages while leaving the module graph intact.
++            model.transformer.to_empty(device="meta")
+         torch.cuda.empty_cache()
+-    timings["transformer_offload_seconds"] = time.perf_counter() - offload_started
++    timings["transformer_release_seconds"] = time.perf_counter() - release_started
++    timings["transformer_release_mode"] = mode
+ 
+     # The denoising activations are gone by now, so the decoders have room. Every rank
+     # takes the video VAE when the decode is going to be data-parallel; only rank 0 ever
+@@ -225,7 +244,8 @@ def main():
+             f"denoise {timings['denoise_seconds']:.2f}s "
+             f"({timings['seconds_per_step']:.2f}s/step; per NFE "
+             + " ".join(f"{x:.2f}" for x in timings["step_seconds"]) + "), "
+-            f"offload {timings['transformer_offload_seconds']:.2f}s, "
++            f"DiT {timings['transformer_release_mode']} "
++            f"{timings['transformer_release_seconds']:.2f}s, "
+             f"decoder load {timings['decoder_load_seconds']:.2f}s, "
+             f"decode+encode {timings['decode_and_encode_seconds']:.2f}s, "
+             f"E2E {timings['end_to_end_seconds']:.2f}s",

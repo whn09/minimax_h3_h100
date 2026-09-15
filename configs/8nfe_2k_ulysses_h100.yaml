@@ -42,7 +42,7 @@ parallel:
   # driver sweeps rather than trusting this default.
   softmax_ranks: 6
   profile: false
-  offload_transformer_before_decode: true
+  transformer_before_decode: free
   # A serial 2K decode would be ~3.6x the 768p one, i.e. most of a minute on rank 0 while
   # seven cards idle. It also needs a full 2K pixel buffer in one place.
   parallel_vae_decode: true

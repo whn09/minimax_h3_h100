@@ -1,7 +1,7 @@
 From 841b7e0bf73df73f3289a79e0ea0b71cc1778cf9 Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 12:07:28 +0800
-Subject: [PATCH 4/9] vdn: time the decode stages separately
+Subject: [PATCH 04/10] vdn: time the decode stages separately
 
 At 480p the decode outweighs the denoising it follows -- 13.8 s against 8.9 s -- and
 unlike denoising it is single-rank: rank 0 decodes while the other seven wait at the
@@ -115,6 +115,3 @@ index 7587aa7..e03eb03 100644
 +    stage("mux_seconds")
      print(f"wrote {out_path}", flush=True)
 +    return timings
--- 
-2.54.0 (Apple Git-157)
-

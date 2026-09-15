@@ -1,7 +1,7 @@
 From 4680f6abca1928d2d10786e5d9ba342c12444826 Mon Sep 17 00:00:00 2001
 From: vdn-h100 <none@local>
 Date: Tue, 15 Sep 2026 10:39:04 +0800
-Subject: [PATCH 3/9] vdn: never keep the DiT and the decoders on the card at
+Subject: [PATCH 03/10] vdn: never keep the DiT and the decoders on the card at
  once
 
 At 768p on an 80 GiB card rank 0 dies twice over where ranks 1-7 are fine, and
@@ -162,6 +162,3 @@ index cb1ead0..7587aa7 100644
  
  
  def load_prompt(prompt_file: str, device: str):
--- 
-2.54.0 (Apple Git-157)
-

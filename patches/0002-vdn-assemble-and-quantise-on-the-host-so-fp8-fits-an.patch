@@ -1,8 +1,8 @@
 From 9bcaf5ab8923f1e5e4b2dc046545e79d45db67ee Mon Sep 17 00:00:00 2001
 From: vdn-h100 <none@local>
 Date: Tue, 15 Sep 2026 10:31:51 +0800
-Subject: [PATCH 2/9] vdn: assemble and quantise on the host so fp8 fits an 80
- GiB card
+Subject: [PATCH 02/10] vdn: assemble and quantise on the host so fp8 fits an
+ 80 GiB card
 
 fp8 assembly does not fit an H100. Ulysses shards the sequence, not the
 weights, so every rank replicates the whole DiT: ~63 GiB in bf16, and ~78 GiB
@@ -116,6 +116,3 @@ index 0863ce9..96e6eef 100644
      return InferenceModel(transformer=transformer, vae=vae, audio_vae=audio_vae,
                            artifact=art, is_hybrid=is_hybrid, merged_lora_pairs=merged,
                            external_loras=external_records, ablated=ablated,
--- 
-2.54.0 (Apple Git-157)
-

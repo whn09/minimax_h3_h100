@@ -176,28 +176,39 @@ why the asymptotic argument gives the wrong answer here.
 The denoise is the fair comparison above, but it is not the request. Full 768p breakdown,
 arm `n_768p_seg4`, same nine patches and same parallel decode as the 480p headline:
 
-| stage | 768p / 345 f | 480p / 345 f |
-|---|---|---|
-| denoise, 8 NFE | 19.78 (2.473 s/NFE) | 8.55 (1.069) |
-| **DiT → host** | **26.33** | **0** (not needed) |
-| decoder load (once per process) | 3.19 | 3.87 |
-| video VAE, 8 ranks | 4.78 | 3.10 |
-| audio VAE + frames-to-host + mux | 2.21 | 1.55 |
-| **post-warmup end-to-end** | **56.29** | **17.07** |
-| **steady state** | **53.10** | **13.20** |
-| vs clip length | 3.69x slower than realtime | 1.09x faster |
+| stage | 768p, patch 10 | 768p, patch 3's offload | 480p / 345 f |
+|---|---|---|---|
+| denoise, 8 NFE | 19.77 (2.471 s/NFE) | 19.78 (2.473) | 8.55 (1.069) |
+| **release the DiT** | **2.81** (free) | **26.33** (copy to host) | **0** (not needed) |
+| decoder load (once per process) | 2.81 | 3.19 | 3.87 |
+| video VAE, 8 ranks | 4.47 | 4.78 | 3.10 |
+| audio VAE + frames-to-host + mux | 2.47 | 2.21 | 1.55 |
+| **post-warmup end-to-end** | **32.32** | 56.29 | **17.07** |
+| **steady state** | **29.50** | 53.10 | **13.20** |
+| vs clip length | 2.05x slower than realtime | 3.69x slower | 1.09x faster |
 
-768p is **4.0x** the 480p request against a 2.41x row ratio, and the excess is almost
-entirely `offload_transformer_before_decode`: 45.2 GiB of fp8 weights back to the host at
-1.7 GB/s, the same unpinned-state-dict rate as everywhere else in this file. Note also that
-the steady-state row flatters 768p, because the DiT never comes *back* in a single-request
-process. A warm server serving 768p back to back also pays the return trip, ~7 s at the
-measured 6.43 GiB/s host→device, so the real cycle is **~60 s**. That last figure is
-arithmetic, not a measurement.
+(Arms `p_768p_free` and `n_768p_seg4`. Both outputs `clipinfo.py`-clean.)
 
-**The offload is load-bearing, and that was tested rather than assumed.** Patch 3 introduced
-it when the decode was still serial on rank 0; patch 5 made the decode 8-way, which changes
-where the peak lives, so the arm was re-run with the offload off:
+768p used to be **4.0x** the 480p request against a 2.41x row ratio, and almost all of the
+excess was one line: `model.transformer.to("cpu")`, 45.2 GiB back to the host at 1.7 GB/s.
+**Patch 10 deletes 23.5 s of that by not making the host copy.** Both modes free exactly the
+same GPU memory — the decode needs the space, not the eviction — and the 26.33 s is the
+host-side allocation, thousands of separate pageable tensors, not the release. Releasing
+without the copy costs 2.81 s (`to_empty(device="meta")` plus `empty_cache()` over a 45.2 GiB
+arena; not instant, but 9.4x cheaper). Nothing downstream of the denoise reads the weights,
+so the copy bought nothing this path uses.
+
+That takes 768p to **2.2x** the 480p request, which is finally in line with the 2.41x row
+ratio, and the denoise is untouched at 2.471 s/NFE. `parallel.transformer_before_decode` is
+now `keep | free | offload`; 480p uses `keep`, 768p uses `free`, and `offload` survives as
+the measured comparison and for a server that will denoise again and wants the weights back
+without re-reading the checkpoint — though a *pinned* host copy retained from patch 2's
+host-side assembly would be the cheaper way to have that: 8 ranks x 45.2 GiB is 362 GiB of
+the box's 2 TiB, and a pinned upload runs at DMA rate rather than 1.7 GB/s.
+
+**Releasing the weights at all is load-bearing, and that was tested rather than assumed.**
+Patch 3 introduced the eviction when the decode was still serial on rank 0; patch 5 made the
+decode 8-way, which changes where the peak lives, so the arm was re-run with `keep`:
 
 ```
 denoise 19.77s over 8 NFE = 2.472s/NFE      <- fine
@@ -207,8 +218,10 @@ torch.OutOfMemoryError: Tried to allocate 102.00 MiB. GPU 0 has a total capacity
 ```
 
 Rank 0 dies in the assembly, not the chunk decode, and it dies **102 MiB short of finishing**
-— which says the offload is buying a couple of GiB, not tens. Where those GiB go, from the
-tensor shapes at 768p (6.19 MB per frame at 3 channels fp16):
+— which says the eviction is buying a couple of GiB, not tens. That margin is also why the
+remaining 2.81 s is worth attacking rather than accepting: if rank 0's peak came down by a
+few GiB the DiT could simply stay on the card and the whole stage would disappear. Where
+those GiB go, from the tensor shapes at 768p (6.19 MB per frame at 3 channels fp16):
 
 * `gathered`, the all-gather destination — 24 slots of ~34 frames each, since every slot
   carries its chunk's decode overlap: **~5 GiB**.
@@ -221,7 +234,17 @@ comfortably more than the offload is buying, and 4x less NCCL traffic as a bonus
 free to write: `_blend` ramps across chunk boundaries in float, and consecutive chunks live
 on different ranks by the round-robin, so the overlap frames would have to stay float while
 the interior went to uint8. That is the shape of the next patch if 768p ever becomes the
-deliverable; at 480p there is nothing to fix, because there is no offload to remove.
+deliverable — it would take the 768p request to ~26.7 s. At 480p there is nothing to fix,
+because there is nothing to evict.
+
+Worth stating explicitly, since it is the obvious alternative: **tensor parallelism would
+also solve this, and it is the expensive way to.** TP=2 x Ulysses=4 halves the resident
+weights to ~22.6 GiB and frees 22.6 GiB where the OOM needed 102 MiB, so the eviction goes
+away entirely. But nothing in this tree shards a weight — Ulysses shards the *sequence*
+inside the attention modules — so it means column/row-parallel projections, an all-reduce per
+block, making patch 2's host-side fp8 assembly shard-aware, and re-deriving the branch split
+on a 4-way grid where 768p's measured optimum of 5-of-8 is not expressible (4-of-8 costs
++12 %, 6-of-8 costs +5 %). Against that: a mode string, and 23.5 s recovered.
 
 ## The decode was the other half
 

@@ -29,11 +29,13 @@ parallel:
   # ranks to spread it over. The split is a property of the canvas, not of the machine.
   softmax_ranks: 5
   profile: false
-  # 768p only. 45.2 GiB of fp8 weights on every rank, ~11 GiB of decoders on rank 0, and a
-  # 345-frame 1344x768 decode is ~4 GiB past what an 80 GiB card has, so the DiT is parked
-  # on the host once denoising is done. ~27 s of PCIe, all of it after the measured
-  # denoise. 480p has the headroom and leaves this off.
-  offload_transformer_before_decode: true
+  # 768p only. 45.2 GiB of weights on every rank, ~11 GiB of decoders on rank 0, and a
+  # 345-frame 1344x768 decode is past what an 80 GiB card has -- measured, it OOMs about
+  # 100 MiB short, in the assembly rather than the chunk decode. So the weights are released
+  # once denoising is done. "free" not "offload": both free the same 45.2 GiB, but the host
+  # copy costs 26.33 s against 2.81 s and nothing after the denoise reads the weights.
+  # 480p has the headroom and leaves this at "keep".
+  transformer_before_decode: free
 
 render:
   height: 768

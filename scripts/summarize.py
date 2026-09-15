@@ -56,7 +56,10 @@ def rows(out_dir: Path):
         denoise = timings.get("denoise_seconds") or (sum(steps) if steps else None)
         s_per_nfe = timings.get("seconds_per_step") or (
             denoise / len(steps) if denoise and steps else None)
-        offload = timings.get("transformer_offload_seconds")
+        # transformer_release_seconds since patch 10; the old key was
+        # transformer_offload_seconds, when copying to the host was the only mode.
+        offload = (timings.get("transformer_release_seconds")
+                   or timings.get("transformer_offload_seconds"))
         loading = timings.get("decoder_load_seconds")
         decode = timings.get("decode_and_encode_seconds")
         # The collective decode is timed OUTSIDE decode_and_save (a collective cannot live
