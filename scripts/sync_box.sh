@@ -29,7 +29,7 @@ done
 # resolves when the file sits at <repo>/scripts/. decode_parity.py is not listed here
 # because it is a tracked file of the patch series and the loop above already sent it.
 bash "$HERE/p5.sh" "mkdir -p $REPO/scripts"
-for f in text_encoder_bench.py mux_bench.py vidcmp.py vidscale.py vidshift.py; do
+for f in text_encoder_bench.py mux_bench.py vidcmp.py vidscale.py vidshift.py clipinfo.py; do
   echo "  drv  scripts/$f"
   bash "$HERE/p5.sh" --put "$HERE/$f" "$REPO/scripts/$f"
 done

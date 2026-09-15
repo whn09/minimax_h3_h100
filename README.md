@@ -31,15 +31,15 @@ The model is **`ckpts/stage-dmd-step-250`** = VDN-H3-8-step, the Stage-DMD disti
 
 ## What had to change for this box
 
-Eight patches, in `patches/`. All are needed; none is upstream. They fall into four groups.
+Nine patches, in `patches/`. All are needed; none is upstream. They fall into four groups.
 Patches 1 and 6 are about the **workload** — 480P does not exist upstream, in the renderer
 or in the keyframe encoder. Patches 2 and 3 are the same underlying fact showing up at two
 different moments: **80 GiB is not 141 GiB**, and Ulysses replicates the whole DiT on every
-rank. Patches 4, 5 and 7 are about the **other half of the latency** — once the denoise is
+rank. Patches 4, 5, 7 and 9 are about the **other half of the latency** — once the denoise is
 fast the decode is the bigger number, and each one attacks whatever the previous one left
 largest: measure the stages, then the video VAE on one rank, then the colour conversion in
-swscale. Patch 8 is a **test**, and it is here rather than folded into patch 5 because
-finding out *why* the obvious test could not work is most of what it says.
+swscale, then libx264 itself. Patch 8 is a **test**, and it is here rather than folded into
+patch 5 because finding out *why* the obvious test could not work is most of what it says.
 
 | # | patch | why |
 |---|---|---|
@@ -50,8 +50,9 @@ finding out *why* the obvious test could not work is most of what it says.
 | 5 | `0005-vdn-data-parallel-video-VAE-decode-across-the-Ulysse.patch` | **the video VAE ran on rank 0 while seven cards waited.** Only the *encoder* is a causal 3D CNN; the **decoder is a non-causal ViT** (36 layers, 32x64 heads, hidden 2048), so no conv cache is threaded between temporal chunks and `_decode_clip` is a pure function of its 7-latent-frame slice. The only coupling anywhere is `_blend`, a linear cross-fade in pixel space after every forward has finished. That makes it **DP, not TP** — see below — and the patch spreads the 20 temporal chunks over the ranks for one `all_gather`, bit-identical output, behind `parallel.parallel_vae_decode` |
 | 6 | `0006-vdn-let-encode_keyframes.py-target-a-canvas-other-th.patch` | **fl2va could not be measured at 480p.** A keyframe cache is only usable at the canvas it was encoded for — `condition_latents` come out at that canvas's latent size and the layout reserves rows to match, so the released `example_fl2va.pt` (`(1, 24, 1, 48, 84)`) fits a 1344x768 render and nothing else. `encode_keyframes.py` derives the canvas from the first keyframe's aspect ratio under the released rule (short edge 768, `768*1344` max pixels, both edges a multiple of 32), with no way to ask for another one; those stay the default and `--height` / `--width` override them. Note that exposing the *rule*'s parameters instead would not have worked: at short edge 480 the pixel cap scales to `768*1344*(480/768)² = 403,200`, below `480*864 = 414,720`, so the cap would have quietly produced an 832-wide canvas rather than 864 |
 
-| 7 | `0007-vdn-convert-RGB-to-YUV420p-on-the-GPU-instead-of-in-.patch` | **the mux became the biggest single item, and it was not x264.** Once patch 5 took the video VAE to 2.11 s, the 2.65 s mp4 mux was the largest thing left in a 480p render. `scripts/mux_bench.py` decomposes it: `from_ndarray` 0.30 s, **`reformat rgb24→yuv420p` 2.03 s**, x264 encode 1.72 s. x264 was already threaded (6.40 s at `thread_count=1`), which is why setting the thread count buys only 1.17× — the serial part is **swscale's colour conversion**, running in the calling thread. The pixels are already on the card as float32 in [0,1] and the conversion is a 3×3 matrix plus a 2×2 average, so it happens there; that also halves the host copy, yuv420p being 1.5 bytes/px against rgb24's 3. It re-implements a lossy conversion, so it sits behind `render.gpu_color_convert` and is verified numerically rather than assumed — `mux_bench.py --verify` reports Y within 1 level (70.96 dB) and chroma at 55.10/56.90 dB against swscale's own output |
+| 7 | `0007-vdn-convert-RGB-to-YUV420p-on-the-GPU-instead-of-in-.patch` | **the mux became the biggest single item.** Once patch 5 took the video VAE to 2.15 s, the 2.70 s mp4 mux was the largest thing left in a 480p render, and it is entirely host-side. Two things in it are avoidable: swscale's `rgb24→yuv420p` conversion, and the fact that PyAV leaves `thread_count` at 1. The pixels are already on the card as float32 in [0,1] and the conversion is a 3×3 matrix plus a 2×2 average, so it happens there; that also halves the host copy, yuv420p being 1.5 bytes/px against rgb24's 3 — measured 0.42 → 0.27 s. Matched-config, the mux goes 2.70 → 1.85 s at 480p and 4.32 → 2.39 s at 768p. **Of that 0.85 s, ~0.40 is the thread setting and ~0.45 the conversion** — an earlier version of this table said the conversion alone was 2.03 s, which came from timing `frame.reformat()` per frame in a loop (a fresh frame allocated each call); the real remainder, 1.85 s, is libx264, which is patch 9's problem. It re-implements a lossy conversion, so it sits behind `render.gpu_color_convert` and is verified numerically rather than assumed — `mux_bench.py --verify` reports Y within 1 level (71.42 dB) and chroma at 57.40/58.79 dB against swscale's own output on real render frames |
 | 8 | `0008-vdn-test-the-parallel-VAE-decode-against-the-serial-.patch` | **the correctness test for patch 5 was measuring the wrong thing.** The grid rendered a prompt twice, serial and parallel, and `cmp`'d the mp4s; it reported `MISMATCH`. But this pipeline does not reproduce run to run — two renders at the same seed and config sit ~17 dB apart with no bit-identical frame — so that diff compares two denoise trajectories and fails whatever the decoder does. The patch tests the decode where it lives: one process, one latent tensor, both paths back to back |
+| 9 | `0009-vdn-encode-the-mp4-in-parallel-segments-instead-of-o.patch` | **libx264 does not parallelise itself here.** With the conversion gone the mux *is* x264, and x264's own frame threading buys 1.12× on this canvas — 345 frames of 864×480 go 251 fps at `thread_count=0` against 224 at 1, on a box with 192 vCPUs — because the serial part is the per-frame Python plane writes, which hold the GIL. So the clip is split into `render.encode_segments` contiguous ranges, encoded concurrently in threads, and the bitstreams concatenated by copy: each segment opens with an IDR and references nothing outside itself, and mp4 carries one SPS/PPS in `avcC`, which is asserted identical rather than assumed. **4 segments is 3.2× (1.37 → 0.43 s) for +2.5 % bits and −0.38 dB.** Not free, but a better trade than the alternative of a faster preset, which is 1.9× for −2.8 dB *and* fewer bits. `scripts/clipinfo.py` is the structural check — every frame decoded, timestamps a clean run, audio present — because a PSNR against another render cannot see a concatenation bug through the run-to-run divergence |
 
 The two OOM failures, for the record. Patch 2's, during assembly:
 
@@ -201,10 +202,18 @@ PSNR between the two clips** and not one bit-identical frame out of 345 (480p 3+
 17.55 dB; 768p standard Ulysses twice: 16.69 dB).
 
 The seeding is fine — an explicit `torch.Generator(device).manual_seed(seed)`, three draws in
-a fixed order, the same on every rank. The parallelism is not the cause either: the 768p pair
-has no branch split, and Ulysses' collectives are all-to-alls, which are permutations and so
-bitwise exact. It is the fp8 GEMMs, whose split-k reductions accumulate with atomics,
-amplified over eight sampler steps.
+a fixed order, the same on every rank. **One GPU is exactly reproducible**: two `infer.py`
+runs give byte-identical mp4s, which rules out the fp8 GEMMs, the kernels and the sampler,
+since the single-GPU path uses all of them too.
+
+The cause is upstream's asynchronous frame mean,
+`UlyssesRuntime.video_frame_mean_async` (`src/inference/utils/ulysses_runtime.py:497-520`, not
+touched by any patch here), which the multi-rank path calls and `infer.py` never does. It
+accumulates with `index_add_` — CUDA atomics, so the addition order varies — and then sums
+across ranks with `dist.all_reduce`, whose order follows NCCL's algorithm choice for that run.
+Both give ULP differences in a value that normalises the linear branch for *every* frame, and
+eight sampler steps amplify them. Ulysses' other collectives are all-to-alls, which are
+permutations and therefore exact, which is why this is the only candidate.
 
 It is nonetheless the **same video**: the temporal cross-correlation peaks at shift 0 with a
 sharp peak, and 48× downsampled PSNR reaches only 24.90 dB where independent high-frequency
@@ -214,9 +223,19 @@ everywhere.
 The consequence is procedural. `scripts/h100_grid.sh` phase `v` used to `cmp` a serial render
 against a parallel one and call a mismatch a decode bug — that test could only ever fail,
 because it compares two denoise trajectories. It is replaced by `scripts/decode_parity.py`
-(patch 8): one process, one latent tensor, decoded both ways back to back. The same reasoning
-is why patch 7's colour conversion is verified by `mux_bench.py --verify` against swscale on
-*fixed frames* rather than by diffing two renders.
+(patch 8): one process, one latent tensor, decoded both ways back to back. Run that way the
+parallel decode is **bit-identical at both canvases**, max absolute difference 0.0, so patch
+5's claim holds and the `MISMATCH` was the test. The same reasoning is why patch 7's colour
+conversion is verified by `mux_bench.py --verify` against swscale on *fixed frames* rather
+than by diffing two renders, and why patch 9's segmented encode is checked two ways that do
+not involve a second render — PSNR against the input planes, and `scripts/clipinfo.py` for
+the structural properties a PSNR cannot see (frame count, monotone evenly-spaced timestamps,
+audio present).
+
+If reproducibility ever matters more than the ~0.5 % of a step that the async frame mean
+saves, the fix is in that one function: replace `index_add_` with a fixed-order segment sum
+(the video rows of a frame are contiguous, so it is a reshape and a sum, not a scatter) and
+the `all_reduce` with a gather plus a local sum in rank order.
 
 ## Text encoding is not in any of these numbers
 
@@ -373,9 +392,9 @@ they are the dominant term, not the sampler.
 | `configs/8nfe_480p_362f_ulysses_h100.yaml` | the same at 362 frames (15.083 s), the literal "15 second" ask |
 | `configs/8nfe_768p_345f_ulysses_h100.yaml` | the control: upstream's published 768p shape, so the H100↔H200 gap is measured |
 | `configs/8nfe_2k_ulysses_h100.yaml` | 2560x1440 — a lower bound on H3-Regenerate-2K, which is not open-sourced |
-| `patches/` | the eight patches above + `BASE.txt` (the upstream commit they apply to) |
+| `patches/` | the nine patches above + `BASE.txt` (the upstream commit they apply to) |
 | `RESULTS.md` | the measured numbers |
-| `samples/` | the two renders the headline numbers came from — `vdn_480p_345f.mp4` (864x480) and `vdn_768p_345f.mp4` (1344x768), both 345 frames of t2va from `prompts/example_2.pt`, video+audio muxed. 8 MB together, kept in the repo because "how long does it take" is only half an answer without "and what comes out" |
+| `samples/` | the renders the numbers came from, video+audio muxed, all t2va from `prompts/example_2.pt`. The current best config, with all nine patches: **`n_480p_seg4.mp4`** (864x480, 345 f), **`n_480p_362f_seg4.mp4`** (the literal 15 s, 362 f) and **`n_768p_seg4.mp4`** (1344x768, 345 f) — these three are the segmented-encode output, checked with `clipinfo.py`. Earlier renders kept for comparison: `vdn_*` (pre-patch-7 swscale mux), `z_*` (patches 1–6), `y_768p_345f_r5` (the 768p split winner), `f_*` (fl2va) |
 
 ## Traps found on this box
 

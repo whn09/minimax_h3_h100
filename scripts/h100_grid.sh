@@ -23,6 +23,13 @@
 #                  curve, which is what says whether 8 GPUs is the right answer at all
 #   n  STEPS       4 / 6 / 8 NFE at the best config (quality falls off below 8; this
 #                  only measures what the step budget costs)
+#   m  TAIL        the decode tail -- RGB->YUV420p on the card (patch 0007) against
+#                  swscale, at matched split and canvas
+#   e  ENCODE      the mux is libx264 once the conversion is gone, so encode the clip in
+#                  parallel segments (patch 0009) against one encoder
+#
+# Other phases exist below -- f (fl2va), v (parallel VAE decode), x/w/y/z (768p sweeps and
+# the headline arms), k (2K, closed) -- and each documents itself where it is defined.
 #
 # Timing convention, matching upstream's table: `denoise_seconds / num_steps` is the
 # s/NFE, measured AFTER render.warmup_steps=2 NFE have run in the same process, so the
@@ -306,11 +313,25 @@ case $PHASES in *v*)
 
 case $PHASES in *m*)
   echo "##### PHASE m: the tail -- audio VAE + frames-to-host + mux"
+  # DONE -- results below; kept runnable because patch 0007 is behind a config switch and
+  # this is the arm that justifies its default.
+  #
   # With the video VAE spread over 8 ranks (patch 0005) the tail is what is left, and at
-  # 480p it was 3.18 s against 2.97 s for the whole eight-way decode. scripts/mux_bench.py
-  # decomposed the mux and found it is NOT x264: of 2.65 s, 2.03 s is swscale converting
-  # rgb24 -> yuv420p in one thread. Patch 0007 does that conversion on the card, which also
-  # halves the host copy (1.5 bytes/px instead of 3). These two arms are the before/after.
+  # 480p it was 3.18 s against 2.97 s for the whole eight-way decode. Patch 0007 does the
+  # RGB->YUV420p conversion on the card, which also halves the host copy (1.5 bytes/px
+  # instead of 3). These two arms are the before/after, at matched split and canvas:
+  #
+  #                       video_vae_x8   audio_vae   frames_to_host   mux     tail
+  #   m_480p_swscale          2.49         0.26          0.42         2.70    3.41
+  #   m_480p_gpu_yuv          2.15         0.26          0.27         1.85    2.39
+  #   m_768p_gpu_yuv          4.32         0.26          0.56         2.39      --   (was 4.32)
+  #
+  # So the host copy goes 1.53x on halved bytes as predicted, and the mux 1.46x. Note what
+  # that does NOT say: mux_bench's thread-only arm is worth 1.17x by itself, so of the
+  # mux's 0.85 s about 0.40 is thread_count=0 and 0.45 the conversion. An earlier comment
+  # here claimed swscale was 2.03 s of the mux -- that came from timing frame.reformat()
+  # per frame, which allocates a new frame each call. **libx264 is the real cost**, which
+  # is what phase n goes after.
   #
   # Timing only, deliberately. The conversion is lossy and re-implemented, so the two mp4s
   # WILL differ -- but comparing these two renders could not show that anyway, because the
@@ -323,10 +344,47 @@ case $PHASES in *m*)
       render.gpu_color_convert=true
   echo "=== [$(date -u +%H:%M:%S)] tail stages, gpu convert vs swscale"
   for tag in m_480p_gpu_yuv m_480p_swscale m_768p_gpu_yuv; do
-    grep -E 'audio_vae|frames_to_host|mux|decode_stages' "$OUT/$tag.log" | sed "s/^/    $tag: /"
+    grep -E 'decode stages' "$OUT/$tag.log" | sed "s/^/    $tag: /"
   done
   # And the conversion's numerical check, against swscale's own output on real frames.
   .venv/bin/python scripts/mux_bench.py "$OUT/m_480p_swscale.mp4" --verify 2>&1 | sed 's/^/    /'
+;; esac
+
+case $PHASES in *e*)
+  echo "##### PHASE e: the mux is libx264, so encode in parallel segments"
+  # Phase m left the mux at 1.85 s, the largest single item in a 480p request after the
+  # denoise and the eight-way decode. It is libx264, and x264's own frame threading is worth
+  # 1.12x here (251 fps at thread_count=0 against 224 at 1) because the serial part is the
+  # per-frame Python plane writes, which hold the GIL. Patch 0009 splits the clip into
+  # `render.encode_segments` contiguous ranges, encodes them in threads and concatenates the
+  # bitstreams.
+  #
+  # These two arms differ in exactly one field, so the difference is the segmentation and
+  # not the conversion, the split or the canvas. seg1 is the matched control: same code
+  # path, one encoder.
+  run n_480p_seg1 $C480 8 render.encode_segments=1
+  run n_480p_seg4 $C480 8 render.encode_segments=4
+  run n_768p_seg4 $C768 8 parallel.softmax_ranks=5 parallel.parallel_vae_decode=true \
+      render.encode_segments=4
+  # 362 frames is the literal "15 second" answer and the headline table quotes it, so it
+  # needs one arm on the current code rather than a tail carried over from before patches
+  # 0007 and 0009. Same split, same everything else -- only the clip length differs.
+  run n_480p_362f_seg4 $C480L 8 parallel.softmax_ranks=3 parallel.parallel_vae_decode=true \
+      render.encode_segments=4
+  echo "=== [$(date -u +%H:%M:%S)] mux, one encoder vs four segments"
+  for tag in n_480p_seg1 n_480p_seg4 n_768p_seg4 n_480p_362f_seg4; do
+    grep -E 'decode stages' "$OUT/$tag.log" | sed "s/^/    $tag: /"
+  done
+  # The concatenation has to produce a playable clip, and "it has the right number of
+  # frames, in order, with its audio" is the part a PSNR cannot tell you -- the two renders
+  # diverge ~17 dB run to run regardless (phase v), so the quality of the segmented encode
+  # was measured on fixed frames instead (see utils/yuv.py's table). What this checks is
+  # that nothing was lost or reordered by the bitstream copy, and that the extra key frames
+  # show up where they should.
+  echo "=== [$(date -u +%H:%M:%S)] does the concatenated clip decode cleanly?"
+  for tag in n_480p_seg1 n_480p_seg4 n_768p_seg4 n_480p_362f_seg4; do
+    .venv/bin/python scripts/clipinfo.py "$OUT/$tag.mp4" 2>&1 | sed "s/^/    /"
+  done
 ;; esac
 
 case $PHASES in *k*)

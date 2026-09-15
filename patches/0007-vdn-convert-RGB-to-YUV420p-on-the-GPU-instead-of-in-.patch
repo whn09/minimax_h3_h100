@@ -1,7 +1,7 @@
 From abaacfff9efda7aeddbe2216c3a90125f94136ec Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 13:59:57 +0800
-Subject: [PATCH 7/8] vdn: convert RGB to YUV420p on the GPU instead of in
+Subject: [PATCH 7/9] vdn: convert RGB to YUV420p on the GPU instead of in
  swscale
 
 With the video VAE spread over the ranks the mp4 mux became the largest single item in a
@@ -318,3 +318,6 @@ index 0000000..5fdd0f7
 +    if planes and planes[0].is_cuda:
 +        torch.cuda.current_stream(planes[0].device).synchronize()
 +    return tuple(staged)
+-- 
+2.54.0 (Apple Git-157)
+

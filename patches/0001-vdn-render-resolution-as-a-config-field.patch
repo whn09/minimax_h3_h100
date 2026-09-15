@@ -1,7 +1,7 @@
 From 36c70cd566860c44557adb146c730f4f53b9774e Mon Sep 17 00:00:00 2001
 From: vdn-h100 <none@local>
 Date: Tue, 15 Sep 2026 10:31:40 +0800
-Subject: [PATCH 1/8] vdn: render resolution as a config field
+Subject: [PATCH 1/9] vdn: render resolution as a config field
 
 480P does not exist upstream: src/inference/render.py hardcodes
 LATENT_H, LATENT_W = 48, 84 -- the 768x1344 production canvas -- as a module
@@ -213,3 +213,6 @@ index 10e08ca..308378f 100644
      audio_latents = audio_rows.reshape(AUDIO_CHANNELS, num_audio_latents, 32).permute(0, 2, 1).contiguous()
      return latents, audio_latents
  
+-- 
+2.54.0 (Apple Git-157)
+

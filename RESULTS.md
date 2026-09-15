@@ -14,18 +14,24 @@ almost the same:
 
 | | 345 f / 14.375 s | 362 f / 15.083 s |
 |---|---|---|
-| denoise, 8 NFE | **8.72** (1.090 s/NFE) | **9.09** (1.136 s/NFE) |
-| video VAE, 8 ranks | 2.97 | 2.55 |
-| audio VAE + frames-to-host + mux | 3.18 | 3.27 |
-| decoder load (once per process, not per request) | 3.65 | 5.41 |
-| **post-warmup end-to-end** | **18.53** | **20.32** |
-| **steady state, decoders already resident** | **14.88** | **14.91** |
-| steady vs clip length | 0.97x realtime | **1.01x realtime** |
+| denoise, 8 NFE | **8.55** (1.069 s/NFE) | **9.02** (1.128 s/NFE) |
+| video VAE, 8 ranks | 3.10 | 2.46 |
+| audio VAE + frames-to-host + mux | 1.55 | 1.61 |
+| decoder load (once per process, not per request) | 3.87 | 4.47 |
+| **post-warmup end-to-end** | **17.07** | **17.57** |
+| **steady state, decoders already resident** | **13.20** | **13.10** |
+| steady vs clip length | 1.09x realtime | **1.15x realtime** |
+
+(Arms `n_480p_seg4` and `n_480p_362f_seg4`. One caveat on how precisely to read these: the
+**video VAE stage is the noisy one**, 2.11–3.82 s across seven arms at matched canvas, split
+and decode path — median 2.97, σ 0.61. The denoise is stable to ±0.02 s/NFE and the tail to
+±0.06 s, so treat the steady-state figure as **13.2 ± 0.6 s**, with the uncertainty living
+entirely in the decode.)
 
 **15.000 s is not a reachable length** — `align_num_frames(n, 17, 5)` snaps to `5 + 17k`,
 so the grid near 15 s is 345 (14.375 s) then 362 (15.083 s), with nothing between. 362 is
-the literal answer to "15 seconds", and at 14.91 s steady it renders **slightly faster than
-the clip plays**.
+the literal answer to "15 seconds", and at 13.10 s steady it renders **1.15x faster than the
+clip plays**.
 
 The two lengths cost the same for a reason worth stating: 362 frames is 21 temporal VAE
 chunks against 345's 20, and `ceil(21/8) = ceil(20/8) = 3`, so the parallel decode's
@@ -35,10 +41,10 @@ steps only when the chunk count crosses a multiple of 8.
 
 Two framings of the same run, because they get quoted for different things:
 
-* **1.090 s/NFE** is the number comparable with upstream's published table (2.29 on
+* **1.069 s/NFE** is the number comparable with upstream's published table (2.29 on
   8x H200, 1.40 on 8x B200 — all at 768p, all denoise-only).
-* **14.9 s steady-state end-to-end** is what a request costs on a warm server. Post-warmup
-  E2E including the one-time decoder load is 18.5 s.
+* **13.2 s steady-state end-to-end** is what a request costs on a warm server. Post-warmup
+  E2E including the one-time decoder load is 17.1 s.
 
 Two corrections to earlier versions of this file, both the same mistake — comparing two
 numbers measured at **different branch splits**:
@@ -195,9 +201,87 @@ At 768p the same patch takes decode+encode from **25.14 s to 5.87 s, 4.28×** �
 factor than 480p's, because 768p's chunks are 1.87× the decoder calls each, so the fixed
 per-chunk cost that limits 480p is a smaller share of the total.
 
-**The bottleneck is now the H.264 mux, at 2.66 s** — more than the eight-way video VAE
-decode it follows, and it is host-side with no GPU involvement at all. See the next section:
-it turned out not to be libx264.
+**That left the H.264 mux as the largest single item, at 2.70 s** — more than the eight-way
+video VAE decode it follows, and host-side with no GPU involvement at all. The next section
+is what it decomposes into.
+
+## The tail: two changes, and one wrong diagnosis in between
+
+Patches 7 and 9 go after the three stages that patch 5 does not touch. Both arms below are
+the same config with one field flipped, so the difference is the change and nothing else
+(480p, 345 f, 8 GPUs, 3+5):
+
+| stage | swscale, 1 encoder | GPU convert, 1 encoder | GPU convert, 4 segments |
+|---|---|---|---|
+| audio VAE | 0.263 | 0.260 | 0.255 |
+| frames → host | 0.417 | **0.273** | 0.276 |
+| mp4 mux | 2.697 | 1.852 | **1.018** |
+| **tail total** | **3.409** | **2.385** | **1.548** |
+| vs upstream | — | 1.43× | **2.20×** |
+| output size | 2.859 MB | 2.814 MB | 2.926 MB |
+
+At 768p the same two changes take the mux **4.32 → 2.39 → 1.39 s** and the tail 3.21 → 2.21 s.
+The conversion is worth more there (1.81× against 480p's 1.46×) because there are 2.4× the
+pixels to convert against the same fixed cost.
+
+The `frames → host` row is the prediction landing: yuv420p is 1.5 bytes per pixel against
+rgb24's 3, so the transfer is 215 MB instead of 430 MB, and the GPU-side conversion itself is
+free at this scale — it is inside that 0.273 s.
+
+**The mux was not swscale, and I said it was.** An earlier version of this file attributed
+2.03 s of the 2.66 s mux to swscale's colour conversion, from a micro-benchmark that called
+`frame.reformat()` per frame in a loop. That allocates a fresh frame every call and overstates
+what the encoder's internal conversion costs. The matched measurement above says the whole
+mux only moved 0.85 s, and `mux_bench.py`'s thread-only arm accounts for 1.17× of that, so:
+
+| | seconds |
+|---|---|
+| upstream: swscale, `thread_count` unset (1) | 2.70 |
+| `thread_count=0`, still swscale | ~2.30 |
+| planes from the GPU, `thread_count=0` | 1.85 |
+
+≈0.40 s for the thread setting and ≈0.45 s for the conversion. **The rest, 1.85 s, is libx264
+doing real work**, which is what patch 9 addresses.
+
+### libx264 does not parallelise itself, so encode in segments
+
+x264's own frame threading is nearly worthless on this canvas: 345 frames of 864×480 encode at
+251 fps with `thread_count=0` against 224 at 1, a **1.12×** on a box with 192 vCPUs. The serial
+part is the per-frame Python plane writes, which hold the GIL. So patch 9 splits the clip into
+contiguous ranges, encodes them concurrently in threads and concatenates the bitstreams by
+copy. Measured on fixed frames, PSNR against the input planes:
+
+| | seconds | size | Y PSNR vs input |
+|---|---|---|---|
+| 1 encoder, `thread_count=0` | 1.37 | 2.36 MB | 42.72 dB |
+| 2 segments × 8 threads | 0.69 | 2.38 MB | 42.61 dB |
+| **4 segments × 8 threads** | **0.43** | 2.42 MB | 42.34 dB |
+| 8 segments × 8 threads | 0.34 | 2.51 MB | 41.63 dB |
+| 16 segments × 8 threads | 0.33 | 2.65 MB | 40.68 dB |
+
+**4 segments is 3.2× for +2.5 % bits and −0.38 dB**, and that is the default. In the render
+the mux stage goes **1.873 → 1.018 s, 1.84×** rather than 3.2×: the stage also carries the AAC
+audio encode and the container write, which are ~0.6 s and unaffected. The absolute saving,
+0.86 s, is what the standalone measurement predicted (1.37 − 0.43 = 0.94 s).
+
+Two things make 4 the right stopping point. Past 8 segments the time stops falling (0.34 → 0.33 s) while the
+bits keep climbing, because each segment costs one extra IDR. And the obvious alternative —
+a faster x264 preset — is a worse trade, which is worth showing because the file sizes make it
+look free at first glance:
+
+| preset | seconds | size | PSNR vs source |
+|---|---|---|---|
+| medium (upstream's default) | 1.54 | 2.33 MB | **38.88 dB** |
+| veryfast | 0.80 | 2.01 MB | 36.07 dB |
+| ultrafast | 0.41 | 5.92 MB | 36.54 dB |
+
+`veryfast` is 1.9× faster and its file is *smaller*, which is the tell: it is spending fewer
+bits **and** losing 2.8 dB, a real rate–distortion loss rather than a boundary cost. So the
+preset stays at medium.
+
+**Hardware encoding is not an option on this box.** `h264_nvenc` fails to open on H100 —
+GH100 ships NVDEC and NVJPEG but no NVENC silicon. Confirmed by running it, not inferred:
+`scripts/mux_bench.py --nvenc` reports the arm as FAILED.
 
 ## The same seed does not give the same video
 
@@ -212,10 +296,31 @@ the same seed, same config, same split, same decode path:
 
 Not one frame of 345 is bit-identical in either pair. The seeding is not the cause — it is an
 explicit `torch.Generator(device).manual_seed(seed)`, drawn in a fixed order for the three
-draws, identical on every rank. Nor is it the parallelism: the 768p pair is at standard
-Ulysses with no branch split, and Ulysses' collectives are all-to-alls, which are
-permutations and bitwise exact. What is left is the fp8 GEMMs, whose split-k reductions
-accumulate with atomics, amplified over eight sampler steps.
+draws, identical on every rank.
+
+**It is the parallel path, and one GPU is exactly reproducible.** Two `infer.py` runs at
+480p/345f came out **byte-identical mp4s** (phase `g`), which rules out the fp8 GEMMs, the
+kernels and the sampler — all of which the single-GPU path also uses. The divergence is
+introduced by something only the multi-rank path executes, and it is not the Ulysses
+all-to-alls: those are permutations, and permutations are bitwise exact.
+
+It is upstream's **asynchronous frame mean**, `UlyssesRuntime.video_frame_mean_async`
+(`src/inference/utils/ulysses_runtime.py:497-520`, untouched by any patch here), which has
+two nondeterministic steps and no third candidate between them:
+
+```python
+sums.index_add_(0, frames, local_x[is_video].float())   # CUDA atomics, order varies
+...
+work = dist.all_reduce(sums, async_op=True)             # cross-rank float sum
+```
+
+`index_add_` on CUDA accumulates with atomics, so the order of up to `tokens_per_frame`
+additions per (frame, channel) is not fixed run to run; `all_reduce` then sums across ranks in
+whatever order NCCL's algorithm choice gives that run. Both produce ULP-level differences in
+a quantity that feeds the linear branch's normalisation for *every* frame, and eight sampler
+steps amplify that into visible detail differences. This also explains the shape of the
+evidence: it appears at standard Ulysses (no branch split) because the frame mean is computed
+either way, and it disappears on one GPU because `infer.py` never builds a runtime to call it.
 
 **It is the same video, though.** Two measurements say so, and both matter:
 
@@ -234,12 +339,18 @@ trying to do.
 ### So the decode is tested on fixed latents instead
 
 The grid used to render the same prompt twice, once serial and once parallel, and `cmp` the
-mp4s. It reported `MISMATCH` at both canvases, and **the test was wrong, not necessarily the
-decode** — it was comparing two denoise trajectories. `scripts/decode_parity.py` (patch 8)
-replaces it: one process, one latent tensor, decoded both ways back to back, nothing upstream
-in the comparison.
+mp4s. It reported `MISMATCH` at both canvases, and **the test was wrong, not the decode** — it
+was comparing two denoise trajectories. `scripts/decode_parity.py` (patch 8) replaces it: one
+process, one latent tensor, decoded both ways back to back, nothing upstream in the
+comparison. Run that way:
 
-_Pending: the parity result from the box._
+```
+480p: OK -- bit-identical. The eight-rank decode is upstream's decode.
+768p: OK -- bit-identical. The eight-rank decode is upstream's decode.
+```
+
+Max absolute difference **0.0** at both canvases, on the pixel-denormalised float output. So
+patch 5's claim holds exactly, and the earlier `MISMATCH` was an artefact of the test.
 
 ## Text encoding is not in any of these numbers
 

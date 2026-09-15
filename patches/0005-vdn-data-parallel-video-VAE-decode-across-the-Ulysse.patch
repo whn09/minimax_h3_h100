@@ -1,7 +1,7 @@
 From 4f82fd621704c707b9638647d3f11ae1db763346 Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 12:14:37 +0800
-Subject: [PATCH 5/8] vdn: data-parallel video VAE decode across the Ulysses
+Subject: [PATCH 5/9] vdn: data-parallel video VAE decode across the Ulysses
  ranks
 
 The decode is the bigger half of a 480p render's post-warmup latency -- 13.8 s against
@@ -408,3 +408,6 @@ index 0000000..707fee5
 +        )
 +        dec = dec[:, :, :-pad_frames]
 +    return dec
+-- 
+2.54.0 (Apple Git-157)
+

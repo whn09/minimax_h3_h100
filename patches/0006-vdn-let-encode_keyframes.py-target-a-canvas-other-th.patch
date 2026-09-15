@@ -1,7 +1,7 @@
 From 461a864c1015cfab9718e860cd6409b3e6dcc191 Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 12:39:42 +0800
-Subject: [PATCH 6/8] vdn: let encode_keyframes.py target a canvas other than
+Subject: [PATCH 6/9] vdn: let encode_keyframes.py target a canvas other than
  768p
 
 A keyframe cache is only usable at the canvas it was encoded for: condition_latents come
@@ -83,3 +83,6 @@ index 3b7f289..9f3cb97 100644
      print(f"{mode}: canvas {width}x{height}; keyframes {anchors}", flush=True)
      device = args.device
  
+-- 
+2.54.0 (Apple Git-157)
+

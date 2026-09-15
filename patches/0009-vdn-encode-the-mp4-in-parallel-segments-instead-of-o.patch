@@ -1,0 +1,414 @@
+From 7df9492e449e4b7e0bcffe8461e642f4ffab0b33 Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Tue, 15 Sep 2026 14:46:19 +0800
+Subject: [PATCH 9/9] vdn: encode the mp4 in parallel segments instead of one
+ libx264 stream
+
+Once the colour conversion moved to the GPU, the mux is libx264 and nothing else, and
+x264's own frame threading is worth only 1.12x on a 864x480 canvas -- the serial part is
+the per-frame Python plane writes, which hold the GIL. So the clip is split into four
+contiguous ranges, encoded concurrently, and the bitstreams concatenated by copy.
+
+Measured on 345 frames of 864x480, PSNR against the input planes:
+
+    1 encoder,  thread_count=0     1.37 s   2.36 MB   42.72 dB
+    4 segments, thread_count=8     0.43 s   2.42 MB   42.34 dB
+    8 segments, thread_count=8     0.34 s   2.51 MB   41.63 dB
+   16 segments, thread_count=8     0.33 s   2.65 MB   40.68 dB
+
+Each segment costs one extra IDR, so this is not free -- 4 segments is +2.5 % bits for
+3.2x. It is still a better trade than the alternative of a faster preset, which buys 1.9x
+for 2.8 dB and fewer bits (a real rate-distortion loss, not a boundary cost).
+
+Two things about the concatenation that a frame count and a PSNR both miss, hence
+scripts/clipinfo.py. Every stream has to be declared before the first packet is muxed --
+PyAV writes the container header on the first mux(), and an audio stream added after that
+gets no time base, which surfaces as 'Cannot rebase to zero time'. And the re-stamping has
+to be done in the output stream's own time base (mp4 picks 1/12288, so a 24 fps frame is
+512 ticks): frame indices left as-is are read as 1/12288 ticks and give a 4952 fps clip,
+while setting packet.time_base to 1/fps fixes the pts but rescales packet.duration a second
+time and writes a 9.67 fps header. Both produce 345 frames in the right order.
+
+Also corrects this file's own docstring: the claim that swscale cost 2.03 s of the mux came
+from timing frame.reformat() per frame, which allocates a fresh frame each call. The
+matched-config measurement is ~0.45 s for the conversion and ~0.40 s for thread_count.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/config/inference.py        |  25 ++--
+ src/inference/infer.py         |   4 +-
+ src/inference/infer_ulysses.py |   2 +
+ src/inference/render.py        |  17 ++-
+ src/inference/utils/yuv.py     | 211 ++++++++++++++++++++++++++++-----
+ 5 files changed, 215 insertions(+), 44 deletions(-)
+
+diff --git a/src/config/inference.py b/src/config/inference.py
+index 928a638..4beb423 100644
+--- a/src/config/inference.py
++++ b/src/config/inference.py
+@@ -107,15 +107,26 @@ class RenderConfig:
+                                          # identity, resolved config, actual kernel
+                                          # state, per-NFE timings) -- a debug aid
+     gpu_color_convert: bool = True       # do RGB->YUV420p on the card instead of in
+-                                         # swscale (src.inference.utils.yuv). swscale's
+-                                         # conversion is single-threaded and was 2.03 s of
+-                                         # the 2.65 s mux at 480p; this also halves the
+-                                         # host copy, 3 bytes/px -> 1.5. It re-implements a
+-                                         # lossy conversion, so the encoded bytes change:
+-                                         # false restores diffusers' encode_video exactly,
+-                                         # for anyone who needs to reproduce an older clip.
++                                         # swscale (src.inference.utils.yuv). Worth ~0.45 s
++                                         # of the 2.70 s mux at 480p, and it halves the host
++                                         # copy, 3 bytes/px -> 1.5. It re-implements a lossy
++                                         # conversion, so the encoded bytes change: false
++                                         # restores diffusers' encode_video exactly, for
++                                         # anyone who needs to reproduce an older clip.
+                                          # Equivalence is checked numerically by
+                                          # scripts/mux_bench.py --verify.
++    encode_segments: int = 4             # encode this many contiguous frame ranges
++                                         # concurrently and concatenate the bitstreams.
++                                         # libx264 is what is actually left in the mux, and
++                                         # its own frame threading buys only 1.12x here;
++                                         # 4 segments buy 3.2x. Each segment costs one extra
++                                         # key frame -- 4 is +2.5 % bits and -0.38 dB, 16 is
++                                         # +12 % and -2.0 dB. 1 = one encoder, no boundaries.
++                                         # Ignored when gpu_color_convert is false.
++    encode_threads: int = 8              # thread_count per segment encoder. 4 x 8 = 32 of
++                                         # the box's 192 vCPUs; more per segment does not
++                                         # help, because x264's frame threading is the part
++                                         # that does not scale on a canvas this small.
+ 
+ 
+ @dataclass
+diff --git a/src/inference/infer.py b/src/inference/infer.py
+index d6e0e04..680fb34 100644
+--- a/src/inference/infer.py
++++ b/src/inference/infer.py
+@@ -66,7 +66,9 @@ def main():
+         print(f"wrote {lpath}", flush=True)
+ 
+     decode_and_save(latents, audio_latents, model.vae, model.audio_vae, cfg.render.out,
+-                    device, gpu_color_convert=cfg.render.gpu_color_convert)
++                    device, gpu_color_convert=cfg.render.gpu_color_convert,
++                    encode_segments=cfg.render.encode_segments,
++                    encode_threads=cfg.render.encode_threads)
+ 
+     if cfg.render.record:
+         jpath = cfg.render.out + ".inference.json"
+diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
+index c148a25..02a27ec 100644
+--- a/src/inference/infer_ulysses.py
++++ b/src/inference/infer_ulysses.py
+@@ -190,6 +190,8 @@ def main():
+         timings["decode_stages"] = decode_and_save(
+             latents, audio_latents, model.vae, model.audio_vae, cfg.render.out, str(device),
+             video=video, gpu_color_convert=cfg.render.gpu_color_convert,
++            encode_segments=cfg.render.encode_segments,
++            encode_threads=cfg.render.encode_threads,
+         )
+         torch.cuda.synchronize(device)
+ 
+diff --git a/src/inference/render.py b/src/inference/render.py
+index 6d9c6e0..f1bf306 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -266,7 +266,8 @@ def decode_video_latents(vae, latents, device: str, runtime=None):
+ 
+ @torch.no_grad()
+ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str,
+-                    video=None, gpu_color_convert: bool = True):
++                    video=None, gpu_color_convert: bool = True,
++                    encode_segments: int = 4, encode_threads: int = 8):
+     """Returns a dict of per-stage seconds. At 480p the whole of this outweighs the
+     denoising it follows -- 13.8 s against 8.9 s -- and unlike denoising none of it is
+     parallel by default: one rank decodes while the other seven sit at the barrier. So the
+@@ -278,7 +279,9 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+     multi-rank decode gets its result in here. None keeps the single-rank behaviour.
+ 
+     `gpu_color_convert` moves RGB->YUV420p onto the card (utils/yuv.py); false is
+-    diffusers' encode_video, byte-for-byte as before. See RenderConfig for why it exists."""
++    diffusers' encode_video, byte-for-byte as before. `encode_segments`/`encode_threads`
++    parallelise libx264, which is what the mux is once the conversion is gone. See
++    RenderConfig for the measured cost of each."""
+     timings: dict[str, float] = {}
+     stage_started = time.perf_counter()
+ 
+@@ -325,9 +328,13 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+     # output format". Same directory either way, which is what os.replace needs.
+     stem, ext = os.path.splitext(out_path)
+     partial_path = f"{stem}.partial{ext}"
+-    write = encode_video_yuv420p if gpu_color_convert else encode_video
+-    write(frames, fps=FPS, output_path=partial_path,
+-          audio=audio.cpu(), audio_sample_rate=audio_vae.config.sampling_rate)
++    common = dict(fps=FPS, output_path=partial_path, audio=audio.cpu(),
++                  audio_sample_rate=audio_vae.config.sampling_rate)
++    if gpu_color_convert:
++        encode_video_yuv420p(frames, segments=encode_segments,
++                             thread_count=encode_threads, **common)
++    else:
++        encode_video(frames, **common)
+     os.replace(partial_path, out_path)
+     stage("mux_seconds")
+     print(f"wrote {out_path}", flush=True)
+diff --git a/src/inference/utils/yuv.py b/src/inference/utils/yuv.py
+index 5fdd0f7..1625668 100644
+--- a/src/inference/utils/yuv.py
++++ b/src/inference/utils/yuv.py
+@@ -1,17 +1,21 @@
+ """Do the RGB -> YUV420p colour conversion on the GPU, not in swscale.
+ 
+ After the video VAE went data-parallel (utils/parallel_vae.py) the largest single item left
+-in a 480p request was the mp4 mux, at 2.65 s against the eight-way decode's 2.11 s. Measured
+-with scripts/mux_bench.py, on 345 frames of 864x480, that 2.65 s decomposes as:
++in a 480p request was the mp4 mux, at 2.70 s against the eight-way decode's 2.15 s. Two
++things in it are avoidable, and measuring them separately mattered because they are not the
++same size. At 480p / 345 frames, matched config, only this file's switch differing:
+ 
+-    VideoFrame.from_ndarray(rgb24)      0.30 s
+-    reformat rgb24 -> yuv420p           2.03 s   <-- swscale, single-threaded
+-    x264 encode, thread_count=0         1.72 s   (already multi-threaded; 6.40 s at 1)
++    mux, swscale + thread_count=1 (upstream)     2.70 s
++    mux, swscale + thread_count=0                ~2.30 s   (mux_bench's 1.17x thread arm)
++    mux, planes from the GPU + thread_count=0     1.85 s
+ 
+-So it was never x264. It is the colour conversion, running serially in the calling thread,
+-which is why setting `thread_count` on the stream buys almost nothing (1.17x). The pixels
+-are already on the GPU as float32 in [0, 1] -- the conversion is a 3x3 matrix and a 2x2
+-average, both of which the card does in microseconds.
++So the conversion is worth ~0.45 s and the thread setting ~0.40 s. **The dominant cost is
++libx264 itself**, which is why the encode is also segmented below. An earlier version of this
++file claimed swscale cost 2.03 s; that came from timing `frame.reformat()` per frame in a
++loop, which allocates a fresh frame every call and overstates what the encoder's internal
++conversion actually costs. The GPU conversion is still worth doing -- the pixels are already
++on the card as float32 in [0, 1], and the conversion is a 3x3 matrix and a 2x2 average that
++the card does in microseconds -- but it is not where the mux's time was.
+ 
+ Converting here also halves the host transfer, which is the second item on the list:
+ yuv420p is 1.5 bytes per pixel against rgb24's 3, so a 345-frame 864x480 clip crosses PCIe
+@@ -87,8 +91,125 @@ def _pool2(plane: torch.Tensor) -> torch.Tensor:
+     return plane.view(frames, height // 2, 2, width // 2, 2).mean(dim=(2, 4))
+ 
+ 
++def _write_frames(stream, container, y_np, u_np, v_np) -> None:
++    """Feed a (frames, h, w) plane triple into `stream`, muxing into `container`."""
++    import av
++    import numpy as np
++
++    height, width = y_np.shape[1:]
++    for index in range(y_np.shape[0]):
++        frame = av.VideoFrame(width, height, "yuv420p")
++        # PyAV exposes each plane as a writable buffer with its own stride, which is padded up
++        # for alignment and is NOT width. Going through np.frombuffer on the plane and slicing
++        # to the real width is what respects that; `plane.update(bytes)` would need the
++        # padding baked into the source.
++        for plane, source in zip(frame.planes, (y_np[index], u_np[index], v_np[index])):
++            view = np.frombuffer(plane, dtype=np.uint8).reshape(-1, plane.line_size)
++            view[: source.shape[0], : source.shape[1]] = source
++        frame.pts = index
++        for packet in stream.encode(frame):
++            container.mux(packet)
++    for packet in stream.encode():
++        container.mux(packet)
++
++
++def _encode_segment(y_np, u_np, v_np, fps: int, thread_count: int) -> bytes:
++    """One contiguous frame range, encoded to an in-memory mp4. Runs in a worker thread.
++
++    In memory rather than in a temp file: a segment is a few hundred KB, and BytesIO is
++    seekable, which is all the mp4 muxer needs to write its moov atom.
++    """
++    import io
++
++    import av
++
++    buffer = io.BytesIO()
++    with av.open(buffer, mode="w", format="mp4") as container:
++        stream = container.add_stream("libx264", rate=int(fps))
++        stream.height, stream.width = y_np.shape[1:]
++        stream.pix_fmt = "yuv420p"
++        stream.codec_context.thread_count = thread_count
++        _write_frames(stream, container, y_np, u_np, v_np)
++    return buffer.getvalue()
++
++
++def _video_stream_from(blob: bytes, container, fps: int):
++    """Add an output video stream matching an encoded segment, without muxing anything.
++
++    Split out from the copy below because **every stream has to exist before the first
++    packet is muxed**: PyAV writes the container header on the first `mux()`, and a stream
++    added after that gets no time base, which surfaces later as `ValueError: Cannot rebase
++    to zero time` when the audio is written. The template can only be read off an encoded
++    segment, so the order is: encode the segments, add the video stream, add the audio
++    stream, and only then copy the packets.
++    """
++    import io
++
++    import av
++
++    with av.open(io.BytesIO(blob)) as segment:
++        source = segment.streams.video[0]
++        stream = container.add_stream_from_template(source)
++        # The template's time base comes along, and it is deliberately left alone: the mp4
++        # muxer overwrites whatever is set here when it writes the header (it went straight
++        # back to the template's 1/12288 when this tried to force 1/24), so the only reliable
++        # unit to re-stamp in is the one the output actually ends up with. Which the copy
++        # below reads off the stream rather than assuming.
++        return stream, source.codec_context.extradata
++
++
++def _copy_segments(blobs, container, stream, extradata, fps: int) -> None:
++    """Bitstream-copy encoded segments into `stream`, re-stamping the timestamps.
++
++    Concatenating H.264 like this is sound because each segment was encoded independently:
++    it opens with an IDR and no frame in it references anything outside it, so a decoder can
++    start there. The one thing that must hold across segments is the SPS/PPS, since mp4
++    carries a single copy in the `avcC` box -- identical dimensions and identical encoder
++    settings give identical parameter sets, and that is asserted rather than assumed.
++
++    Every segment's timestamps restart at 0, so each one is shifted by the frames already
++    written. The shift is in the OUTPUT stream's own time base, read off the stream: mp4
++    writes 1/12288 here, so a frame at 24 fps is 512 ticks. Doing the arithmetic in frame
++    indices instead and letting PyAV rescale looked cleaner and was wrong twice over -- with
++    `packet.time_base` left alone the indices were read as 1/12288 ticks (a 4952 fps clip),
++    and with it set to 1/fps the pts came out right but `packet.duration`, which is already in
++    the segment's units, was rescaled a second time and the mp4's frame-rate header went to
++    9.67 fps. scripts/clipinfo.py is what catches this: the frames and their order survive
++    both bugs, so a frame count or a PSNR sees nothing wrong.
++    """
++    import io
++
++    import av
++
++    time_base = stream.time_base
++    ticks_per_frame = int(round(1 / (int(fps) * time_base)))
++    offset = 0
++    for blob in blobs:
++        with av.open(io.BytesIO(blob)) as segment:
++            source = segment.streams.video[0]
++            if source.codec_context.extradata != extradata:
++                raise RuntimeError("segments disagree on SPS/PPS; the concatenation would "
++                                   "decode as garbage after the first segment")
++            scale = source.time_base / time_base       # 1 in practice; not assumed
++            frames = 0
++            for packet in segment.demux(source):
++                if packet.dts is None:
++                    continue                      # the demuxer's flush packet
++                # pts and dts separately, because libx264 emits B-frames and the two orders
++                # differ; dts can also start negative, which the offset absorbs.
++                packet.pts = offset + round(packet.pts * scale)
++                packet.dts = offset + round(packet.dts * scale)
++                if packet.duration:
++                    packet.duration = round(packet.duration * scale)
++                packet.stream = stream
++                container.mux(packet)
++                frames += 1
++            offset += frames * ticks_per_frame
++
++
+ def encode_video_yuv420p(planes, fps: int, output_path: str, audio=None,
+-                         audio_sample_rate: int | None = None) -> None:
++                         audio_sample_rate: int | None = None,
++                         segments: int = 4, thread_count: int = 8) -> None:
+     """`diffusers.utils.export_utils.encode_video`, taking yuv420p planes instead of rgb24.
+ 
+     `planes` is the `(y, u, v)` from `rgb_to_yuv420p`, already on the host. Each frame's
+@@ -96,47 +217,75 @@ def encode_video_yuv420p(planes, fps: int, output_path: str, audio=None,
+     converts a colour space -- which is the entire point, that work having already happened on
+     the card.
+ 
++    `segments` splits the clip into that many contiguous ranges, encodes them concurrently in
++    threads, and concatenates the bitstreams. x264's own frame threading barely helps at this
++    canvas -- 345 frames of 864x480 go 251 fps at `thread_count=0` against 224 at 1, a 1.12x
++    on a 192-vCPU box -- because the serial part is the per-frame Python work, which holds the
++    GIL. Independent encoders sidestep both limits. Measured, same frames, PSNR against the
++    input planes:
++
++        1 encoder,  thread_count=0     1.37 s   2.36 MB   42.72 dB
++        4 segments, thread_count=8     0.43 s   2.42 MB   42.34 dB   <-- the default
++        8 segments, thread_count=8     0.34 s   2.51 MB   41.63 dB
++       16 segments, thread_count=8     0.33 s   2.65 MB   40.68 dB
++
++    **This is not free: it costs key frames.** Each segment starts with an IDR, so 4 segments
++    is 2.5 % more bits and 0.38 dB for 3.2x. That is a much better trade than the obvious
++    alternative of a faster x264 preset, which buys 1.9x for 2.8 dB and *fewer* bits, i.e. a
++    real rate-distortion loss rather than a boundary cost. Past 8 segments the returns stop
++    (0.34 -> 0.33 s) while the bits keep growing, so 4 is the default and `segments=1` restores
++    a single encoder exactly.
++
+     The audio path is diffusers' own, imported rather than reimplemented: the soundtrack is
+     a few hundred KB and none of it is on the critical path.
+     """
+     import av
+-    import numpy as np
++    from concurrent.futures import ThreadPoolExecutor
+     from diffusers.utils.export_utils import _prepare_audio_stream, _write_audio
+ 
++    if audio is not None and audio_sample_rate is None:
++        raise ValueError("audio_sample_rate is required when audio is provided")
++
+     y, u, v = planes
+     num_frames, height, width = y.shape
++    y_np, u_np, v_np = (p.numpy() for p in (y, u, v))
++
++    if segments > 1 and num_frames >= 2 * segments:
++        bounds = [round(i * num_frames / segments) for i in range(segments + 1)]
++        with ThreadPoolExecutor(max_workers=segments) as pool:
++            blobs = list(pool.map(
++                lambda i: _encode_segment(y_np[bounds[i]:bounds[i + 1]],
++                                          u_np[bounds[i]:bounds[i + 1]],
++                                          v_np[bounds[i]:bounds[i + 1]], fps, thread_count),
++                range(segments)))
++        container = av.open(output_path, mode="w")
++        # Video stream first, so it lands at index 0 as it does on the single-encoder path
++        # and on upstream's -- players and downstream tools do assume that. Both streams are
++        # declared before any packet is muxed; see _video_stream_from for why that matters.
++        stream, extradata = _video_stream_from(blobs[0], container, fps)
++        audio_stream = None
++        if audio is not None:
++            audio_stream = _prepare_audio_stream(container, audio_sample_rate)
++        _copy_segments(blobs, container, stream, extradata, fps)
++        if audio is not None:
++            _write_audio(container, audio_stream, audio, audio_sample_rate, av)
++        container.close()
++        return
+ 
+     container = av.open(output_path, mode="w")
+     stream = container.add_stream("libx264", rate=int(fps))
+     stream.width, stream.height = width, height
+     stream.pix_fmt = "yuv420p"
+-    # Measured worth 1.17x on its own (scripts/mux_bench.py): 0 is "decide for me", which for
++    # Measured worth 1.12x on its own (scripts/mux_bench.py): 0 is "decide for me", which for
+     # libx264 hands off to x264's own auto-detect. PyAV does not set this, and upstream's
+-    # encode_video does not either. Small next to the conversion this file removes, but free.
++    # encode_video does not either.
+     stream.codec_context.thread_count = 0
+ 
+     audio_stream = None
+     if audio is not None:
+-        if audio_sample_rate is None:
+-            raise ValueError("audio_sample_rate is required when audio is provided")
+         audio_stream = _prepare_audio_stream(container, audio_sample_rate)
+ 
+-    y_np, u_np, v_np = (p.numpy() for p in (y, u, v))
+-    for index in range(num_frames):
+-        frame = av.VideoFrame(width, height, "yuv420p")
+-        # PyAV exposes each plane as a writable buffer with its own stride, which is padded up
+-        # for alignment and is NOT width. Going through np.frombuffer on the plane and slicing
+-        # to the real width is what respects that; `plane.update(bytes)` would need the
+-        # padding baked into the source.
+-        for plane, source in zip(frame.planes, (y_np[index], u_np[index], v_np[index])):
+-            view = np.frombuffer(plane, dtype=np.uint8).reshape(-1, plane.line_size)
+-            view[: source.shape[0], : source.shape[1]] = source
+-        frame.pts = index
+-        for packet in stream.encode(frame):
+-            container.mux(packet)
+-
+-    for packet in stream.encode():
+-        container.mux(packet)
++    _write_frames(stream, container, y_np, u_np, v_np)
+     if audio is not None:
+         _write_audio(container, audio_stream, audio, audio_sample_rate, av)
+     container.close()
+-- 
+2.54.0 (Apple Git-157)
+

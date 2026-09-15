@@ -1,7 +1,7 @@
 From 1aa74989c82873b2fa203a7d1692b365d2b65e6a Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 13:59:57 +0800
-Subject: [PATCH 8/8] vdn: test the parallel VAE decode against the serial one
+Subject: [PATCH 8/9] vdn: test the parallel VAE decode against the serial one
  on fixed latents
 
 Patch 0005 claims its eight-rank decode is bit-identical to vae.decode(), and the grid was
@@ -160,3 +160,6 @@ index 0000000..b15f839
 +
 +if __name__ == "__main__":
 +    main()
+-- 
+2.54.0 (Apple Git-157)
+
