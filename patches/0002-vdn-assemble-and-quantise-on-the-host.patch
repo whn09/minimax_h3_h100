@@ -1,0 +1,118 @@
+From 9bcaf5ab8923f1e5e4b2dc046545e79d45db67ee Mon Sep 17 00:00:00 2001
+From: vdn-h100 <none@local>
+Date: Tue, 15 Sep 2026 10:31:51 +0800
+Subject: [PATCH 2/2] vdn: assemble and quantise on the host so fp8 fits an 80
+ GiB card
+
+fp8 assembly does not fit an H100. Ulysses shards the sequence, not the
+weights, so every rank replicates the whole DiT: ~63 GiB in bf16, and ~78 GiB
+once the hybrid branch and stage-dmd-step-250's two LoRAs are merged.
+convert_linear_to_fp8 then needs one Linear's bf16 weight and its fp8 copy
+alive at the same time, which is about a gigabyte more than the card has:
+
+  torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 294.00 MiB.
+  GPU 5 has a total capacity of 79.18 GiB of which 24.06 MiB is free.
+    File "src/models/ops/fp8_linear.py", line 263, in __init__
+
+It fits a 141 GiB H200, which is why upstream never hit it.
+
+So when fp8 is enabled, assemble on the host and move only the finished model
+to the device -- ~47 GiB of weights instead of a ~78 GiB transient peak. The
+order of operations is untouched (transform -> branch -> LoRA -> fp8) and every
+step is elementwise or a small matmul, so the resulting weights are identical;
+only the device the arithmetic ran on differs. Without fp8 there is nothing to
+gain, so the released bf16 path still goes straight to the card.
+
+max_memory_allocated is reset after the move so the record reports the RENDER's
+peak rather than the assembly's.
+
+Note for anyone running this: torchrun defaults OMP_NUM_THREADS to 1, which
+leaves the host-side merge and quantise single-threaded and takes it from ~200 s
+to over ten minutes. Set it (192 cores / 8 ranks = 24 on a p5.48xlarge).
+---
+ src/inference/render.py         | 10 +++++++---
+ src/inference/utils/assemble.py | 29 +++++++++++++++++++++++++++--
+ 2 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/src/inference/render.py b/src/inference/render.py
+index 308378f..cb1ead0 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -54,15 +54,19 @@ KEYFRAME_NOISE_AUG = 0.999
+ 
+ 
+ def load_models(model_root: str, device: str, vae_source: str = None,
+-                load_decoders: bool = True):
++                load_decoders: bool = True, transformer_device: str = None):
+     """`model_root` holds the transformer; both decoders come from `vae_source`,
+     default the release copy. Ranks that never decode pass `load_decoders=False` and
+-    get (transformer, None, None)."""
++    get (transformer, None, None).
++
++    `transformer_device` puts the transformer somewhere other than the decoders --
++    "cpu", so that assembly and fp8 quantisation happen on the host and only the
++    finished model is moved to an 80 GiB card (see build_inference_model)."""
+     vae_source = resolve_weights(vae_source or DEFAULT_MODEL_ROOT)
+     model_root = resolve_weights(model_root)
+     transformer = MiniMaxH3Transformer3DModel.from_pretrained(
+         model_root, subfolder="transformer", torch_dtype=torch.bfloat16
+-    ).to(device)
++    ).to(transformer_device or device)
+     transformer.eval().requires_grad_(False)
+ 
+     if not load_decoders:
+diff --git a/src/inference/utils/assemble.py b/src/inference/utils/assemble.py
+index 0863ce9..96e6eef 100644
+--- a/src/inference/utils/assemble.py
++++ b/src/inference/utils/assemble.py
+@@ -81,8 +81,24 @@ def build_inference_model(cfg, device, *, load_decoders: bool = True,
+ 
+     base_source = cfg.base_source or (
+         art.model_spec["base"]["source"] if art else DEFAULT_MODEL_ROOT)
++    # Where the ASSEMBLY arithmetic happens, which is not necessarily where the model
++    # runs. Ulysses shards the sequence, not the weights, so every rank replicates the
++    # whole DiT: bf16 it is ~63 GiB, and the hybrid branch plus the two merged LoRAs of
++    # stage-dmd-step-250 take it to ~78 GiB. convert_linear_to_fp8 then needs one
++    # Linear's bf16 weight and its fp8 copy alive together, which is ~1 GiB more than an
++    # 80 GiB H100 has -- it fits a 141 GiB H200, which is why upstream never hit it.
++    # Quantising on the host and moving the FINISHED model over peaks at ~47 GiB on the
++    # card instead. The order is untouched (transform -> branch -> LoRA -> fp8) and every
++    # step is elementwise or a small matmul, so the resulting weights are identical; only
++    # the device they were computed on differs. Without fp8 there is nothing to gain, so
++    # the released path (bf16, straight to the card) is left exactly as it was.
++    assembly_device = "cpu" if cfg.precision.fp8.enabled else device
++    if assembly_device != device:
++        say(f"assembling on {assembly_device}, then moving to {device} "
++            f"(fp8 peak does not fit this card)", flush=True)
+     transformer, vae, audio_vae = load_models(
+-        base_source, device, vae_source=cfg.vae_source, load_decoders=load_decoders)
++        base_source, device, vae_source=cfg.vae_source, load_decoders=load_decoders,
++        transformer_device=assembly_device)
+ 
+     merged = 0
+     if art:
+@@ -99,7 +115,7 @@ def build_inference_model(cfg, device, *, load_decoders: bool = True,
+     else:
+         say("DENSE BASE render: no checkpoint -- no transform, no branch", flush=True)
+ 
+-    transformer.to(device).eval().requires_grad_(False)
++    transformer.to(assembly_device).eval().requires_grad_(False)
+ 
+     external_records = []
+     for xl in cfg.external_loras:
+@@ -140,6 +156,15 @@ def build_inference_model(cfg, device, *, load_decoders: bool = True,
+             transformer, skip_end_blocks=cfg.precision.fp8.skip_end_blocks)
+         say(f"fp8: {fp8_linears} Linears quantised", flush=True)
+ 
++    if assembly_device != device:
++        transformer.to(device)
++        # The host copy is what we just halved; drop the allocator's idea of the peak so
++        # `torch.cuda.max_memory_allocated` in the record reports the RENDER's peak.
++        torch.cuda.reset_peak_memory_stats(device)
++        say(f"moved to {device}: "
++            f"{torch.cuda.memory_allocated(device) / 2**30:.1f} GiB of weights",
++            flush=True)
++
+     return InferenceModel(transformer=transformer, vae=vae, audio_vae=audio_vae,
+                           artifact=art, is_hybrid=is_hybrid, merged_lora_pairs=merged,
+                           external_loras=external_records, ablated=ablated,

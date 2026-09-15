@@ -43,8 +43,14 @@ run() {
   echo "=== [$(date -u +%H:%M:%S)] $tag  (gpus=$gpus, $config, $*)"
   # A dead rank from a previous arm leaves the port bound; --standalone picks a free one,
   # but stale processes still hold HBM, so make each arm start from a clean box.
-  pkill -f infer_ulysses.py 2>/dev/null; sleep 3
+  pkill -f 'infer_ulysses\.py' 2>/dev/null; sleep 3
+  # OMP_NUM_THREADS: torchrun's own default is 1, which is right for the render but makes
+  # patch 2's host-side assembly (LoRA merge + fp8 quantise on the CPU) single-threaded.
+  # Measured on this box: 1 thread was still going after 6 minutes; 192/nproc finishes the
+  # whole assembly in ~200 s. The render itself is unaffected -- it is all on the device.
   CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((gpus - 1))) \
+  OMP_NUM_THREADS=$((192 / gpus)) MKL_NUM_THREADS=$((192 / gpus)) \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   timeout 3600 torchrun --standalone --nproc_per_node="$gpus" src/inference/infer_ulysses.py \
       --config "configs/inference/$config" \
       checkpoint="$CKPT" \
