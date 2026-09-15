@@ -20,8 +20,20 @@ precision:
     skip_end_blocks: 0
 
 parallel:
-  softmax_ranks: 6
+  # 5 softmax + 3 linear: 2.470 s/NFE, the best of the swept 0/3/4/5/6 at this canvas
+  # (RESULTS.md). Upstream's 6+2 is 2.590 here, only 5 % off -- a much better default at
+  # 768p than it is at 480p, where it costs 24 %. Note that 480p's winner, 3, is the WORST
+  # of the five here (3.331): the window softmax costs
+  # O(rows x window_frames x tokens_per_frame) and 768p has 1008 tokens per frame against
+  # 480p's 405, so there is 2.49x more softmax work per row to spread and it wants more
+  # ranks to spread it over. The split is a property of the canvas, not of the machine.
+  softmax_ranks: 5
   profile: false
+  # 768p only. 45.2 GiB of fp8 weights on every rank, ~11 GiB of decoders on rank 0, and a
+  # 345-frame 1344x768 decode is ~4 GiB past what an 80 GiB card has, so the DiT is parked
+  # on the host once denoising is done. ~27 s of PCIe, all of it after the measured
+  # denoise. 480p has the headroom and leaves this off.
+  offload_transformer_before_decode: true
 
 render:
   height: 768

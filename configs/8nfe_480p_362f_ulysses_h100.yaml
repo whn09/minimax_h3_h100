@@ -21,8 +21,9 @@ precision:
     skip_end_blocks: 0
 
 parallel:
-  softmax_ranks: 0
+  softmax_ranks: 3       # the 480p optimum; see the 345f config for the sweep
   profile: false
+  parallel_vae_decode: true
 
 render:
   height: 480

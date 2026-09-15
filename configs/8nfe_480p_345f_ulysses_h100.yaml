@@ -39,8 +39,18 @@ precision:
     skip_end_blocks: 0
 
 parallel:
-  softmax_ranks: 0     # standard Ulysses; measured faster than 6+2 at this size
+  # 3 softmax + 5 linear. The full sweep 0..7 at this size (RESULTS.md) is a real interior
+  # minimum: 1.090 s/NFE here, against 1.110 at 4+4, 1.302 at standard Ulysses and 1.356 at
+  # the 6+2 upstream tuned on a 768p H200. 480p/345f is 43,759 rows to 768p's 105,265, and
+  # the window softmax's cost falls faster with the row count than the linear scan's does,
+  # so the balance point moves down as the canvas shrinks.
+  softmax_ranks: 3
   profile: false
+  # The video VAE on all eight ranks instead of rank 0 alone. At 480p the decode is the
+  # BIGGER half of the post-warmup latency (13.8 s against 8.7 s of denoising), and it is
+  # 20 independent non-causal-ViT chunks, so it splits with one all-gather and no change to
+  # the output. See patches/0005 and src/inference/utils/parallel_vae.py.
+  parallel_vae_decode: true
 
 render:
   height: 480

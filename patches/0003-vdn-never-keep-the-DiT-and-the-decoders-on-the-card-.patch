@@ -1,35 +1,65 @@
-From 6120dae0d0fd2cb283e8f91f7e2cc99d3bb6dae7 Mon Sep 17 00:00:00 2001
+From 4680f6abca1928d2d10786e5d9ba342c12444826 Mon Sep 17 00:00:00 2001
 From: vdn-h100 <none@local>
 Date: Tue, 15 Sep 2026 10:39:04 +0800
-Subject: [PATCH 3/3] vdn: load the Ulysses decoders after denoising, not
- before
+Subject: [PATCH 3/8] vdn: never keep the DiT and the decoders on the card at
+ once
 
-At 768p on an 80 GiB card rank 0 dies and ranks 1-7 do not:
+At 768p on an 80 GiB card rank 0 dies twice over where ranks 1-7 are fine, and
+both times the reason is the same: install_ulysses replicates the transformer on
+every rank (45.2 GiB in fp8) but only the main rank carries the video and audio
+VAEs, and those are ~11 GiB.
+
+First in the denoising loop, where a block's activations want 10.33 GiB and
+about 13 GiB is left:
 
   [rank0]: torch.OutOfMemoryError: Tried to allocate 10.33 GiB.
   GPU 0 has a total capacity of 79.18 GiB of which 8.69 GiB is free.
     File "src/models/ops/fused_block.py", line 106, in fast_block_forward
 
-The asymmetry is the decoders. install_ulysses gives every rank the same
-transformer -- 55.5 GiB in fp8 at 768p -- but only the main rank loads the video
-and audio VAEs, and those are ~11 GiB. That leaves rank 0 about 13 GiB for
-activations where a block wants 10.33 GiB plus everything already live.
+Then, once the decoders are deferred past the loop, in the decode itself, where
+345 frames of 1344x768 want ~4 GiB more than remains:
 
-The decoders do nothing during the denoising loop, so load them when they are
-first needed instead. Rank 0 then has the same headroom as every other rank.
-Timed as its own `decoder_load_seconds` rather than folded into setup or decode,
-so nothing is hidden by the move; `denoise_seconds` is untouched, which is what
-the published comparison is measured on.
+  [rank0]: torch.OutOfMemoryError: Tried to allocate 3.98 GiB.
+  GPU 0 has a total capacity of 79.18 GiB of which 3.92 GiB is free.
+    File "src/inference/render.py", line 242, in decode_and_save
 
-A 141 GiB H200 fits both at once, which is why upstream loads them up front.
-src/inference/infer.py is single-GPU and unchanged.
+The two never need to be co-resident: the decoders are idle while denoising and
+the transformer is idle while decoding. So the decoders are loaded after the loop
+instead of before it, and the transformer is parked on the host before the
+decode. Rank 0 then has the same headroom as every other rank at both moments.
+
+Timed as their own `decoder_load_seconds` and `transformer_offload_seconds`
+rather than folded into setup or decode, so the move is visible rather than
+hidden. `denoise_seconds` -- the number upstream's published comparison is
+measured on -- is untouched by both.
+
+A 141 GiB H200 fits everything at once, which is why upstream loads decoders up
+front and never offloads. src/inference/infer.py is single-GPU and unchanged.
 ---
- src/inference/infer_ulysses.py | 17 +++++++++++++----
+ src/config/inference.py        |  6 ++++++
+ src/inference/infer_ulysses.py | 32 ++++++++++++++++++++++++++++----
  src/inference/render.py        | 18 ++++++++++++++++--
- 2 files changed, 29 insertions(+), 6 deletions(-)
+ 3 files changed, 50 insertions(+), 6 deletions(-)
 
+diff --git a/src/config/inference.py b/src/config/inference.py
+index 7d56c95..b818e96 100644
+--- a/src/config/inference.py
++++ b/src/config/inference.py
+@@ -57,6 +57,12 @@ class ParallelConfig:
+     """torchrun layout for infer_ulysses.py."""
+     softmax_ranks: int = 6               # 0 = standard Ulysses; n = n softmax + (world-n) linear
+     profile: bool = False                # per-section CUDA events: profiling only
++    # Park the DiT on the host after denoising, so the main rank can hold the decoders and
++    # a full-length decode. Needed at 768p on an 80 GiB card and nowhere else: 45.2 GiB of
++    # fp8 weights, plus ~11 GiB of decoders, plus a 345-frame 1344x768 decode is ~4 GiB
++    # over. Costs ~27 s of PCIe, all of it after the measured denoise -- so leave it off
++    # when the canvas has headroom, which 480p does.
++    offload_transformer_before_decode: bool = False
+ 
+ 
+ @dataclass
 diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
-index 7a14b0d..288ea42 100644
+index 7a14b0d..9778549 100644
 --- a/src/inference/infer_ulysses.py
 +++ b/src/inference/infer_ulysses.py
 @@ -36,7 +36,7 @@ from src.inference.utils.assemble import (
@@ -41,25 +71,39 @@ index 7a14b0d..288ea42 100644
  from src.inference.utils.ulysses import init_ulysses, install_ulysses
  
  
-@@ -57,9 +57,11 @@ def main():
+@@ -57,9 +57,13 @@ def main():
      device = runtime.device
      torch.set_grad_enabled(False)
  
 -    model = build_inference_model(
 -        cfg, device, load_decoders=runtime.is_main, log=runtime.is_main
 -    )
-+    # No rank loads decoders here, not even the main one: they are ~11 GiB, they are idle
-+    # until the loop is over, and on an 80 GiB card at 768p they are the difference between
-+    # rank 0 finishing and rank 0 dying in a block's activations while ranks 1-7 are fine.
-+    # Loaded below, after denoising, and timed separately so the split stays visible.
++    # No rank loads decoders here, not even the main one. On an 80 GiB card the DiT and the
++    # VAEs cannot be co-resident at 768p, and they never need to be: the decoders are idle
++    # during denoising and the transformer is idle during decoding. So the decoders arrive
++    # after the loop (below) and the transformer leaves before the decode. Without this,
++    # rank 0 dies in a block's activations while ranks 1-7 finish, because rank 0 is the
++    # only rank that carries decoders. Both moves are timed separately so nothing hides.
 +    model = build_inference_model(cfg, device, load_decoders=False, log=runtime.is_main)
      if not model.is_hybrid:
          raise ValueError("Ulysses path currently requires a HybridAttention checkpoint")
  
-@@ -137,6 +139,12 @@ def main():
+@@ -137,6 +141,24 @@ def main():
          os.makedirs(os.path.dirname(lpath) or ".", exist_ok=True)
          torch.save({"video": latents.cpu(), "audio": audio_latents.cpu()}, lpath)
  
++    # ... and the transformer goes the other way, when the config asks. At 768p on an
++    # 80 GiB card the DiT (45.2 GiB in fp8) and the decoders (~11 GiB) plus a 345-frame
++    # 1344x768 decode do not fit together either -- the decode wants ~4 GiB more than what
++    # is left. Denoising is finished, so the main rank parks the transformer on the host
++    # first. Every other rank is already waiting at the barrier below and holds nothing that
++    # matters. Off by default: it is ~27 s of PCIe, and 480p does not need it.
++    offload_started = time.perf_counter()
++    if runtime.is_main and cfg.parallel.offload_transformer_before_decode:
++        model.transformer.to("cpu")
++        torch.cuda.empty_cache()
++    timings["transformer_offload_seconds"] = time.perf_counter() - offload_started
++
 +    # The denoising activations are gone by now, so the decoders have room.
 +    decoder_load_started = time.perf_counter()
 +    if runtime.is_main:
@@ -69,10 +113,11 @@ index 7a14b0d..288ea42 100644
      decode_started = time.perf_counter()
      if runtime.is_main:
          decode_and_save(
-@@ -174,6 +182,7 @@ def main():
+@@ -174,6 +196,8 @@ def main():
              f"denoise {timings['denoise_seconds']:.2f}s "
              f"({timings['seconds_per_step']:.2f}s/step; per NFE "
              + " ".join(f"{x:.2f}" for x in timings["step_seconds"]) + "), "
++            f"offload {timings['transformer_offload_seconds']:.2f}s, "
 +            f"decoder load {timings['decoder_load_seconds']:.2f}s, "
              f"decode+encode {timings['decode_and_encode_seconds']:.2f}s, "
              f"E2E {timings['end_to_end_seconds']:.2f}s",

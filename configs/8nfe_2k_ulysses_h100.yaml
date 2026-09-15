@@ -1,0 +1,58 @@
+# 2K, for the "how long would 2K take" question -- and it needs a caveat up front.
+#
+# MiniMax's 2K is NOT a super-resolution module and NOT a GPU feature. It is H3-Regenerate-2K:
+# the 768p result is fed back into the H3 base model together with the original multimodal
+# context, and the model regenerates the clip at 2K in-context. That module is explicitly
+# NOT open-sourced ("Due to the complexity of the system, this module is not yet
+# open-sourced"), only reachable through /video-generation-v2-regeneration. So nothing here
+# runs MiniMax's 2K path.
+#
+# What this file does measure is the part that IS on this box: what one denoising pass over
+# a 2K canvas costs on this DiT. That is a LOWER BOUND on the regeneration pass, because
+# regeneration additionally carries the 768p clip's rows as context (another ~103k rows on
+# top of the ~370k this generates). It is also out of distribution -- H3-Base is trained at
+# 768p short edge and the released pipeline hard-caps canvas_max_pixels at 768*1344 -- so
+# the OUTPUT of this arm is not meaningful. Only the timing is.
+#
+# 2560x1440 is not a guess. MiniMax publish reference outputs for both resolutions
+# (assets/t2va_2k.mp4 and assets/t2va.mp4); probed, they are 2560x1440 and 1344x768, both
+# 243 frames at 24 fps. Note that this is not a pure rescale: 1344x768 is 1.750:1 and
+# 2560x1440 is 1.778:1, so the regeneration slightly recomposes the frame as well.
+#
+# Geometry: 2560x1440 -> latent 160x90 -> 80x45 patched = 3600 tokens per frame, 3.571x the
+# 768p canvas's 1008. Pixels go up 3.571x too (3,686,400 / 1,032,192).
+#
+# The clip length is deliberately left to the driver. At 345 frames this is ~370k rows and
+# an 80 GiB card is not obviously enough, so scripts/h100_grid.sh phase k walks 345 -> 243
+# -> 90 and keeps whatever fits; 243 frames is the length of MiniMax's own reference clip.
+
+kernels:
+  inference_kernels: true
+  softmax_backend: flex
+
+precision:
+  fp8:
+    enabled: true
+    skip_end_blocks: 0
+
+parallel:
+  # The window softmax costs O(rows x window_frames x tokens_per_frame) while the linear
+  # branch and the MLPs cost O(rows), so tokens_per_frame moves the balance point and 2K has
+  # 3.571x of it. That argues for MORE softmax ranks than 768p's optimum, not fewer; the
+  # driver sweeps rather than trusting this default.
+  softmax_ranks: 6
+  profile: false
+  offload_transformer_before_decode: true
+  # A serial 2K decode would be ~3.6x the 768p one, i.e. most of a minute on rank 0 while
+  # seven cards idle. It also needs a full 2K pixel buffer in one place.
+  parallel_vae_decode: true
+
+render:
+  height: 1440
+  width: 2560
+  num_frames: 243      # 243 = 5 + 17*14 -> 72 latent frames = 10.125 s, MiniMax's own
+                       # reference clip length. Overridden by the driver.
+  num_steps: 8
+  warmup_steps: 2
+  video_shift: 12.0
+  audio_shift: 3.0

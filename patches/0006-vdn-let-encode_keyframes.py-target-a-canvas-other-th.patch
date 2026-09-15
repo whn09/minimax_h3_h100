@@ -1,0 +1,85 @@
+From 461a864c1015cfab9718e860cd6409b3e6dcc191 Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Tue, 15 Sep 2026 12:39:42 +0800
+Subject: [PATCH 6/8] vdn: let encode_keyframes.py target a canvas other than
+ 768p
+
+A keyframe cache is only usable at the canvas it was encoded for: condition_latents come
+out at that canvas's latent size, and the layout reserves conditioning rows to match. The
+released prompts/image/example_fl2va.pt has (1, 24, 1, 48, 84), i.e. 1344x768 and nothing
+else, so fl2va could be compared against t2va at 768p and not at 480p -- which is the
+canvas the whole exercise is about.
+
+CANVAS_SHORT_EDGE / CANVAS_MAX_PIXELS stay the default. --height/--width override only
+which canvas the keyframes are fitted to; the stretch-first, cover-crop-the-rest arithmetic
+after that is untouched, so a 864x480 cache is built the same way a 768p one is.
+---
+ src/inference/encode_keyframes.py | 31 ++++++++++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/src/inference/encode_keyframes.py b/src/inference/encode_keyframes.py
+index 3b7f289..9f3cb97 100644
+--- a/src/inference/encode_keyframes.py
++++ b/src/inference/encode_keyframes.py
+@@ -37,6 +37,12 @@ from src.paths import H3_BASE, resolve_weights, upstream_snapshot
+ 
+ TEXT_ENCODER_LAYER = 50
+ VIDEO_TAG, TEXT_TAG = 0, 1
++# The released canvas rule: short edge 768, at most 768*1344 pixels, both edges a multiple
++# of 32 (the 16x VAE, then the 2x2 transformer patch). These stay the DEFAULT and are not
++# the only option, because a keyframe cache is only usable at the canvas it was encoded for
++# -- `condition_latents` come out at that canvas's latent size and the layout reserves rows
++# to match. Rendering fl2va at 864x480 therefore needs a cache encoded at 864x480, which is
++# what --height/--width are for.
+ CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, CANVAS_MAX_PIXELS = 32, 768, 768 * 1344
+ KEYFRAME_ENCODE_SEED = 42
+ 
+@@ -58,12 +64,17 @@ KEYFRAME_MODES = {
+ }
+ 
+ 
+-def put_on_canvas(keyframes):
++def put_on_canvas(keyframes, canvas=None):
+     """MiniMaxH3ResizeStep: the canvas follows the first keyframe's aspect ratio; the
+     first keyframe is stretched onto it, every follower cover-cropped (the released
+-    model's rounding, not VaeImageProcessor's). Returns (keyframes, height, width)."""
+-    height, width = resolve_canvas_size(*keyframes[0].size, CANVAS_MULTIPLE,
+-                                        CANVAS_SHORT_EDGE, CANVAS_MAX_PIXELS)
++    model's rounding, not VaeImageProcessor's). Returns (keyframes, height, width).
++
++    `canvas` = (height, width) overrides the derived size. Everything after the first two
++    lines is unchanged by that, including the stretch-then-cover-crop asymmetry: the
++    override only replaces which canvas the keyframes are fitted to, so a cache encoded at
++    864x480 goes through exactly the arithmetic a 768p one does."""
++    height, width = canvas if canvas else resolve_canvas_size(
++        *keyframes[0].size, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, CANVAS_MAX_PIXELS)
+     prepared = []
+     for index, keyframe in enumerate(keyframes):
+         keyframe = keyframe.convert("RGB")
+@@ -145,7 +156,17 @@ def main():
+                         "default: downloaded from the Hub on first use")
+     p.add_argument("--vae_root", type=str, default=H3_BASE, help="root holding vae/")
+     p.add_argument("--device", type=str, default="cuda:0")
++    p.add_argument("--height", type=int, help="force the canvas height instead of deriving "
++                                             "it from the first keyframe's aspect ratio")
++    p.add_argument("--width", type=int, help="force the canvas width; pass both or neither")
+     args = p.parse_args()
++    if bool(args.height) != bool(args.width):
++        p.error("pass --height and --width together, or neither")
++    canvas = (args.height, args.width) if args.height else None
++    for name, value in (("height", args.height), ("width", args.width)):
++        if value is not None and value % CANVAS_MULTIPLE:
++            p.error(f"--{name}={value} must be a multiple of {CANVAS_MULTIPLE} "
++                    f"(the 16x VAE then the 2x2 transformer patch)")
+     if not (args.first or args.last):
+         p.error("pass --first and/or --last (a request without keyframes is t2va: "
+                 "use encode_prompt.py)")
+@@ -155,7 +176,7 @@ def main():
+     pairs = [(anchor, path) for anchor, path in (("first", args.first), ("last", args.last)) if path]
+     anchors = [anchor for anchor, _ in pairs]
+     mode = check_instruction(args.prompt, anchors)
+-    keyframes, height, width = put_on_canvas([Image.open(path) for _, path in pairs])
++    keyframes, height, width = put_on_canvas([Image.open(path) for _, path in pairs], canvas)
+     print(f"{mode}: canvas {width}x{height}; keyframes {anchors}", flush=True)
+     device = args.device
+ 

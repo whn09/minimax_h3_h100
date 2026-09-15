@@ -1,0 +1,410 @@
+From 4f82fd621704c707b9638647d3f11ae1db763346 Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Tue, 15 Sep 2026 12:14:37 +0800
+Subject: [PATCH 5/8] vdn: data-parallel video VAE decode across the Ulysses
+ ranks
+
+The decode is the bigger half of a 480p render's post-warmup latency -- 13.8 s against
+8.9 s of denoising -- and upstream runs all of it on rank 0 while seven cards wait at the
+barrier.
+
+It parallelises almost for free, because of what the decoder is. Only the ENCODER is a
+causal 3D CNN; the decoder is a non-causal ViT, so no conv cache is threaded from one
+temporal chunk to the next and `_decode_clip` is a pure function of its 7-latent-frame
+slice. Spatial tiles inside a clip are independent too, and the only coupling anywhere is
+`_blend` -- a linear cross-fade in pixel space, after every forward has finished. At 345
+frames that is a grid of 20 chunks x 15 tiles = 300 independent decoder calls at 480p (28
+tiles, 560 at 768p), and the measured 768p/480p decode ratio of 1.82x against the 1.87x
+call ratio says the call count is the cost.
+
+That makes it data parallelism, not tensor parallelism: TP would shard a 2048-wide ViT and
+pay an all-reduce inside each of the 300 tiles, DP pays one all-gather for the whole
+decode. Chunks are the unit rather than (chunk, tile) pairs -- 20/3 = 6.67x against
+300/38 = 7.89x, but pairs ship overlapping tiles, 2.37x the pixels at 480p, for a fifth of
+a second, and chunks leave upstream's tile stitching untouched.
+
+Output is bit-identical: the same slices through the same `_decode_clip`, then `_decode`'s
+own blend chain on rank 0.
+
+Off by default (parallel.parallel_vae_decode): it needs the video VAE's weights on every
+rank instead of only on rank 0. decode_video_latents is split out of decode_and_save
+because the collective cannot live inside a rank-0-only branch.
+---
+ src/config/inference.py             |   6 +
+ src/inference/infer_ulysses.py      |  32 +++++-
+ src/inference/render.py             |  69 +++++++++---
+ src/inference/utils/parallel_vae.py | 167 ++++++++++++++++++++++++++++
+ 4 files changed, 252 insertions(+), 22 deletions(-)
+ create mode 100644 src/inference/utils/parallel_vae.py
+
+diff --git a/src/config/inference.py b/src/config/inference.py
+index b818e96..5eb09c2 100644
+--- a/src/config/inference.py
++++ b/src/config/inference.py
+@@ -63,6 +63,12 @@ class ParallelConfig:
+     # over. Costs ~27 s of PCIe, all of it after the measured denoise -- so leave it off
+     # when the canvas has headroom, which 480p does.
+     offload_transformer_before_decode: bool = False
++    # Spread the video VAE's temporal chunks over the ranks instead of decoding all of them
++    # on rank 0. The decode is the bigger half of a 480p render's post-warmup latency and it
++    # is a grid of independent non-causal ViT forwards, so this is nearly free parallelism:
++    # bit-identical output for one all-gather. It costs the video VAE's weights on every
++    # rank rather than only on rank 0, which is why it is a switch and not the default.
++    parallel_vae_decode: bool = False
+ 
+ 
+ @dataclass
+diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
+index 8f4f07d..0e30161 100644
+--- a/src/inference/infer_ulysses.py
++++ b/src/inference/infer_ulysses.py
+@@ -35,8 +35,8 @@ from src.inference.utils.assemble import (
+     render_record,
+     write_json,
+ )
+-from src.inference.render import (decode_and_save, generate_latents, latent_grid,
+-                                  load_decoders_only, load_prompt)
++from src.inference.render import (decode_and_save, decode_video_latents, generate_latents,
++                                  latent_grid, load_decoders_only, load_prompt)
+ from src.inference.utils.ulysses import init_ulysses, install_ulysses
+ 
+ 
+@@ -162,16 +162,34 @@ def main():
+         torch.cuda.empty_cache()
+     timings["transformer_offload_seconds"] = time.perf_counter() - offload_started
+ 
+-    # The denoising activations are gone by now, so the decoders have room.
++    # The denoising activations are gone by now, so the decoders have room. Every rank
++    # takes the video VAE when the decode is going to be data-parallel; only rank 0 ever
++    # needs the audio one, whose stream is 1150 latents against the video's 102 frames.
+     decoder_load_started = time.perf_counter()
+     if runtime.is_main:
+         model.vae, model.audio_vae = load_decoders_only(cfg.vae_source, str(device))
++    elif cfg.parallel.parallel_vae_decode:
++        model.vae, model.audio_vae = load_decoders_only(cfg.vae_source, str(device), audio=False)
+     timings["decoder_load_seconds"] = time.perf_counter() - decoder_load_started
+ 
++    # The video VAE, on all eight cards. `latents` is the full tensor on every rank -- the
++    # sampler above feeds the whole packed sequence to the transformer and Ulysses shards
++    # inside the attention modules, not on the residual stream -- so no rank needs anything
++    # gathered before it can start. Timed here rather than inside decode_and_save because
++    # the collective has to be outside the is_main branch.
++    video = None
++    video_decode_started = time.perf_counter()
++    if cfg.parallel.parallel_vae_decode:
++        video = decode_video_latents(model.vae, latents, str(device), runtime=runtime)
++        torch.cuda.synchronize(device)
++        runtime.barrier()
++        timings["parallel_video_vae_seconds"] = time.perf_counter() - video_decode_started
++
+     decode_started = time.perf_counter()
+     if runtime.is_main:
+         timings["decode_stages"] = decode_and_save(
+-            latents, audio_latents, model.vae, model.audio_vae, cfg.render.out, str(device)
++            latents, audio_latents, model.vae, model.audio_vae, cfg.render.out, str(device),
++            video=video,
+         )
+         torch.cuda.synchronize(device)
+ 
+@@ -214,10 +232,14 @@ def main():
+         # The decode is the bigger half of the post-warmup latency at 480p and it is
+         # single-rank, so break it out: the video VAE is the only part worth parallelising,
+         # and this says how much of the 13.8 s that actually is.
++        stages = dict(timings["decode_stages"])
++        if "parallel_video_vae_seconds" in timings:
++            stages = {f"video_vae_x{runtime.world_size}_seconds":
++                      timings["parallel_video_vae_seconds"], **stages}
+         print(
+             "decode stages: "
+             + ", ".join(f"{name.removesuffix('_seconds')} {seconds:.2f}s"
+-                        for name, seconds in timings["decode_stages"].items()),
++                        for name, seconds in stages.items()),
+             flush=True,
+         )
+ 
+diff --git a/src/inference/render.py b/src/inference/render.py
+index e03eb03..6531fc0 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -17,6 +17,7 @@ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+     audio_latent_num_frames, video_latent_num_frames)
+ from diffusers.utils.export_utils import encode_video
+ 
++from src.inference.utils.parallel_vae import can_decode_in_parallel, decode_video_parallel
+ from src.models.sequence_layout import layout_from_indices
+ from src.paths import H3_BASE, resolve_weights
+ from src.models.hybrid_transform import iter_hybrids, set_layout
+@@ -75,7 +76,7 @@ def load_models(model_root: str, device: str, vae_source: str = None,
+     return transformer, vae, audio_vae
+ 
+ 
+-def load_decoders_only(vae_source: str, device: str):
++def load_decoders_only(vae_source: str, device: str, audio: bool = True):
+     """The two decoders, without touching the transformer -- for loading them AFTER the
+     denoising loop instead of before it.
+ 
+@@ -84,11 +85,17 @@ def load_decoders_only(vae_source: str, device: str):
+     55.5 GiB, and a block's activations want 10.33 GiB, so rank 0 dies where ranks 1-7
+     are fine. The decoders are idle during denoising, so keeping them off the card until
+     the loop is over costs nothing and evens the ranks out. A 141 GiB H200 has room for
+-    both, which is why upstream loads them up front."""
++    both, which is why upstream loads them up front.
++
++    `audio=False` returns (vae, None): a rank that only joins the data-parallel video
++    decode has no use for the audio decoder, and the audio stream is short enough that
++    splitting it would not pay for the collective."""
+     vae_source = resolve_weights(vae_source or DEFAULT_MODEL_ROOT)
+     vae = AutoencoderKLMiniMaxH3.from_pretrained(vae_source, subfolder="vae").to(device)
+-    audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(vae_source, subfolder="audio_vae").to(device)
+     vae.eval()
++    if not audio:
++        return vae, None
++    audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(vae_source, subfolder="audio_vae").to(device)
+     audio_vae.eval()
+     return vae, audio_vae
+ 
+@@ -232,13 +239,42 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
+ 
+ 
+ @torch.no_grad()
+-def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str):
++def decode_video_latents(vae, latents, device: str, runtime=None):
++    """The video half of the decode: latent denormalisation, the VAE, pixel
++    denormalisation. Split out of decode_and_save so that it can run on EVERY rank.
++
++    With `runtime`, the temporal chunks are spread over the ranks (see
++    utils/parallel_vae.py) -- which is why this is a separate function: decode_and_save
++    runs on rank 0 alone, and a collective cannot live inside it. Bit-identical either
++    way; the parallel path is upstream's `_decode_clip` on upstream's slices, only on
++    eight cards instead of one."""
++    latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
++    latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
++    scaled = latents * latents_std + latents_mean
++    with torch.autocast(device_type="cuda", dtype=torch.float16):
++        if runtime is not None and can_decode_in_parallel(vae):
++            video = decode_video_parallel(vae, scaled, runtime)
++        else:
++            video = vae.decode(scaled, return_dict=False)[0]
++    if runtime is not None and not runtime.is_main:
++        return None                    # a partial gather buffer; only rank 0 assembles
++    pixel_mean = torch.tensor(PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
++    pixel_std = torch.tensor(PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
++    return (video.float() * pixel_std + pixel_mean).clamp(0, 1)
++
++
++@torch.no_grad()
++def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str,
++                    video=None):
+     """Returns a dict of per-stage seconds. At 480p the whole of this outweighs the
+     denoising it follows -- 13.8 s against 8.9 s -- and unlike denoising none of it is
+-    parallel: one rank decodes while the other seven sit at the barrier. So the stages are
+-    timed separately, because "decode" being the bigger half of the latency is only
+-    actionable if it says which part. Each boundary is device-synchronised; the launches
+-    are async otherwise and the split would be meaningless."""
++    parallel by default: one rank decodes while the other seven sit at the barrier. So the
++    stages are timed separately, because "decode" being the bigger half of the latency is
++    only actionable if it says which part. Each boundary is device-synchronised; the
++    launches are async otherwise and the split would be meaningless.
++
++    `video` is an already-decoded pixel video from decode_video_latents -- how the
++    multi-rank decode gets its result in here. None keeps the single-rank behaviour."""
+     timings: dict[str, float] = {}
+     stage_started = time.perf_counter()
+ 
+@@ -248,15 +284,14 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+         timings[name] = now - stage_started
+         stage_started = now
+ 
+-    latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+-    latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+-    with torch.autocast(device_type="cuda", dtype=torch.float16):
+-        video = vae.decode(latents * latents_std + latents_mean, return_dict=False)[0]
+-    pixel_mean = torch.tensor(PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
+-    pixel_std = torch.tensor(PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
+-    video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+-    torch.cuda.synchronize(device)
+-    stage("video_vae_seconds")
++    if video is None:
++        video = decode_video_latents(vae, latents, device)
++        torch.cuda.synchronize(device)
++        stage("video_vae_seconds")
++    else:
++        # The caller decoded it collectively and timed it there; charging 0 here would
++        # read as a free decode, so the stage is simply absent.
++        stage_started = time.perf_counter()
+ 
+     audio_latents_mean = torch.tensor(audio_vae.config.latents_mean, device=device).view(1, -1, 1)
+     audio_latents_std = torch.tensor(audio_vae.config.latents_std, device=device).view(1, -1, 1)
+diff --git a/src/inference/utils/parallel_vae.py b/src/inference/utils/parallel_vae.py
+new file mode 100644
+index 0000000..707fee5
+--- /dev/null
++++ b/src/inference/utils/parallel_vae.py
+@@ -0,0 +1,167 @@
++"""Data-parallel video VAE decode across the Ulysses ranks.
++
++The decode is the bigger half of a 480p render's post-warmup latency -- 13.8 s against
++8.9 s of denoising -- and upstream runs all of it on rank 0 while the other seven ranks
++sit at the barrier. It does not have to be that way, and the reason is the shape of
++`AutoencoderKLMiniMaxH3._decode`:
++
++  * the decoder is a **non-causal ViT** (36 layers, 32 x 64 heads). Only the *encoder* is
++    a causal 3D CNN, so there is no conv cache threaded from one temporal chunk to the
++    next -- `_decode_clip(z[:, :, start : start + tokens_chunk_size + token_overlap])` is
++    a pure function of its 7-latent-frame slice;
++  * inside a clip, tiling makes each 256x256 pixel tile another independent forward;
++  * the only coupling is linear: `_blend` cross-fades the tile edges and the 5-frame
++    chunk overlaps, in pixel space, after every forward has finished.
++
++So it is a grid of independent forwards, which makes this **data** parallelism, not
++tensor parallelism. TP would shard a 2048-wide ViT and pay an all-reduce inside every one
++of the 300 tiles; DP pays one all-gather for the whole decode. At 345 frames the grid is
++20 temporal chunks x 15 tiles = 300 decoder calls at 480p (28 tiles, 560 calls at 768p),
++and the measured 768p/480p decode ratio, 1.82x, matches the 1.87x call ratio -- so call
++count is what this costs, and splitting the calls is what fixes it.
++
++Chunks are the unit here rather than (chunk, tile) pairs: 20 chunks over 8 ranks is a
++ceiling of 20/3 = 6.67x against 300/38 = 7.89x for pairs, but pairs have to ship the
++overlapping tiles instead of the stitched frames -- 2.37x the pixels at 480p -- for a
++fifth of a second. Chunks also keep `_decode_clip` intact, so the tile stitching is
++upstream's own code and cannot drift from it.
++
++The output is bit-identical to `vae.decode(z)`: the same slices go through the same
++`_decode_clip`, and the blend chain on rank 0 is `_decode`'s, in the same order.
++"""
++
++from __future__ import annotations
++
++import torch
++import torch.distributed as dist
++
++# Index <-> dtype, so the decoder's output dtype can travel through a one-element int64
++# broadcast. Order is load-bearing: it is the wire format, so only ever append.
++_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
++
++
++def can_decode_in_parallel(vae) -> bool:
++    """Whether this VAE's decode has the chunk structure below. The released checkpoint
++    does (clip_length 17, token_drop 3); a config without a token drop has no chunk
++    overlap and would need a different assembly, so it falls back to vae.decode."""
++    return getattr(vae, "tokens_chunk_size", 0) > 0 and vae.config.token_drop > 0
++
++
++@torch.no_grad()
++def decode_video_parallel(vae, z: torch.Tensor, runtime) -> torch.Tensor:
++    """`vae.decode(z, return_dict=False)[0]`, with the temporal chunks spread over
++    runtime's ranks. Every rank must call this -- there is an all-gather inside. Only the
++    return value on rank 0 is the full video; the others get their own partial buffer,
++    which the caller ignores.
++
++    Mirrors AutoencoderKLMiniMaxH3._decode step for step; see the module docstring for
++    why that is safe to do.
++    """
++    tokens_chunk = vae.tokens_chunk_size
++    token_drop = vae.config.token_drop
++    temporal_ratio = vae.temporal_compression_ratio
++    chunk_num_frames = tokens_chunk * temporal_ratio
++
++    # _decode's padding and chunk count, unchanged.
++    num_tokens = z.shape[2] + token_drop
++    pad_tokens = (-num_tokens) % tokens_chunk
++    num_chunks = (num_tokens + pad_tokens) // tokens_chunk - int(token_drop > 0)
++    if pad_tokens > 0:
++        z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
++
++    world_size, rank = runtime.world_size, runtime.rank
++    # Chunk c -> rank c % world_size, slot c // world_size. Round-robin rather than
++    # contiguous so that the ranks that get the extra chunk are spread over the node; with
++    # 20 chunks and 8 ranks four ranks do 3 and four do 2, and the decode takes 3.
++    chunks_per_rank = -(-num_chunks // world_size)
++    my_chunks = [c for c in range(num_chunks) if c % world_size == rank]
++
++    # Every chunk yields the same two pieces: `chunk_num_frames - frame_pre_padding`
++    # frames that go into the video, and (when token_drop > 0) `frame_overlap` frames that
++    # cross-fade into the next chunk. Concatenating them makes the gather one uniform
++    # tensor instead of two.
++    # Worked through on the released config, because the two pieces are NOT the same size
++    # and assuming they were would corrupt the gather. clip_length 17, token_drop 3 ->
++    # tokens_chunk_size 5, token_overlap 2, frame_pre_padding 3, frame_overlap 5,
++    # temporal_ratio 4, so chunk_num_frames = 20 and _decode_clip is fed 5 + 2 = 7 latent
++    # frames = 28 pixel frames. j=0 takes clip[0:20][3:] = 17 frames; j=1 takes
++    # clip[20:28][3:] = 5 = frame_overlap. 20 chunks x 17 + a trailing 5 = 345 frames, which
++    # is the requested clip length exactly.
++    main_frames = chunk_num_frames - vae.frame_pre_padding
++    overlap_frames = vae.frame_overlap
++    piece_frames = main_frames + (overlap_frames if token_drop > 0 else 0)
++
++    height = z.shape[-2] * vae.spatial_compression_ratio
++    width = z.shape[-1] * vae.spatial_compression_ratio
++
++    local = None
++    for c in my_chunks:
++        start = c * tokens_chunk
++        clip = vae._decode_clip(z[:, :, start : start + tokens_chunk + vae.token_overlap])
++        pieces = []
++        for j in range(int(token_drop > 0) + 1):
++            frame_start = j * chunk_num_frames
++            piece = clip[:, :, frame_start : frame_start + chunk_num_frames]
++            pieces.append(piece[:, :, vae.frame_pre_padding :])
++        piece = torch.cat(pieces, dim=2)
++        if local is None:
++            # Allocated from the first real tile so the dtype and layout are the
++            # decoder's own (fp16 under the caller's autocast), never guessed.
++            local = piece.new_zeros((chunks_per_rank, piece.shape[1], piece_frames, height, width))
++        local[c // world_size] = piece[0]
++
++    # An all-gather requires every rank to agree on the buffer's dtype, and a rank that got
++    # no chunks has nothing to read it off. The decoder's parameter dtype is the wrong
++    # answer -- the caller wraps this in autocast(float16), so the pieces come back fp16
++    # while the parameters are fp32 -- and guessing it would be a silent corruption rather
++    # than an error. So rank 0 says: it holds chunk 0 whenever there is a chunk at all, by
++    # the round-robin above. Eight bytes, once per decode.
++    code = torch.zeros(1, dtype=torch.int64, device=z.device)
++    if local is not None:
++        code[0] = _DTYPES.index(local.dtype)
++    dist.broadcast(code, src=0)
++    dtype = _DTYPES[int(code.item())]
++
++    if local is None:
++        # Fewer chunks than ranks (a short clip). This rank still has to join the
++        # all-gather, so it contributes zeros -- rank 0 never reads those slots.
++        local = torch.zeros((chunks_per_rank, vae.config.out_channels, piece_frames, height, width),
++                            device=z.device, dtype=dtype)
++    elif local.dtype is not dtype:
++        raise RuntimeError(f"rank {rank} decoded {local.dtype} but rank 0 decoded {dtype}; "
++                           f"the gather would silently reinterpret the bytes")
++
++    gathered = torch.empty((world_size * chunks_per_rank, *local.shape[1:]),
++                           device=local.device, dtype=local.dtype)
++    dist.all_gather_into_tensor(gathered, local.contiguous())
++
++    if not runtime.is_main:
++        return gathered
++
++    # _decode's assembly, over the gathered pieces instead of locally computed ones.
++    decoded_chunks = []
++    overlap = None
++    for c in range(num_chunks):
++        piece = gathered[(c % world_size) * chunks_per_rank + c // world_size].unsqueeze(0)
++        chunk = piece[:, :, :main_frames]
++        if overlap is not None:
++            chunk = vae._blend(overlap, chunk, vae.frame_overlap, dim=-3)
++        decoded_chunks.append(chunk)
++        if token_drop > 0:
++            overlap = piece[:, :, main_frames:]
++    if overlap is not None:
++        decoded_chunks.append(overlap)
++
++    dec = torch.cat(decoded_chunks, dim=2)
++
++    # And _decode's trailing trim for the repeated latent frames.
++    if pad_tokens > 0:
++        intra_tail = vae.config.clip_length % temporal_ratio
++        num_tokens_before_pad = z.shape[2] - pad_tokens
++        pad_frames = sum(
++            intra_tail if intra_tail and (num_tokens_before_pad + k) % tokens_chunk == 0
++            else temporal_ratio
++            for k in range(pad_tokens)
++        )
++        dec = dec[:, :, :-pad_frames]
++    return dec

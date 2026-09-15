@@ -1,0 +1,320 @@
+From abaacfff9efda7aeddbe2216c3a90125f94136ec Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Tue, 15 Sep 2026 13:59:57 +0800
+Subject: [PATCH 7/8] vdn: convert RGB to YUV420p on the GPU instead of in
+ swscale
+
+With the video VAE spread over the ranks the mp4 mux became the largest single item in a
+480p render: 2.65 s, against 2.11 s for the whole eight-way decode, all of it on the host.
+
+scripts/mux_bench.py decomposes it, and the answer was not the one the shape of the problem
+suggests. It is not x264:
+
+    VideoFrame.from_ndarray(rgb24)      0.30 s
+    reformat rgb24 -> yuv420p           2.03 s   <-- swscale, single-threaded
+    x264 encode, thread_count=0         1.72 s   (already threaded; 6.40 s at 1)
+
+x264 is already using the box. What is not is swscale's colour conversion, which runs
+serially in the calling thread -- which is why setting thread_count on the stream buys only
+1.17x. The pixels are on the GPU as float32 in [0, 1] and the conversion is a 3x3 matrix and
+a 2x2 average, so it is done there instead, and it also halves the host transfer: yuv420p is
+1.5 bytes/px against rgb24's 3, so 345 frames of 864x480 cross PCIe as 215 MB, not 430.
+
+This re-implements a lossy conversion rather than refactoring one, so the encoded bytes
+change and it sits behind render.gpu_color_convert (default true, false is the old path
+exactly). Equivalence is measured, not assumed -- `mux_bench.py --verify` compares against
+swscale's own output on real frames:
+
+    Y: max abs error 1   PSNR 70.96 dB      U: 6, 55.10 dB      V: 6, 56.90 dB
+
+Y is checked on max absolute error because that is where a wrong matrix (BT.709) or a wrong
+range (full) would show, and both would be tens of levels. Chroma is checked on PSNR: the
+2x2 box average is the closest of the three plausible filters to swscale (54.8 dB against
+53.9 for taking the top row), so the residual is swscale's fixed-point arithmetic against
+this file's float, and it is ours that is the more accurate. It is also far below x264's
+chroma quantiser step at the default CRF, so it cannot reach the file.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ src/config/inference.py        |  10 +++
+ src/inference/infer.py         |   2 +-
+ src/inference/infer_ulysses.py |   2 +-
+ src/inference/render.py        |  23 +++--
+ src/inference/utils/yuv.py     | 159 +++++++++++++++++++++++++++++++++
+ 5 files changed, 189 insertions(+), 7 deletions(-)
+ create mode 100644 src/inference/utils/yuv.py
+
+diff --git a/src/config/inference.py b/src/config/inference.py
+index 5eb09c2..928a638 100644
+--- a/src/config/inference.py
++++ b/src/config/inference.py
+@@ -106,6 +106,16 @@ class RenderConfig:
+     record: bool = False                 # also write <out>.inference.json (checkpoint
+                                          # identity, resolved config, actual kernel
+                                          # state, per-NFE timings) -- a debug aid
++    gpu_color_convert: bool = True       # do RGB->YUV420p on the card instead of in
++                                         # swscale (src.inference.utils.yuv). swscale's
++                                         # conversion is single-threaded and was 2.03 s of
++                                         # the 2.65 s mux at 480p; this also halves the
++                                         # host copy, 3 bytes/px -> 1.5. It re-implements a
++                                         # lossy conversion, so the encoded bytes change:
++                                         # false restores diffusers' encode_video exactly,
++                                         # for anyone who needs to reproduce an older clip.
++                                         # Equivalence is checked numerically by
++                                         # scripts/mux_bench.py --verify.
+ 
+ 
+ @dataclass
+diff --git a/src/inference/infer.py b/src/inference/infer.py
+index 29fa966..d6e0e04 100644
+--- a/src/inference/infer.py
++++ b/src/inference/infer.py
+@@ -66,7 +66,7 @@ def main():
+         print(f"wrote {lpath}", flush=True)
+ 
+     decode_and_save(latents, audio_latents, model.vae, model.audio_vae, cfg.render.out,
+-                    device)
++                    device, gpu_color_convert=cfg.render.gpu_color_convert)
+ 
+     if cfg.render.record:
+         jpath = cfg.render.out + ".inference.json"
+diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
+index 0e30161..c148a25 100644
+--- a/src/inference/infer_ulysses.py
++++ b/src/inference/infer_ulysses.py
+@@ -189,7 +189,7 @@ def main():
+     if runtime.is_main:
+         timings["decode_stages"] = decode_and_save(
+             latents, audio_latents, model.vae, model.audio_vae, cfg.render.out, str(device),
+-            video=video,
++            video=video, gpu_color_convert=cfg.render.gpu_color_convert,
+         )
+         torch.cuda.synchronize(device)
+ 
+diff --git a/src/inference/render.py b/src/inference/render.py
+index 6531fc0..6d9c6e0 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -18,6 +18,7 @@ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+ from diffusers.utils.export_utils import encode_video
+ 
+ from src.inference.utils.parallel_vae import can_decode_in_parallel, decode_video_parallel
++from src.inference.utils.yuv import encode_video_yuv420p, rgb_to_yuv420p, to_host
+ from src.models.sequence_layout import layout_from_indices
+ from src.paths import H3_BASE, resolve_weights
+ from src.models.hybrid_transform import iter_hybrids, set_layout
+@@ -265,7 +266,7 @@ def decode_video_latents(vae, latents, device: str, runtime=None):
+ 
+ @torch.no_grad()
+ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str,
+-                    video=None):
++                    video=None, gpu_color_convert: bool = True):
+     """Returns a dict of per-stage seconds. At 480p the whole of this outweighs the
+     denoising it follows -- 13.8 s against 8.9 s -- and unlike denoising none of it is
+     parallel by default: one rank decodes while the other seven sit at the barrier. So the
+@@ -274,7 +275,10 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+     launches are async otherwise and the split would be meaningless.
+ 
+     `video` is an already-decoded pixel video from decode_video_latents -- how the
+-    multi-rank decode gets its result in here. None keeps the single-rank behaviour."""
++    multi-rank decode gets its result in here. None keeps the single-rank behaviour.
++
++    `gpu_color_convert` moves RGB->YUV420p onto the card (utils/yuv.py); false is
++    diffusers' encode_video, byte-for-byte as before. See RenderConfig for why it exists."""
+     timings: dict[str, float] = {}
+     stage_started = time.perf_counter()
+ 
+@@ -300,7 +304,15 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+     torch.cuda.synchronize(device)
+     stage("audio_vae_seconds")
+ 
+-    frames = (video[0].permute(1, 2, 3, 0) * 255).round().to(torch.uint8).cpu()  # (F, H, W, 3)
++    if gpu_color_convert:
++        # (1, 3, F, H, W) -> (F, 3, H, W), still float in [0, 1] and still on the card: the
++        # *255-and-round that used to happen here is folded into the colour matrix, so the
++        # pixels are quantised once (to Y/Cb/Cr) rather than twice (to rgb24, then again by
++        # swscale). What crosses PCIe is the yuv420p the encoder wants, 1.5 bytes/px.
++        planes = rgb_to_yuv420p(video[0].permute(1, 0, 2, 3))
++        frames = to_host(*planes)
++    else:
++        frames = (video[0].permute(1, 2, 3, 0) * 255).round().to(torch.uint8).cpu()  # (F,H,W,3)
+     stage("frames_to_host_seconds")
+     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+ 
+@@ -313,8 +325,9 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+     # output format". Same directory either way, which is what os.replace needs.
+     stem, ext = os.path.splitext(out_path)
+     partial_path = f"{stem}.partial{ext}"
+-    encode_video(frames, fps=FPS, output_path=partial_path,
+-                 audio=audio.cpu(), audio_sample_rate=audio_vae.config.sampling_rate)
++    write = encode_video_yuv420p if gpu_color_convert else encode_video
++    write(frames, fps=FPS, output_path=partial_path,
++          audio=audio.cpu(), audio_sample_rate=audio_vae.config.sampling_rate)
+     os.replace(partial_path, out_path)
+     stage("mux_seconds")
+     print(f"wrote {out_path}", flush=True)
+diff --git a/src/inference/utils/yuv.py b/src/inference/utils/yuv.py
+new file mode 100644
+index 0000000..5fdd0f7
+--- /dev/null
++++ b/src/inference/utils/yuv.py
+@@ -0,0 +1,159 @@
++"""Do the RGB -> YUV420p colour conversion on the GPU, not in swscale.
++
++After the video VAE went data-parallel (utils/parallel_vae.py) the largest single item left
++in a 480p request was the mp4 mux, at 2.65 s against the eight-way decode's 2.11 s. Measured
++with scripts/mux_bench.py, on 345 frames of 864x480, that 2.65 s decomposes as:
++
++    VideoFrame.from_ndarray(rgb24)      0.30 s
++    reformat rgb24 -> yuv420p           2.03 s   <-- swscale, single-threaded
++    x264 encode, thread_count=0         1.72 s   (already multi-threaded; 6.40 s at 1)
++
++So it was never x264. It is the colour conversion, running serially in the calling thread,
++which is why setting `thread_count` on the stream buys almost nothing (1.17x). The pixels
++are already on the GPU as float32 in [0, 1] -- the conversion is a 3x3 matrix and a 2x2
++average, both of which the card does in microseconds.
++
++Converting here also halves the host transfer, which is the second item on the list:
++yuv420p is 1.5 bytes per pixel against rgb24's 3, so a 345-frame 864x480 clip crosses PCIe
++as 215 MB instead of 430 MB.
++
++**This changes the encoded bytes.** It is a reimplementation of a lossy conversion, not a
++refactor of one, so it is behind a config switch and validated numerically rather than
++assumed: scripts/mux_bench.py --verify reports the PSNR against swscale's own output on real
++frames, and anything below ~50 dB means the matrix or the range is wrong.
++"""
++
++from __future__ import annotations
++
++import torch
++
++# BT.601, limited ("TV") range -- Y in [16, 235], Cb/Cr in [16, 240] about 128. This is what
++# swscale produces for an rgb24 -> yuv420p conversion when nothing sets a colorspace or a
++# range, which is the case in diffusers' encode_video: it sets width, height and pix_fmt and
++# nothing else. Matching the default is the point; picking BT.709 here because the clip is
++# "HD" would silently shift every colour in the output relative to every previously rendered
++# clip.
++#
++# Coefficients are the ITU-R BT.601 ones scaled for a [0, 1] input and a [0, 255] output:
++#   Y  =  16 + (  65.481 R + 128.553 G +  24.966 B )
++#   Cb = 128 + ( -37.797 R -  74.203 G + 112.000 B )
++#   Cr = 128 + ( 112.000 R -  93.786 G -  18.214 B )
++_Y_COEFF = (65.481, 128.553, 24.966)
++_CB_COEFF = (-37.797, -74.203, 112.000)
++_CR_COEFF = (112.000, -93.786, -18.214)
++
++
++@torch.no_grad()
++def rgb_to_yuv420p(video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """`video` is (frames, 3, height, width) float in [0, 1], on any device.
++
++    Returns `(y, u, v)` as uint8 on the same device: y is (frames, height, width) and u, v
++    are (frames, height // 2, width // 2).
++
++    Chroma is the 2x2 average. Averaging the chroma of four pixels and taking the chroma of
++    their average are the same thing here -- the transform is affine and the four weights are
++    equal -- so this pools the chroma planes rather than the RGB, which is one fewer pass.
++    """
++    if video.ndim != 4 or video.shape[1] != 3:
++        raise ValueError(f"expected (frames, 3, height, width), got {tuple(video.shape)}")
++    height, width = video.shape[-2:]
++    if height % 2 or width % 2:
++        # yuv420p has no way to represent a half chroma sample. Every canvas this renderer
++        # can produce is a multiple of 32 (the 16x VAE then the 2x2 patch), so this is a
++        # guard against a future caller, not a case to handle.
++        raise ValueError(f"yuv420p needs even dimensions, got {height}x{width}")
++
++    video = video.float().clamp_(0.0, 1.0)
++    r, g, b = video[:, 0], video[:, 1], video[:, 2]
++
++    def plane(coeff, offset):
++        cr, cg, cb = coeff
++        return (r * cr + g * cg + b * cb + offset).round_().clamp_(0, 255).to(torch.uint8)
++
++    y = plane(_Y_COEFF, 16.0)
++    # Compute chroma at full resolution in float, pool, and only then quantise -- pooling
++    # after the uint8 round would average four already-rounded values and lose up to half a
++    # level per sample for no gain.
++    cb = (r * _CB_COEFF[0] + g * _CB_COEFF[1] + b * _CB_COEFF[2] + 128.0)
++    cr = (r * _CR_COEFF[0] + g * _CR_COEFF[1] + b * _CR_COEFF[2] + 128.0)
++    u = _pool2(cb).round_().clamp_(0, 255).to(torch.uint8)
++    v = _pool2(cr).round_().clamp_(0, 255).to(torch.uint8)
++    return y, u, v
++
++
++def _pool2(plane: torch.Tensor) -> torch.Tensor:
++    """2x2 box average of a (frames, height, width) plane, without a conv."""
++    frames, height, width = plane.shape
++    return plane.view(frames, height // 2, 2, width // 2, 2).mean(dim=(2, 4))
++
++
++def encode_video_yuv420p(planes, fps: int, output_path: str, audio=None,
++                         audio_sample_rate: int | None = None) -> None:
++    """`diffusers.utils.export_utils.encode_video`, taking yuv420p planes instead of rgb24.
++
++    `planes` is the `(y, u, v)` from `rgb_to_yuv420p`, already on the host. Each frame's
++    planes are written straight into an `av.VideoFrame`'s buffers, so nothing in this function
++    converts a colour space -- which is the entire point, that work having already happened on
++    the card.
++
++    The audio path is diffusers' own, imported rather than reimplemented: the soundtrack is
++    a few hundred KB and none of it is on the critical path.
++    """
++    import av
++    import numpy as np
++    from diffusers.utils.export_utils import _prepare_audio_stream, _write_audio
++
++    y, u, v = planes
++    num_frames, height, width = y.shape
++
++    container = av.open(output_path, mode="w")
++    stream = container.add_stream("libx264", rate=int(fps))
++    stream.width, stream.height = width, height
++    stream.pix_fmt = "yuv420p"
++    # Measured worth 1.17x on its own (scripts/mux_bench.py): 0 is "decide for me", which for
++    # libx264 hands off to x264's own auto-detect. PyAV does not set this, and upstream's
++    # encode_video does not either. Small next to the conversion this file removes, but free.
++    stream.codec_context.thread_count = 0
++
++    audio_stream = None
++    if audio is not None:
++        if audio_sample_rate is None:
++            raise ValueError("audio_sample_rate is required when audio is provided")
++        audio_stream = _prepare_audio_stream(container, audio_sample_rate)
++
++    y_np, u_np, v_np = (p.numpy() for p in (y, u, v))
++    for index in range(num_frames):
++        frame = av.VideoFrame(width, height, "yuv420p")
++        # PyAV exposes each plane as a writable buffer with its own stride, which is padded up
++        # for alignment and is NOT width. Going through np.frombuffer on the plane and slicing
++        # to the real width is what respects that; `plane.update(bytes)` would need the
++        # padding baked into the source.
++        for plane, source in zip(frame.planes, (y_np[index], u_np[index], v_np[index])):
++            view = np.frombuffer(plane, dtype=np.uint8).reshape(-1, plane.line_size)
++            view[: source.shape[0], : source.shape[1]] = source
++        frame.pts = index
++        for packet in stream.encode(frame):
++            container.mux(packet)
++
++    for packet in stream.encode():
++        container.mux(packet)
++    if audio is not None:
++        _write_audio(container, audio_stream, audio, audio_sample_rate, av)
++    container.close()
++
++
++def to_host(*planes: torch.Tensor) -> tuple[torch.Tensor, ...]:
++    """Copy planes to the host through pinned staging buffers, all three in flight at once.
++
++    The default `.cpu()` lands in pageable memory, which the driver has to stage internally
++    one chunk at a time: measured on this box, 430 MB of rgb24 took 0.35 s, i.e. 1.9 GB/s
++    against the ~25 GB/s the link can do. Pinned destinations let the copies be real DMA and
++    lets all three planes overlap, so the whole transfer is one synchronise instead of three
++    blocking calls.
++    """
++    staged = [torch.empty(p.shape, dtype=p.dtype, pin_memory=True) for p in planes]
++    for host, device_plane in zip(staged, planes):
++        host.copy_(device_plane, non_blocking=True)
++    if planes and planes[0].is_cuda:
++        torch.cuda.current_stream(planes[0].device).synchronize()
++    return tuple(staged)

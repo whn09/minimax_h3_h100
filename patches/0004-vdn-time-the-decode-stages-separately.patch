@@ -1,0 +1,117 @@
+From 841b7e0bf73df73f3289a79e0ea0b71cc1778cf9 Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Tue, 15 Sep 2026 12:07:28 +0800
+Subject: [PATCH 4/8] vdn: time the decode stages separately
+
+At 480p the decode outweighs the denoising it follows -- 13.8 s against 8.9 s -- and
+unlike denoising it is single-rank: rank 0 decodes while the other seven wait at the
+barrier. `decode_and_encode_seconds` alone cannot say whether that is the video VAE, the
+gpu->host copy of 345 frames, or libx264, so it cannot say what is worth fixing.
+
+decode_and_save now returns per-stage seconds (video VAE, audio VAE, frames to host, mux)
+with a device synchronise at each boundary -- without which the async launches would
+attribute everything to whichever stage happened to synchronise. infer_ulysses records
+them under timings["decode_stages"] and prints them. Returning a dict is additive: infer.py
+and infer_diffusers.py ignore the return value and are unchanged.
+---
+ src/inference/infer_ulysses.py | 20 +++++++++++++++++++-
+ src/inference/render.py        | 22 ++++++++++++++++++++++
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
+index 9778549..8f4f07d 100644
+--- a/src/inference/infer_ulysses.py
++++ b/src/inference/infer_ulysses.py
+@@ -122,6 +122,15 @@ def main():
+     latents, audio_latents = sample(cfg.render.num_steps, step_seconds)
+     denoise_seconds = time.perf_counter() - denoise_started
+ 
++    # Printed HERE, not only in the summary line at the bottom, because everything after
++    # this point can still run out of memory -- the decoders arrive, a full-canvas decode
++    # allocates, and on an 80 GiB card at a large canvas that is exactly where a render
++    # dies. The s/NFE is the number the whole run exists to produce and it is final now, so
++    # it should survive a failed decode instead of dying with it.
++    if runtime.is_main:
++        print(f"denoise {denoise_seconds:.2f}s over {cfg.render.num_steps} NFE = "
++              f"{denoise_seconds / cfg.render.num_steps:.3f}s/NFE", flush=True)
++
+     timings = {
+         "denoise_seconds": denoise_seconds,
+         "seconds_per_step": denoise_seconds / cfg.render.num_steps,
+@@ -161,7 +170,7 @@ def main():
+ 
+     decode_started = time.perf_counter()
+     if runtime.is_main:
+-        decode_and_save(
++        timings["decode_stages"] = decode_and_save(
+             latents, audio_latents, model.vae, model.audio_vae, cfg.render.out, str(device)
+         )
+         torch.cuda.synchronize(device)
+@@ -202,6 +211,15 @@ def main():
+             f"E2E {timings['end_to_end_seconds']:.2f}s",
+             flush=True,
+         )
++        # The decode is the bigger half of the post-warmup latency at 480p and it is
++        # single-rank, so break it out: the video VAE is the only part worth parallelising,
++        # and this says how much of the 13.8 s that actually is.
++        print(
++            "decode stages: "
++            + ", ".join(f"{name.removesuffix('_seconds')} {seconds:.2f}s"
++                        for name, seconds in timings["decode_stages"].items()),
++            flush=True,
++        )
+ 
+         if runtime.profile_enabled:
+             for rank, profile in enumerate(profile_by_rank):
+diff --git a/src/inference/render.py b/src/inference/render.py
+index 7587aa7..e03eb03 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -233,6 +233,21 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
+ 
+ @torch.no_grad()
+ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str):
++    """Returns a dict of per-stage seconds. At 480p the whole of this outweighs the
++    denoising it follows -- 13.8 s against 8.9 s -- and unlike denoising none of it is
++    parallel: one rank decodes while the other seven sit at the barrier. So the stages are
++    timed separately, because "decode" being the bigger half of the latency is only
++    actionable if it says which part. Each boundary is device-synchronised; the launches
++    are async otherwise and the split would be meaningless."""
++    timings: dict[str, float] = {}
++    stage_started = time.perf_counter()
++
++    def stage(name):
++        nonlocal stage_started
++        now = time.perf_counter()
++        timings[name] = now - stage_started
++        stage_started = now
++
+     latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+     latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+     with torch.autocast(device_type="cuda", dtype=torch.float16):
+@@ -240,13 +255,18 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+     pixel_mean = torch.tensor(PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
+     pixel_std = torch.tensor(PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
+     video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
++    torch.cuda.synchronize(device)
++    stage("video_vae_seconds")
+ 
+     audio_latents_mean = torch.tensor(audio_vae.config.latents_mean, device=device).view(1, -1, 1)
+     audio_latents_std = torch.tensor(audio_vae.config.latents_std, device=device).view(1, -1, 1)
+     audio = audio_vae.decode(audio_latents * audio_latents_std + audio_latents_mean, return_dict=False)[0]
+     audio = audio.float().permute(1, 0, 2)[0]  # (2, num_samples)
++    torch.cuda.synchronize(device)
++    stage("audio_vae_seconds")
+ 
+     frames = (video[0].permute(1, 2, 3, 0) * 255).round().to(torch.uint8).cpu()  # (F, H, W, 3)
++    stage("frames_to_host_seconds")
+     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+ 
+     # Encode to a sibling temp name and rename into place, so a render that is killed
+@@ -261,4 +281,6 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+     encode_video(frames, fps=FPS, output_path=partial_path,
+                  audio=audio.cpu(), audio_sample_rate=audio_vae.config.sampling_rate)
+     os.replace(partial_path, out_path)
++    stage("mux_seconds")
+     print(f"wrote {out_path}", flush=True)
++    return timings
