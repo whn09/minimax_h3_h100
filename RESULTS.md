@@ -116,6 +116,80 @@ Three things this table is and is not:
   configuration is plausible, but the number is denoise-only arithmetic and has not been run
   end to end. It is the trade the brief chose against: the ask was minimum latency.
 
+## 480p vs 768p, both measured over ten requests
+
+The two canvases were never compared at matched methodology before — 480p's figure was a
+subtraction and 768p's came from a process that could not serve a second request. Both are now
+nine-request means from one warm process, 345 frames, 8 NFE, fp8, t2va, each at **its own**
+optimal branch split (480p wants 3 softmax + 5 linear, 768p wants 5 + 3; the split is a
+property of the canvas, see the two sweeps below):
+
+| per request, steady state | 480p / 864x480 | 768p / 1344x768 | ratio |
+|---|---:|---:|---:|
+| **request, end to end** | **11.447 ± 0.040** | **33.206 ± 0.850** | **2.90x** |
+| denoise, 8 NFE | 8.695 ± 0.032 | 20.968 ± 0.483 | 2.41x |
+| — per NFE | 1.087 | 2.621 | 2.41x |
+| video VAE, 8 ranks | 1.568 ± 0.039 | 3.696 ± 0.343 | 2.36x |
+| audio VAE + frames-to-host + mux | 1.181 ± 0.019 | 1.678 ± 0.043 | 1.42x |
+| decoder load | **0.000** | 5.046 ± 0.607 | — |
+| decoder release | **0.000** | 1.815 ± 0.415 | — |
+| | | | |
+| sequence rows | 43,759 | 105,265 | 2.406x |
+| tokens per frame | 405 | 1,008 | 2.489x |
+| decode peak, reserved | 62.89 GiB | 63.59 GiB | 1.01x |
+| reserved growth over 10 requests | +0.254 GiB | **+0.000** | — |
+| vs clip length | **1.256x realtime** | 0.433x (2.31x slower) | — |
+| $ per finished video-second | **$0.005259** | $0.015257 | 2.90x |
+
+**The 2.90x is not a compute ratio, and that is the whole point of the table.** Split the
+21.76 s gap by stage:
+
+| where the 21.76 s goes | s | share |
+|---|---:|---:|
+| denoise | +12.273 | 56.4 % |
+| video VAE | +2.128 | 9.8 % |
+| tail (audio, PCIe, x264) | +0.497 | 2.3 % |
+| **decoder load** | **+5.046** | **23.2 %** |
+| **decoder release** | **+1.815** | **8.3 %** |
+
+**31.5 % of the gap is memory cycling, not arithmetic.** 480p holds the DiT (45.24 GiB per
+rank), both decoders (9.70 + 0.564) and a full-length decode's activations simultaneously and
+never moves anything; 768p cannot — 45.24 + 9.70 + a ~13.6 GiB non-PyTorch floor leaves 10.6
+where the denoise needs ~16.9 — so it drops the decoders after every decode and reloads them
+before the next. Take that away and 768p is **26.35 s (2.30x)**; give it the pinned host copy
+that is designed but not built, ~1.5 s instead of 6.86, and it is **27.85 s (2.43x)**.
+
+Both of those bracket the **2.406x row ratio**. So the honest statement is: *the model scales
+essentially linearly in sequence rows from 480p to 768p, and the 2.90x a user would actually
+measure is 2.41x of model plus 0.49x of an 80 GiB card.* On a 141 GiB H200 the second term
+disappears — which is a stronger reason to prefer H200 for 768p than the 1.13x per-NFE gap
+measured further down, and it does not apply at 480p at all.
+
+Three more things the matched comparison settles:
+
+* **the denoise ratio depends on which pair you take, and the spread is informative.** Request
+  1 against request 1 is 2.28x; steady against steady is 2.41x; at *standard* Ulysses on both
+  canvases (matched but optimal for neither) it is 2.08x. The 2.28 → 2.41 movement is 768p's
+  unexplained steady-state denoise regression (19.77 → 20.97 s), which only appears on the
+  canvas that cycles memory — so allocator churn is the leading suspect and 480p, which cycles
+  nothing and moves +0.03 s, is the control that makes it suspicious rather than the one that
+  proves it.
+* **the tail barely scales — 1.42x on 2.49x the pixels.** Because two thirds of it is not
+  per-pixel work: the audio VAE is 0.126 s at both canvases (it decodes 451 audio frames
+  either way, and the canvas does not enter), and 4-segment x264 gives back most of the rest.
+  Only `frames_to_host` scales with pixels, and after patch 7 it is 0.04 → 0.07 s.
+* **768p is less repeatable, 2.56 % relative sd against 480p's 0.35 %** — and the variance is
+  in the cycled stages, not the compute: decoder load sd 0.607, release 0.415, video VAE 0.343
+  against the denoise's 0.483 on a number 4x larger. A 768p server that stopped cycling would
+  get tighter as well as faster.
+
+Practical read: **480p is the configuration that works.** It renders 1.26x faster than the
+clip plays, costs less per finished second than the instance costs to run, holds everything
+resident, and repeats to ±40 ms. 768p is 2.9x the price for 2.49x the pixels and it is 2.3x
+slower than realtime, so it cannot be a low-latency interactive product on this box — it is a
+batch shape, and the first thing to fix on it is the 6.86 s of cycling rather than anything in
+the model.
+
 ## 480p: the branch split matters more than anything else
 
 `parallel.softmax_ranks: n` gives n ranks the window-softmax branch and `8-n` the linear
@@ -230,7 +304,10 @@ more than the choice of card.
 
 480p vs 768p at the same clip length, standard Ulysses both: 1.302 vs 2.702 s/NFE =
 **2.08x**, against a row ratio of 2.41x. Sublinear, not superlinear — see the README for
-why the asymptotic argument gives the wrong answer here.
+why the asymptotic argument gives the wrong answer here. Note that this is a matched-config
+comparison at a config **neither canvas uses**: each at its own optimal split it is 2.28x
+(request 1) to 2.41x (steady), i.e. linear in rows. The full matched comparison is the
+"480p vs 768p" section above.
 
 ### 768p end to end: half the request is one PCIe transfer
 
