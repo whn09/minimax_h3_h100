@@ -42,7 +42,9 @@ steps only when the chunk count crosses a multiple of 8.
 Two framings of the same run, because they get quoted for different things:
 
 * **1.069 s/NFE** is the number comparable with upstream's published table (2.29 on
-  8x H200, 1.40 on 8x B200 — all at 768p, all denoise-only).
+  8x H200, 1.40 on 8x B200 — all at 768p, and all **denoise only**: their Results section
+  excludes "model loading, warm-up, VAE decoding, and MP4 encoding", so their `18.3 s` is
+  just `2.29 x 8`).
 * **13.2 s steady-state end-to-end** is what a request costs on a warm server. Post-warmup
   E2E including the one-time decoder load is 17.1 s.
 

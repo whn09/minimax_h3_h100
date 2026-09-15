@@ -27,7 +27,8 @@ fp8 kernels and Ulysses sequence parallelism:
 
 The model is **`ckpts/stage-dmd-step-250`** = VDN-H3-8-step, the Stage-DMD distilled
 `turbo` adapter. That is the fastest tier upstream ships and the one behind their headline
-(768p / 14.4 s: **18.3 s on 8x H200**, 11.23 s on 8x B200, both at 8 NFE).
+(768p / 14.4 s: **18.3 s on 8x H200**, 11.23 s on 8x B200, both at 8 NFE — and both
+**denoise only**, by their own Results caveat; see "What the latency actually is").
 
 ## What had to change for this box
 
@@ -120,36 +121,51 @@ ranks to spread it over — even though the *total* time does not follow the cos
 ## What the latency actually is
 
 The number asked for is **post-warmup end-to-end**: with the process already up and the
-kernels compiled, how long from "go" to a finished mp4. That is not the denoise. Upstream's
-published 18.3 s is denoise only (`denoise_seconds / num_steps x num_steps`), and it is the
-right thing to publish for a kernel comparison, but it is roughly half of what a request
-costs. The four stages, at 480p / 345 f / 8 NFE / 8 GPUs:
+kernels compiled, how long from "go" to a finished mp4. **That is not what upstream
+publishes**, and the difference is not small. Their Results section is explicit about it:
 
-| stage | on how many ranks | 480p, before patch 5 | 480p, after | 768p (standard) |
+> We report steady-state **denoising** speed on the 768p, 14.4-second video generation
+> workload [...] We **exclude model loading, warm-up, VAE decoding, and MP4 encoding**. For a
+> live setup, we recommend running the text prompt rewriter, VAE decoding, and MP4
+> conversion on separate machines, so the eight GPUs only denoise.
+
+So `18.3 s` is `2.29 s/NFE x 8`, nothing else — the column header `8 NFE
+(VDN-H3-8-step)` names the step count and the checkpoint, not a metric. That is the right
+thing to publish for a kernel comparison, and it is the number to compare a `s/NFE` against.
+It is also **about half of what one request costs**. Note the terminology collision too:
+upstream's "steady state" means the denoise loop after warm-up, while "steady state" below
+means the whole request with the decoders already resident.
+
+480p / 345 f / 8 NFE / 8 GPUs / 3+5, as the patches landed:
+
+| stage | on how many ranks | before patch 5 | after patch 5 | now (7, 9, 10) |
 |---|---|---|---|---|
-| denoise, 8 NFE | 8 | 8.72 s | 8.72 s | 21.62 s |
-| transformer offload to host | 1 | 0 (off) | 0 (off) | ~27 s |
-| decoder load, NVMe → GPU | 1 | 2.53 s | 3.65 s | 2.52 s |
-| video VAE | 1 → **8** | ~11.23 s | **2.97 s** | 25.08 s (with the rest) |
-| audio VAE + frames-to-host + mux | 1 | (in the 14.38 s) | 3.18 s | ↑ |
-| **post-warmup E2E** | | **25.63 s** | **18.53 s** | **49.21 s** |
-| **steady state** (decoders resident) | | **23.10 s** | **14.88 s** | **46.69 s** |
+| denoise, 8 NFE | 8 | 8.72 s | 8.72 s | 8.55 s |
+| release the DiT | 1 | 0 (`keep`) | 0 (`keep`) | 0 (`keep`) |
+| decoder load, NVMe → GPU | 1 | 2.53 s | 3.65 s | 3.87 s |
+| video VAE | 1 → **8** | ~11.23 s | **2.97 s** | 3.10 s |
+| audio VAE + frames-to-host + mux | 1 | (in the 14.38 s) | 3.18 s | **1.55 s** |
+| **post-warmup E2E** | | **25.63 s** | 18.53 s | **17.07 s** |
+| **steady state** (decoders resident) | | **23.10 s** | 14.88 s | **13.20 s** |
 
-Decoder load is once per **process**, not once per request, so the steady-state
-per-request figure excludes it. Everything else is per request. (The 768p row shows no
-offload because that control arm predates the offload existing; the ~27 s is what the arms
-that do carry it measure.) `RESULTS.md` carries the full table; the point here is the shape:
+Decoder load is once per **process**, not once per request, so the steady-state per-request
+figure excludes it. Everything else is per request. `RESULTS.md` carries the full tables and
+the 768p equivalent (**32.32 s** post-warmup, **29.50 s** steady); the point here is the
+shape, and it changed twice:
 
-**At 480p the decode was bigger than the denoise, and none of it was parallel.** Eight cards
+**First, the decode was bigger than the denoise and none of it was parallel.** Eight cards
 spent 8.7 s working and then one card spent 14.4 s working while seven sat at a barrier.
-Patch 5 takes the video VAE — the large majority of that — to all eight ranks, and the
-steady-state request drops from 23.1 s to **14.9 s against a 14.375 s clip, i.e. real
-time**.
+Patch 5 takes the video VAE to all eight ranks and the request drops to 14.88 s.
 
-What is left is more interesting than what was fixed: the biggest single item after the
-denoise is now the **H.264 mux at 2.66 s**, which is host-side libx264 and touches no GPU.
-The GPU-side decode is 2.97 s. Attacking the decode further means attacking a video encoder,
-not a model.
+**Then the biggest item after the denoise was an H.264 encoder**, host-side libx264 touching
+no GPU. Patches 7 and 9 take the tail 3.18 → **1.55 s** by doing the colour conversion on the
+card and running four independent encoders instead of one. What is left in the tail is
+0.26 s of AAC, 0.28 s of PCIe and 1.02 s of x264.
+
+Following upstream's own advice — decode and mux on another machine — would take the tail off
+these eight GPUs and raise their *throughput*, since the tail would overlap the next
+request's denoise. It would make the *latency* asked for here worse, not better, because a
+finished clip then has to cross a network before it exists.
 
 ## The VAE decoder: DP, not TP
 
