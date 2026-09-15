@@ -1,0 +1,538 @@
+From 6d81d7aaad7ea52c2daad779b56be5a7a1dd6cdc Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Tue, 15 Sep 2026 18:56:54 +0800
+Subject: [PATCH 11/12] vdn: keep the DiT resident at 768p by never building
+ the full-canvas clip
+
+768p ran `transformer_before_decode: free` because rank 0's decode peak cleared
+80 GiB by 102 MiB with the weights still on the card, so every 768p render paid
+2.81 s to evict 45.24 GiB it would have to rebuild (138-232 s) before the next
+request. The eviction is not the fix; rank 0's peak is. Two allocations do it,
+and both are avoidable rather than necessary:
+
+  * the assembly's own output. `_decode` cats the blended chunks into a
+    full-canvas fp16 RGB tensor (1.99 GiB at 345 frames of 1344x768) and the
+    caller then denormalises it to fp32 (3.98 GiB) before converting to yuv420p,
+    which is 1.5 bytes per pixel. The blend is temporally local and everything
+    after it is per frame, so none of that has to coexist: each chunk can become
+    its final planes as it leaves the assembly. `parallel.stream_yuv_assembly`
+    passes a sink into decode_video_parallel and the only full-length buffers
+    left are the planes.
+
+  * the all-gather destination. Gathering every rank's every chunk at once is
+    24 pieces x 3 x 22 x 768 x 1344 fp16 = 3.045 GiB, and with the two buffers
+    above removed it becomes the largest thing on the card -- it is what the
+    first attempt at this actually died on, 3.05 GiB wanted against 2.84 free.
+    Gathering one slot at a time holds 0.38 GiB, and costs nothing: slot s
+    across the ranks in rank order IS chunks 8s..8s+7, which is the order the
+    assembly consumes them in, so the gather is not merely split but pipelined
+    with the blend. The carried overlap is cloned at slot boundaries (31 MiB)
+    because it is a view into the buffer the next gather overwrites.
+
+Neither changes the arithmetic, and scripts/decode_parity.py asserts that rather
+than trusting it: fixed latents, one process, serial vs parallel vs streamed, all
+three bit-identical at 768p (0 of 1,068,318,720) and 480p (0 of 429,235,200),
+with the streamed planes checked against rgb_to_yuv420p(serial). This is the only
+form the test can take -- multi-rank denoise is not reproducible run to run
+(index_add_ atomics plus all_reduce, ~17 dB PSNR between identical runs), so a
+whole-render A-B could never have shown bit-identity.
+
+Result at 768p: decode peak 64.5 GiB reserved, ~1 GiB clear of the non-PyTorch
+floor, and `keep` holds for a render. Nothing here is wired into
+infer_ulysses.py yet -- decode_parity.py is what verifies it, and it calls the
+decode directly -- so the switch is honoured starting with the next commit,
+which is also what finds out that the DiT staying resident is only half the
+problem.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ scripts/decode_parity.py            |  60 +++++++--
+ src/config/inference.py             |  18 +++
+ src/inference/render.py             |  85 ++++++++++++-
+ src/inference/utils/parallel_vae.py | 185 +++++++++++++++++++++-------
+ 4 files changed, 292 insertions(+), 56 deletions(-)
+
+diff --git a/scripts/decode_parity.py b/scripts/decode_parity.py
+index b15f839..d9fb305 100644
+--- a/scripts/decode_parity.py
++++ b/scripts/decode_parity.py
+@@ -26,6 +26,16 @@ this code's difference and nothing else. Latents are drawn from a seeded generat
+ than loaded from a render, because the decoder is a pure function of its input -- it has no
+ idea where the numbers came from -- and `--latents` is there for anyone who would rather
+ check an in-distribution tensor.
++
++Two claims are checked, in the order that isolates a failure:
++
++  1. the eight-rank decode's RGB against `vae.decode`'s RGB;
++  2. `parallel.stream_yuv_assembly`'s yuv420p planes against converting that same RGB with
++     `rgb_to_yuv420p` -- the streaming path turns each chunk into planes inside the assembly
++     loop, so this is where a chunk-boundary or frame-offset mistake would land, and neither
++     a frame count nor a PSNR would necessarily see one.
++
++If (1) passes and (2) fails, the streaming is wrong; if both fail, the decode is.
+ """
+ from __future__ import annotations
+ 
+@@ -40,8 +50,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+     align_num_frames, video_latent_num_frames)
+ 
+-from src.inference.render import decode_video_latents, latent_grid, load_decoders_only
++from src.inference.render import (decode_video_latents, decode_video_latents_yuv, latent_grid,
++                                  load_decoders_only)
+ from src.inference.utils.ulysses_runtime import init_ulysses
++from src.inference.utils.yuv import rgb_to_yuv420p
+ 
+ 
+ def main():
+@@ -85,6 +97,12 @@ def main():
+     torch.cuda.synchronize(device)
+     runtime.barrier()
+ 
++    # The streamed variant is a second collective, so it also has to be reached by every rank
++    # before rank 0 goes off to do the serial decode alone.
++    streamed = decode_video_latents_yuv(vae, latents, device, runtime)
++    torch.cuda.synchronize(device)
++    runtime.barrier()
++
+     if not runtime.is_main:
+         return
+ 
+@@ -107,13 +125,41 @@ def main():
+     print(f"{'in 8-bit levels':>22}: {max_abs * 255:.3e}")
+ 
+     if max_abs == 0.0:
+-        print("\nOK -- bit-identical. The eight-rank decode is upstream's decode.")
+-        raise SystemExit(0)
+-    if max_abs * 255 < 0.5:
+-        print("\nOK-ish -- not bit-identical, but below half an 8-bit level, so the encoded "
+-              "bytes cannot differ. Still worth explaining before the claim is weakened.")
++        print("\n(1) OK -- bit-identical. The eight-rank decode is upstream's decode.")
++    elif max_abs * 255 < 0.5:
++        print("\n(1) OK-ish -- not bit-identical, but below half an 8-bit level, so the "
++              "encoded bytes cannot differ. Still worth explaining before the claim is "
++              "weakened.")
++    else:
++        print("\n(1) FAIL -- the parallel decode changed the picture.")
++        raise SystemExit(1)
++
++    # (2) The streamed assembly, against converting the RGB that (1) just validated. uint8
++    # planes, so exact equality is the only sensible bar -- there is no rounding left to be
++    # generous about.
++    reference = rgb_to_yuv420p(serial[0].permute(1, 0, 2, 3))
++    names = ("y", "u", "v")
++    if len(streamed) != 3:
++        print(f"\n(2) FAIL -- streamed returned {len(streamed)} planes")
++        raise SystemExit(1)
++    ok = True
++    print()
++    for name, got, want in zip(names, streamed, reference):
++        if got.shape != want.shape:
++            print(f"{name:>22}: FAIL shape {tuple(got.shape)} against {tuple(want.shape)}")
++            ok = False
++            continue
++        bad = int((got != want).sum())
++        worst = int((got.int() - want.int()).abs().max())
++        print(f"{name:>22}: {bad} of {got.numel()} samples differ, worst {worst} levels")
++        ok = ok and bad == 0
++
++    if ok:
++        print("\n(2) OK -- the streamed yuv assembly is bit-identical to converting the "
++              "full-canvas clip.\n\nOK -- both claims hold.")
+         raise SystemExit(0)
+-    print("\nFAIL -- the parallel decode changed the picture.")
++    print("\n(2) FAIL -- streaming the assembly changed the planes. Since (1) passed, the "
++          "decode is right and the per-chunk conversion or the frame offsets are wrong.")
+     raise SystemExit(1)
+ 
+ 
+diff --git a/src/config/inference.py b/src/config/inference.py
+index e6aedc3..57f4b3e 100644
+--- a/src/config/inference.py
++++ b/src/config/inference.py
+@@ -86,6 +86,17 @@ class ParallelConfig:
+     # bit-identical output for one all-gather. It costs the video VAE's weights on every
+     # rank rather than only on rank 0, which is why it is a switch and not the default.
+     parallel_vae_decode: bool = False
++    # Assemble the parallel decode straight into yuv420p planes instead of concatenating the
++    # blended chunks into a full-canvas RGB tensor. Same pixels -- the blend is temporally
++    # local and everything after it is per frame, so scripts/decode_parity.py asserts
++    # bit-identity -- but rank 0 never holds the clip at 6 bytes per pixel (fp16 RGB) nor at
++    # 12 (the fp32 denormalisation), only at 1.5.
++    #
++    # This is what lets 768p keep the DiT resident: `keep` failed by 102 MiB, and the two
++    # buffers this removes are 1.99 and 3.98 GiB at 345 frames of 1344x768. Requires
++    # parallel_vae_decode (there is nothing to stream out of vae.decode) and
++    # render.gpu_color_convert (it produces planes, not RGB).
++    stream_yuv_assembly: bool = False
+ 
+ 
+ @dataclass
+@@ -192,6 +203,13 @@ def validate_parallel(cfg) -> None:
+     world-size bound (softmax_ranks < WORLD_SIZE) is checked at install."""
+     if cfg.parallel.softmax_ranks < 0:
+         raise ValueError("parallel.softmax_ranks must be >= 0 (0 = standard Ulysses)")
++    if cfg.parallel.stream_yuv_assembly:
++        if not cfg.parallel.parallel_vae_decode:
++            raise ValueError("parallel.stream_yuv_assembly needs parallel.parallel_vae_decode: "
++                             "there is no per-chunk assembly to stream out of vae.decode")
++        if not cfg.render.gpu_color_convert:
++            raise ValueError("parallel.stream_yuv_assembly produces yuv420p planes, so it "
++                             "cannot be combined with render.gpu_color_convert=false")
+ 
+ 
+ def validate_single_process(cfg) -> None:
+diff --git a/src/inference/render.py b/src/inference/render.py
+index f1bf306..8c42f8f 100644
+--- a/src/inference/render.py
++++ b/src/inference/render.py
+@@ -17,7 +17,8 @@ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+     audio_latent_num_frames, video_latent_num_frames)
+ from diffusers.utils.export_utils import encode_video
+ 
+-from src.inference.utils.parallel_vae import can_decode_in_parallel, decode_video_parallel
++from src.inference.utils.parallel_vae import (assembled_frame_count, can_decode_in_parallel,
++                                              decode_video_parallel)
+ from src.inference.utils.yuv import encode_video_yuv420p, rgb_to_yuv420p, to_host
+ from src.models.sequence_layout import layout_from_indices
+ from src.paths import H3_BASE, resolve_weights
+@@ -264,9 +265,73 @@ def decode_video_latents(vae, latents, device: str, runtime=None):
+     return (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+ 
+ 
++@torch.no_grad()
++def decode_video_latents_yuv(vae, latents, device: str, runtime):
++    """The same decode as decode_video_latents, assembled straight into yuv420p planes.
++
++    Why this exists: at 768p on an 80 GiB card the DiT (45.2 GiB) can only stay resident if
++    the decode stops building full-canvas tensors it does not need. The ordinary path builds
++    two of them on rank 0 -- `torch.cat` over the blended chunks at 6 bytes per pixel (fp16
++    RGB, 1.99 GiB for 345 frames of 1344x768), then the pixel denormalisation at 12 bytes
++    per pixel (fp32, 3.98 GiB) -- and then converts the result to yuv420p, which is 1.5.
++    Since the conversion is per frame and the blend is temporally local, none of that has to
++    coexist: each chunk can become its final planes as it comes out of the assembly, and the
++    only full-length buffers are the planes themselves at 1.5 bytes per pixel.
++
++    Returns `(y, u, v)` uint8 on `device` on rank 0 -- the same tuple `rgb_to_yuv420p`
++    returns, so decode_and_save's encode path is unchanged -- and None elsewhere. Requires
++    the parallel decode; there is nothing to stream out of `vae.decode`.
++    """
++    if not can_decode_in_parallel(vae):
++        raise ValueError("decode_video_latents_yuv needs the chunked decode "
++                         "(tokens_chunk_size > 0 and token_drop > 0)")
++    latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
++    latents_std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
++    scaled = latents * latents_std + latents_mean
++
++    pixel_mean = torch.tensor(PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
++    pixel_std = torch.tensor(PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
++
++    planes = None
++    if runtime.is_main:
++        # Sized up front from the chunk arithmetic rather than grown per chunk: the whole
++        # point is to hold exactly one full-length buffer per plane, and appending would hold
++        # two while it copied. `assembled_frame_count` is before the trailing trim, which is
++        # a slice at the end.
++        frames = assembled_frame_count(vae, latents.shape[2])
++        height = latents.shape[-2] * vae.spatial_compression_ratio
++        width = latents.shape[-1] * vae.spatial_compression_ratio
++        planes = (torch.empty((frames, height, width), dtype=torch.uint8, device=device),
++                  torch.empty((frames, height // 2, width // 2), dtype=torch.uint8, device=device),
++                  torch.empty((frames, height // 2, width // 2), dtype=torch.uint8, device=device))
++
++    def sink(offset, chunk):
++        # Exactly decode_video_latents' epilogue and decode_and_save's conversion, on
++        # `chunk.shape[2]` frames instead of all of them. Both are elementwise per frame
++        # (the chroma pool is 2x2 *spatial*), so the result is bit-identical -- asserted by
++        # scripts/decode_parity.py rather than argued here.
++        rgb = (chunk.float() * pixel_std + pixel_mean).clamp(0, 1)
++        y, u, v = rgb_to_yuv420p(rgb[0].permute(1, 0, 2, 3))
++        for plane, part in zip(planes, (y, u, v)):
++            plane[offset : offset + part.shape[0]] = part
++
++    with torch.autocast(device_type="cuda", dtype=torch.float16):
++        valid = decode_video_parallel(vae, scaled, runtime, sink=sink if runtime.is_main else _drop)
++    if not runtime.is_main:
++        return None
++    return tuple(plane[:valid] for plane in planes)
++
++
++def _drop(offset, chunk):
++    """A sink for the ranks that assemble nothing. decode_video_parallel only calls the sink
++    on rank 0, so this never runs; it exists so the argument is not None on those ranks,
++    which would silently select the `torch.cat` path if the guard above ever moved."""
++    raise AssertionError("only the main rank assembles")
++
++
+ @torch.no_grad()
+ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, device: str,
+-                    video=None, gpu_color_convert: bool = True,
++                    video=None, planes=None, gpu_color_convert: bool = True,
+                     encode_segments: int = 4, encode_threads: int = 8):
+     """Returns a dict of per-stage seconds. At 480p the whole of this outweighs the
+     denoising it follows -- 13.8 s against 8.9 s -- and unlike denoising none of it is
+@@ -277,6 +342,9 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+ 
+     `video` is an already-decoded pixel video from decode_video_latents -- how the
+     multi-rank decode gets its result in here. None keeps the single-rank behaviour.
++    `planes` is the same thing one step further along: the `(y, u, v)` from
++    decode_video_latents_yuv, for the 768p path that never builds a full-canvas RGB tensor.
++    Mutually exclusive with `video`, and it implies gpu_color_convert.
+ 
+     `gpu_color_convert` moves RGB->YUV420p onto the card (utils/yuv.py); false is
+     diffusers' encode_video, byte-for-byte as before. `encode_segments`/`encode_threads`
+@@ -291,7 +359,14 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+         timings[name] = now - stage_started
+         stage_started = now
+ 
+-    if video is None:
++    if planes is not None:
++        if video is not None:
++            raise ValueError("pass video= or planes=, not both")
++        if not gpu_color_convert:
++            raise ValueError("planes= are already yuv420p; gpu_color_convert=false has "
++                             "nothing left to do differently")
++        stage_started = time.perf_counter()
++    elif video is None:
+         video = decode_video_latents(vae, latents, device)
+         torch.cuda.synchronize(device)
+         stage("video_vae_seconds")
+@@ -312,7 +387,9 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, out_path: str, devic
+         # *255-and-round that used to happen here is folded into the colour matrix, so the
+         # pixels are quantised once (to Y/Cb/Cr) rather than twice (to rgb24, then again by
+         # swscale). What crosses PCIe is the yuv420p the encoder wants, 1.5 bytes/px.
+-        planes = rgb_to_yuv420p(video[0].permute(1, 0, 2, 3))
++        # Already done per chunk when the caller streamed the assembly.
++        if planes is None:
++            planes = rgb_to_yuv420p(video[0].permute(1, 0, 2, 3))
+         frames = to_host(*planes)
+     else:
+         frames = (video[0].permute(1, 2, 3, 0) * 255).round().to(torch.uint8).cpu()  # (F,H,W,3)
+diff --git a/src/inference/utils/parallel_vae.py b/src/inference/utils/parallel_vae.py
+index 707fee5..d454f14 100644
+--- a/src/inference/utils/parallel_vae.py
++++ b/src/inference/utils/parallel_vae.py
+@@ -15,7 +15,8 @@ sit at the barrier. It does not have to be that way, and the reason is the shape
+ 
+ So it is a grid of independent forwards, which makes this **data** parallelism, not
+ tensor parallelism. TP would shard a 2048-wide ViT and pay an all-reduce inside every one
+-of the 300 tiles; DP pays one all-gather for the whole decode. At 345 frames the grid is
++of the 300 tiles; DP pays one all-gather per round of chunks -- three, at 345 frames on
++eight ranks, and they overlap the blend. At 345 frames the grid is
+ 20 temporal chunks x 15 tiles = 300 decoder calls at 480p (28 tiles, 560 calls at 768p),
+ and the measured 768p/480p decode ratio, 1.82x, matches the 1.87x call ratio -- so call
+ count is what this costs, and splitting the calls is what fixes it.
+@@ -47,8 +48,55 @@ def can_decode_in_parallel(vae) -> bool:
+     return getattr(vae, "tokens_chunk_size", 0) > 0 and vae.config.token_drop > 0
+ 
+ 
++class _Geometry:
++    """`_decode`'s chunk arithmetic, derived once instead of inline.
++
++    Split out because a caller that wants to stream the assembly (`sink=` below) has to
++    size its own output buffer *before* the loop runs, and the only honest way to let it do
++    that is to hand it the same numbers the loop uses rather than a second derivation of
++    them.
++    """
++
++    def __init__(self, vae, num_latent_frames: int):
++        self.tokens_chunk = vae.tokens_chunk_size
++        self.token_drop = vae.config.token_drop
++        self.temporal_ratio = vae.temporal_compression_ratio
++        chunk_num_frames = self.tokens_chunk * self.temporal_ratio
++
++        num_tokens = num_latent_frames + self.token_drop
++        self.pad_tokens = (-num_tokens) % self.tokens_chunk
++        self.num_chunks = ((num_tokens + self.pad_tokens) // self.tokens_chunk
++                           - int(self.token_drop > 0))
++
++        self.chunk_num_frames = chunk_num_frames
++        self.main_frames = chunk_num_frames - vae.frame_pre_padding
++        self.overlap_frames = vae.frame_overlap if self.token_drop > 0 else 0
++
++        # What the assembly produces, and what of it was actually asked for. The trailing
++        # trim is _decode's: `pad_tokens` repeated latent frames produce pixel frames nobody
++        # requested. Verified against the released config -- clip_length 17, token_drop 3,
++        # 345 frames: 20 chunks x 17 main + a trailing 5 = 345, pad_frames 0.
++        self.assembled_frames = self.num_chunks * self.main_frames + self.overlap_frames
++        self.pad_frames = 0
++        if self.pad_tokens > 0:
++            intra_tail = vae.config.clip_length % self.temporal_ratio
++            self.pad_frames = sum(
++                intra_tail
++                if intra_tail and (num_latent_frames + k) % self.tokens_chunk == 0
++                else self.temporal_ratio
++                for k in range(self.pad_tokens)
++            )
++        self.valid_frames = self.assembled_frames - self.pad_frames
++
++
++def assembled_frame_count(vae, num_latent_frames: int) -> int:
++    """How many pixel frames `decode_video_parallel` will hand a sink, before the trailing
++    trim. A sink allocating its own output needs this; the trim is a slice afterwards."""
++    return _Geometry(vae, num_latent_frames).assembled_frames
++
++
+ @torch.no_grad()
+-def decode_video_parallel(vae, z: torch.Tensor, runtime) -> torch.Tensor:
++def decode_video_parallel(vae, z: torch.Tensor, runtime, sink=None):
+     """`vae.decode(z, return_dict=False)[0]`, with the temporal chunks spread over
+     runtime's ranks. Every rank must call this -- there is an all-gather inside. Only the
+     return value on rank 0 is the full video; the others get their own partial buffer,
+@@ -56,18 +104,30 @@ def decode_video_parallel(vae, z: torch.Tensor, runtime) -> torch.Tensor:
+ 
+     Mirrors AutoencoderKLMiniMaxH3._decode step for step; see the module docstring for
+     why that is safe to do.
++
++    `sink`, when given, is called as `sink(frame_offset, chunk)` for each assembled chunk in
++    output order and **the full-canvas tensor is never built**. That matters on an 80 GiB
++    card at 768p, where the DiT can only stay resident if this function stops asking for
++    ~4 GiB it does not need: the caller's sink converts each chunk to yuv420p as it arrives
++    and keeps 1.5 bytes per pixel instead of the 6 (fp16 RGB) that `torch.cat` produces and
++    the 12 that the fp32 denormalisation downstream of it produces. In sink mode the return
++    value on rank 0 is the number of VALID frames -- the assembly hands the sink
++    `assembled_frame_count` frames and the trailing trim is the sink's own slice, because
++    trimming is free on a buffer it owns and a copy on one this function owns.
++
++    Chunk boundaries are where `_blend` cross-fades, and it is a temporally local operation
++    over `frame_overlap` frames, so streaming cannot change the arithmetic: each chunk is
++    blended against its predecessor's overlap exactly as `_decode` blends it. Everything a
++    sink does downstream of that is per frame or per pixel. The parity test asserts this
++    rather than trusting it.
+     """
+-    tokens_chunk = vae.tokens_chunk_size
+-    token_drop = vae.config.token_drop
+-    temporal_ratio = vae.temporal_compression_ratio
+-    chunk_num_frames = tokens_chunk * temporal_ratio
+-
+-    # _decode's padding and chunk count, unchanged.
+-    num_tokens = z.shape[2] + token_drop
+-    pad_tokens = (-num_tokens) % tokens_chunk
+-    num_chunks = (num_tokens + pad_tokens) // tokens_chunk - int(token_drop > 0)
+-    if pad_tokens > 0:
+-        z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
++    geo = _Geometry(vae, z.shape[2])
++    tokens_chunk = geo.tokens_chunk
++    token_drop = geo.token_drop
++    num_chunks = geo.num_chunks
++    chunk_num_frames = geo.chunk_num_frames
++    if geo.pad_tokens > 0:
++        z = torch.cat([z, z[:, :, -1:].repeat(1, 1, geo.pad_tokens, 1, 1)], dim=2)
+ 
+     world_size, rank = runtime.world_size, runtime.rank
+     # Chunk c -> rank c % world_size, slot c // world_size. Round-robin rather than
+@@ -87,9 +147,8 @@ def decode_video_parallel(vae, z: torch.Tensor, runtime) -> torch.Tensor:
+     # frames = 28 pixel frames. j=0 takes clip[0:20][3:] = 17 frames; j=1 takes
+     # clip[20:28][3:] = 5 = frame_overlap. 20 chunks x 17 + a trailing 5 = 345 frames, which
+     # is the requested clip length exactly.
+-    main_frames = chunk_num_frames - vae.frame_pre_padding
+-    overlap_frames = vae.frame_overlap
+-    piece_frames = main_frames + (overlap_frames if token_drop > 0 else 0)
++    main_frames = geo.main_frames
++    piece_frames = main_frames + geo.overlap_frames
+ 
+     height = z.shape[-2] * vae.spatial_compression_ratio
+     width = z.shape[-1] * vae.spatial_compression_ratio
+@@ -131,37 +190,73 @@ def decode_video_parallel(vae, z: torch.Tensor, runtime) -> torch.Tensor:
+         raise RuntimeError(f"rank {rank} decoded {local.dtype} but rank 0 decoded {dtype}; "
+                            f"the gather would silently reinterpret the bytes")
+ 
+-    gathered = torch.empty((world_size * chunks_per_rank, *local.shape[1:]),
+-                           device=local.device, dtype=local.dtype)
+-    dist.all_gather_into_tensor(gathered, local.contiguous())
++    # One all-gather PER SLOT, not one for the whole decode. The obvious version gathers
++    # every rank's every chunk into a single (world_size * chunks_per_rank) buffer, and at
++    # 768p that buffer is the largest allocation left on rank 0 once the streaming assembly
++    # has removed the full-canvas ones: 24 pieces x 3 x 22 x 768 x 1344 fp16 = 3.05 GiB, and
++    # it is what the DiT-resident run died on with 2.84 GiB free. Gathering slot by slot
++    # holds one eighth as many pieces at a time -- 0.38 GiB -- and costs nothing, because
++    # slot s across the ranks in rank order IS chunks s*world_size .. s*world_size+7, which
++    # is exactly the order the assembly consumes them in. So the gather is not merely split;
++    # it is pipelined with the blend, and chunk 0 can be converted while slot 1 is still on
++    # the wire.
++    slot = torch.empty((world_size, *local.shape[1:]), device=local.device, dtype=local.dtype)
++
++    def assembled():
++        """(frame_offset, chunk) in output order, gathering as it goes.
++
++        A generator, so the consumers below -- write-into-`dec`, and stream-to-sink -- share
++        one copy of the blend chain rather than two that could drift apart. EVERY rank has to
++        drive it to exhaustion even though only rank 0 gets any values out: the all-gather
++        inside is collective, and a rank that stops iterating early hangs the rest.
++        """
++        overlap = None
++        offset = 0
++        for s in range(chunks_per_rank):
++            # local[s] is a first-dimension slice, so it is already contiguous -- no copy.
++            dist.all_gather_into_tensor(slot, local[s])
++            if not runtime.is_main:
++                continue
++            for r in range(world_size):
++                c = s * world_size + r
++                if c >= num_chunks:
++                    break            # the last slot is partial; those ranks sent zeros
++                piece = slot[r].unsqueeze(0)
++                chunk = piece[:, :, :main_frames]
++                if overlap is not None:
++                    chunk = vae._blend(overlap, chunk, vae.frame_overlap, dim=-3)
++                yield offset, chunk
++                offset += chunk.shape[2]
++                if token_drop > 0:
++                    overlap = piece[:, :, main_frames:]
++            if overlap is not None:
++                # The carried overlap is a VIEW into `slot`, which the next iteration's
++                # all-gather overwrites. It is frame_overlap frames (31 MiB at 768p against
++                # the 2.67 GiB the single gather cost), so it gets copied out rather than
++                # buying a second slot buffer to alternate between.
++                overlap = overlap.clone()
++        if runtime.is_main and overlap is not None:
++            yield offset, overlap
+ 
+     if not runtime.is_main:
+-        return gathered
+-
+-    # _decode's assembly, over the gathered pieces instead of locally computed ones.
+-    decoded_chunks = []
+-    overlap = None
+-    for c in range(num_chunks):
+-        piece = gathered[(c % world_size) * chunks_per_rank + c // world_size].unsqueeze(0)
+-        chunk = piece[:, :, :main_frames]
+-        if overlap is not None:
+-            chunk = vae._blend(overlap, chunk, vae.frame_overlap, dim=-3)
+-        decoded_chunks.append(chunk)
+-        if token_drop > 0:
+-            overlap = piece[:, :, main_frames:]
+-    if overlap is not None:
+-        decoded_chunks.append(overlap)
+-
+-    dec = torch.cat(decoded_chunks, dim=2)
++        for _ in assembled():
++            raise AssertionError("only the main rank assembles")
++        return None
++
++    if sink is not None:
++        for offset, chunk in assembled():
++            sink(offset, chunk)
++        return geo.valid_frames
+ 
++    # Written into a preallocated buffer rather than collected and `torch.cat`ed. Same
++    # values -- cat would copy these same chunks into a destination this same size -- but the
++    # chunks do not have to outlive their slot, so this path also stops needing the whole
++    # gather at once.
++    dec = torch.empty((1, local.shape[1], geo.assembled_frames, height, width),
++                      device=local.device, dtype=local.dtype)
++    for offset, chunk in assembled():
++        dec[:, :, offset : offset + chunk.shape[2]] = chunk
+     # And _decode's trailing trim for the repeated latent frames.
+-    if pad_tokens > 0:
+-        intra_tail = vae.config.clip_length % temporal_ratio
+-        num_tokens_before_pad = z.shape[2] - pad_tokens
+-        pad_frames = sum(
+-            intra_tail if intra_tail and (num_tokens_before_pad + k) % tokens_chunk == 0
+-            else temporal_ratio
+-            for k in range(pad_tokens)
+-        )
+-        dec = dec[:, :, :-pad_frames]
++    if geo.pad_frames:
++        dec = dec[:, :, :-geo.pad_frames]
+     return dec

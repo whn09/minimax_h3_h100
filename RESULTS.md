@@ -10,43 +10,55 @@ by the run itself; `scripts/summarize.py` regenerates the tables from those reco
 
 **480P, 8 NFE, 8x H100, branch-parallel Ulysses at 3 softmax + 5 linear ranks, video VAE
 data-parallel over all eight ranks.** Both reachable lengths near 15 s, since they cost
-almost the same:
+almost the same, and every per-request figure is a ten-request measurement:
 
 | | 345 f / 14.375 s | 362 f / 15.083 s |
 |---|---|---|
-| denoise, 8 NFE | **8.55** (1.069 s/NFE) | **9.02** (1.128 s/NFE) |
-| video VAE, 8 ranks | 3.10 | 2.46 |
-| audio VAE + frames-to-host + mux | 1.55 | 1.61 |
-| decoder load (once per process, not per request) | 3.87 | 4.47 |
-| **post-warmup end-to-end** | **17.07** | **17.57** |
-| **steady state, decoders already resident** | **13.20** | **13.10** |
-| steady vs clip length | 1.09x realtime | **1.15x realtime** |
+| denoise, 8 NFE | **8.70** (1.088 s/NFE) | **9.02** (1.128 s/NFE) |
+| video VAE, 8 ranks | 1.57 | 1.56 |
+| audio VAE + frames-to-host + mux | 1.18 | 1.19 |
+| **steady state, per request** | **11.45 ± 0.040** | **11.78 ± 0.035** |
+| steady vs clip length | 1.26x realtime | **1.28x realtime** |
+| decoder load, once per process | 4.81 | 4.60 |
+| post-warmup end-to-end, request 1 | 17.16 | 17.18 |
 
-(Arms `n_480p_seg4` and `n_480p_362f_seg4`. One caveat on how precisely to read these: the
-**video VAE stage is the noisy one**, 2.11–3.82 s across seven arms at matched canvas, split
-and decode path — median 2.97, σ 0.61. The denoise is stable to ±0.02 s/NFE and the tail to
-±0.06 s, so treat the steady-state figure as **13.2 ± 0.6 s**, with the uncertainty living
-entirely in the decode.)
+Every steady-state figure is the **mean over requests 2–10 of a ten-request process**
+(`render.repeat=10`, arms `s2_480p_rep10` and `s5_480p_362f_rep10`) — not a single render with
+the decoder load subtracted off, which is how the earlier and wrong **13.20 / 13.10** figures
+in this table were produced. Full distributions in "Ten requests in one process" below; the
+short version is sd 35–40 ms over nine requests at both lengths, so this is not a figure that
+needs an error bar wider than its own last digit.
 
 **15.000 s is not a reachable length** — `align_num_frames(n, 17, 5)` snaps to `5 + 17k`,
 so the grid near 15 s is 345 (14.375 s) then 362 (15.083 s), with nothing between. 362 is
-the literal answer to "15 seconds", and at 13.10 s steady it renders **1.15x faster than the
-clip plays**.
+the literal answer to "15 seconds", and at 11.78 s steady it renders **1.28x faster than the
+clip plays** — and it is also the cheaper of the two per finished second, $0.005158 against
+$0.005261, because the extra 17 frames cost 0.33 s and buy 0.71 s of clip.
 
-The two lengths cost the same for a reason worth stating: 362 frames is 21 temporal VAE
-chunks against 345's 20, and `ceil(21/8) = ceil(20/8) = 3`, so the parallel decode's
-critical path is three chunks either way. Parallel decode time is a function of
-`ceil(chunks/8)`, not of frame count — it is flat across a whole band of clip lengths and
-steps only when the chunk count crosses a multiple of 8.
+The extra 17 frames cost **nothing in the decode**: 1.56 s against 1.57 s. That is the
+`ceil(chunks/8)` prediction landing to a millisecond — 362 frames is 21 temporal VAE chunks
+against 345's 20, and `ceil(21/8) = ceil(20/8) = 3`, so the parallel decode's critical path is
+three chunks either way. Parallel decode time is a function of `ceil(chunks/8)`, not of frame
+count; it is flat across a whole band of clip lengths and steps only when the chunk count
+crosses a multiple of 8. The whole 0.33 s difference between the two columns is denoise, where
+the cost really is proportional to tokens.
+
+One thing the repeat runs retire: the **video VAE stage used to look like the noisy one**,
+2.11–3.82 s across seven single-render arms at matched canvas (median 2.97, σ 0.61), and this
+table used to carry a ±0.6 s caveat because of it. Inside one warm process its sd is **1 ms**.
+The variance was never in the decode — it was between processes, and a per-request latency
+figure should never have been carrying it.
 
 Two framings of the same run, because they get quoted for different things:
 
-* **1.069 s/NFE** is the number comparable with upstream's published table (2.29 on
+* **1.088 s/NFE** is the number comparable with upstream's published table (2.29 on
   8x H200, 1.40 on 8x B200 — all at 768p, and all **denoise only**: their Results section
   excludes "model loading, warm-up, VAE decoding, and MP4 encoding", so their `18.3 s` is
-  just `2.29 x 8`).
-* **13.2 s steady-state end-to-end** is what a request costs on a warm server. Post-warmup
-  E2E including the one-time decoder load is 17.1 s.
+  just `2.29 x 8`). Nine warm requests put it at 1.088 ± 0.004, which agrees with the split
+  sweep's 1.090 and retires the 1.069 this file used to quote — that came from one process's
+  single render, and it was the fastest of the several that measured this arm.
+* **11.45 s steady-state end-to-end** is what a request costs on a warm server, measured over
+  nine consecutive requests. Post-warmup E2E including the one-time decoder load is 17.2 s.
 
 Two corrections to earlier versions of this file, both the same mistake — comparing two
 numbers measured at **different branch splits**:
@@ -68,28 +80,36 @@ All eight GPUs work on one clip, so cost per clip is just wall clock x the insta
 
 | | clip | steady state | $/clip | **$/finished video-second** | $ per video-hour |
 |---|---|---|---|---|---|
-| **480p, 345 f** | 14.375 s | 13.20 s | $0.0872 | **$0.006065** | $21.83 |
-| **480p, 362 f** | 15.083 s | 13.10 s | $0.0865 | **$0.005736** | $20.65 |
-| **768p, 345 f** | 14.375 s | 29.50 s | $0.1948 | **$0.013554** | $48.80 |
+| **480p, 345 f** | 14.375 s | 11.45 s | $0.0756 | **$0.005261** | $18.94 |
+| **480p, 362 f** | 15.083 s | 11.78 s | $0.0778 | **$0.005158** | $18.57 |
+| **768p, 345 f** | 14.375 s | 33.21 s | $0.2193 | **$0.015259** | $54.93 |
 
-Per 1000 clips: **$87** at 480p, **$195** at 768p. Using post-warmup E2E instead of steady
+Per 1000 clips: **$76** at 480p, **$219** at 768p. Using post-warmup E2E instead of steady
 state — i.e. charging every request for the one-time decoder load, which is only honest for a
-cold process serving a single clip — 480p is $0.007843/s ($113 per 1000) and 768p is
-$0.014850/s ($213 per 1000).
+cold process serving a single clip — 480p is $0.007883/s ($113 per 1000) and 768p is
+$0.015296/s ($220 per 1000; at 768p the two are nearly equal, because the decoder load has
+stopped being a one-time cost and is now inside every request).
+
+Every steady-state figure here is a ten-request measurement, which moved all three rows:
+480p got 13 % cheaper (the old figures charged a warm request for a cold request's decode) and
+768p got 13 % dearer (the old figure was from a process that could not have served a second
+request at all). Directionally opposite errors from the same methodological cause.
 
 Three things this table is and is not:
 
-* **480p renders for less than the instance costs to run.** At 1.09x realtime the finished
-  second costs 0.92x an instance-second; the 362-frame arm at 1.15x realtime costs 0.87x.
-  768p costs 2.05x an instance-second, and the whole 2.2x gap to 480p is the row count.
+* **480p renders for less than the instance costs to run.** At 1.26x realtime the finished
+  second costs 0.80x an instance-second; the 362-frame arm at 1.28x realtime costs 0.78x.
+  768p costs 2.31x an instance-second. Of the 2.9x gap to 480p, 2.4x is the row count in the
+  denoise and the rest is 768p's per-request decoder cycling.
 * **The one-time build is not in here.** 138 s in a single process, 217–232 s in the 8-rank
   job (`setup`), = $0.91–$1.53 of instance time per process lifetime. Over a few hundred
   requests it rounds away; over three it doubles the bill. It is an argument for long-lived
   workers, and against any per-request DiT reload — a 768p server that freed and restored the
-  weights each request would run 34.4–36.8 s and pay **$0.0158–0.0169 / video-second, +17 to
-  +25 %**.
+  weights each request would add ~5 s to the 33.21 and pay **$0.0175 / video-second, +15 %**,
+  which is precisely why `vae_after_decode: free` cycles the 9.70 GiB decoders instead of the
+  45.24 GiB of weights.
 * **This is a latency-optimised price, and it is roughly 2x the cheapest way to buy these
-  seconds.** 8 GPUs give a 4.03x denoise speedup over 1 GPU (4.39 -> 1.069 s/NFE at 480p), so
+  seconds.** 8 GPUs give a 4.03x denoise speedup over 1 GPU (4.39 -> 1.088 s/NFE at 480p), so
   eight independent single-GPU renders would produce about **1.98x** the clips per hour on the
   same instance — call it ~$0.003 / video-second — at 3-4x the per-clip latency. A single card
   holds the DiT and the decoders together at 480p (45.2 + ~11 GiB of 80), so that
@@ -225,10 +245,17 @@ arm `n_768p_seg4`, same nine patches and same parallel decode as the 480p headli
 | video VAE, 8 ranks | 4.47 | 4.78 | 3.10 |
 | audio VAE + frames-to-host + mux | 2.47 | 2.21 | 1.55 |
 | **post-warmup end-to-end** | **32.32** | 56.29 | **17.07** |
-| **steady state** | **29.50** | 53.10 | **13.20** |
+| E2E minus the decoder load | 29.50 | 53.10 | 13.20 |
 | vs clip length | 2.05x slower than realtime | 3.69x slower | 1.09x faster |
 
 (Arms `p_768p_free` and `n_768p_seg4`. Both outputs `clipinfo.py`-clean.)
+
+The second-to-last row used to be labelled "steady state", and that was the wrong name for a
+subtraction: **neither of these configurations has a steady state**, because both throw the
+weights away and a second request would rebuild them for 217–232 s. The measured steady states
+are 11.45 s at 480p and 33.21 s at 768p, both from ten-request processes — see the last section
+of this file. The subtraction is kept here only because it is what makes the patch-10 vs
+patch-3 comparison in this table like-for-like.
 
 768p used to be **4.0x** the 480p request against a 2.41x row ratio, and almost all of the
 excess was one line: `model.transformer.to("cpu")`, 45.2 GiB back to the host at 1.7 GB/s.
@@ -288,37 +315,256 @@ result: run **without** `parallel_vae_decode`, rank 0 falls back to the serial d
 `_decode`, and the OOM moves to `autoencoder_kl_minimax_h3.py:830` asking for **1.99 GiB with
 1.73 GiB free**. 1.99 GiB is exactly `345 x 1344 x 768 x 3 ch x 2 B` — the whole clip in fp16
 RGB — so the serial path is short by ~260 MiB rather than 102, and both paths die building
-the same full-canvas tensor. Where those GiB go, from the tensor shapes at 768p (6.19 MB per
-frame at 3 channels fp16):
+the same full-canvas tensor. Where those GiB go, from the tensor shapes at 768p (3.10 MB per
+frame at 3 channels fp16, 1344x768):
 
-* `gathered`, the all-gather destination — 24 slots of ~34 frames each, since every slot
-  carries its chunk's decode overlap: **~5 GiB**.
-* `dec`, the concatenated clip that `_blend` builds on top of it: **2.1 GiB**.
+* `gathered`, the all-gather destination — 24 slots × 22 frames, since every slot carries its
+  chunk's 17 main frames plus its 5-frame decode overlap: **3.045 GiB**.
+* `dec`, the concatenated clip: 345 × 1344 × 768 × 3 × 2 B = **1.99 GiB**.
+* the fp32 pixel denormalisation downstream of it, at 12 bytes per pixel: **3.98 GiB**.
 
-So rank 0 holds the whole clip roughly twice, in fp16 RGB at 6 bytes per pixel, while
-patch 7 already knows how to represent a finished frame in **1.5** bytes per pixel.
+So rank 0 holds the whole clip three times over, at 6, 6 and 12 bytes per pixel, while
+patch 7 already knows how to represent a finished frame in **1.5**.
 
-**So yes, the DiT can stay resident at 768p — but it needs a patch, not a knob.** Two
-candidates, both measured against the same 102 MiB deficit:
+### It does stay resident, and it took two changes rather than one
 
-1. **Never materialise `dec`.** The assembly loop already yields one blended chunk at a time,
-   and `torch.cat` exists only to hand `decode_and_save` a single tensor. Converting each
-   chunk to YUV as it comes out of the loop and writing it into a preallocated plane set
-   removes the 1.99 GiB entirely — **20x the margin needed** — without touching the
-   all-gather, the NCCL traffic, or `_blend`'s arithmetic, which keeps running in fp16 RGB per
-   chunk pair exactly as it does now. The awkward part is the trailing `pad_frames` trim,
-   which has to be computed up front so the output can be sized before the loop rather than
-   after it.
-2. **YUV before the all-gather.** Cuts `gathered` *and* `dec` 4x — ~5.4 GiB back and 4x less
-   NCCL traffic — but this is the harder one: `_blend` ramps across chunk boundaries in float
-   and consecutive chunks live on different ranks by the round-robin, so the overlap frames
-   would have to stay float while the interior went to uint8.
+Both were written and measured (patch 11); the first alone was **not** enough, which is worth
+recording because the estimate said it would be.
 
-(1) is strictly smaller and already sufficient, so it is the one to write; (2) only becomes
-worth it if the all-gather's 5 GiB or its NCCL time start mattering on their own. Either way
-768p then runs `keep`, the release stage disappears, and the request goes 29.50 → **~26.7 s**
-steady with no reload cost on any request — which is the number an API wants, per the reload
-section above. At 480p there is nothing to fix, because there is nothing to evict.
+1. **Never materialise `dec` or the fp32 clip.** The assembly already yields one blended chunk
+   at a time and `torch.cat` existed only to hand `decode_and_save` a single tensor. Each
+   chunk now becomes its final yuv420p planes as it leaves the loop, written into a
+   preallocated plane set at 1.5 bytes per pixel — `parallel.stream_yuv_assembly`. This
+   removes 1.99 + 3.98 GiB, which is 60x the 102 MiB deficit, so on the arithmetic it should
+   have been the end of it. It was not: free memory went from 69.88 MiB to **2.84 GiB** and
+   the run died anyway, because with the full-canvas buffers gone the largest single
+   allocation left is `gathered` and it wants a contiguous **3.05 GiB**.
+
+2. **Gather one round of chunks at a time.** Chunk *c* lives on rank *c* mod 8 in slot
+   *c* div 8, so slot *s* across the ranks in rank order *is* chunks 8*s* … 8*s*+7 — exactly
+   the order the assembly consumes them in. So the all-gather does not have to be one
+   collective over the whole decode: it can be one per slot, three at 345 frames, each holding
+   8 pieces instead of 24. Peak falls 3.045 → **0.38 GiB**, the gather pipelines with the
+   blend, and the only new cost is cloning the 5-frame carried overlap at each slot boundary
+   (31 MiB) because it is a view into a buffer the next gather overwrites.
+
+The candidate this file previously ranked second — convert to YUV *before* the all-gather —
+was **not** built, and (2) is the better trade anyway: it returns more (3.045 vs ~2.29 GiB)
+and it stays exactly bit-identical, whereas converting before the blend cannot be, since
+`_blend` cross-fades in float and a linear ramp over quantised uint8 chroma is not the
+quantisation of the ramp.
+
+Measured, arm `r2_768p_keep_yuv`, matched against `p_768p_free` (`softmax_ranks: 5`, 8-way
+parallel decode, 345 f, fp8, t2va):
+
+| stage | `free` | `keep` + streaming YUV + per-slot gather |
+|---|---:|---:|
+| denoise, 8 NFE | 19.77 (2.472 s/NFE) | **19.75 (2.469)** |
+| DiT release | 2.81 | **0.00** |
+| video VAE, 8 ranks | 4.47 | 4.71 |
+| audio VAE + frames-to-host + mux | 2.47 | 2.33 |
+| E2E minus the decoder load | 29.52 | **26.79** |
+| decoder load (once per process) | 2.81 | 5.45 |
+| post-warmup E2E | 32.33 | 32.24 |
+
+By that subtraction the change is worth 2.71 s (−9.2 %), and post-warmup E2E does not move —
+the 2.81 s saved on the release is spent on a decoder load that is 2.64 s slower, plausibly
+because the decoders now allocate against a card that already holds 45.2 GiB of weights.
+**Neither 26.79 nor 29.52 is a steady state**, which is what the next section is about; the
+real figure with the DiT resident is 33.21 s, and the subtraction is off by 24 %.
+
+Rank 0's budget with the weights resident, from the new instrumentation:
+
+| rank 0 at 768p, `keep`, streaming | GiB |
+|---|---:|
+| reserved before the decode (unchanged across it) | 62.1 |
+| decode peak, allocated | 63.8 |
+| decode peak, reserved | 64.5 |
+| non-PyTorch floor, from the OOM arm above | ~13.6 |
+| **implied headroom** | **~1.1** |
+
+**And that is where a single render stops being able to tell you anything, because the run
+above does not survive a second request.** See the next section: this table is a one-shot
+result and was published as a steady-state one for about an hour.
+
+At 480p there was never anything to evict, and the point of running it through the changed
+code was only to show the primary result did not regress. Arm `r2_480p_yuv`: denoise 8.68 s
+(1.085 s/NFE), video VAE 2.50 s, audio+host+mux 1.69 s — unchanged within the between-process
+spread, so the 480p configs are left as they were.
+
+## Ten requests in one process, which is the only test that means anything
+
+Everything above measures **one** render per process and calls the leftover "steady state" by
+subtracting the decoder load from it. That subtraction is wrong in two directions at once, and
+`render.repeat` — serve N complete requests from one warm process, report the distribution —
+shows both. Re-running the *process* N times would not have: it re-measures the 220 s build
+every time and never lets two requests share a resident model, which is the entire question.
+
+**480p, 345 f, 10 requests** (arm `s2_480p_rep10`, published config, DiT and decoders `keep`):
+
+```
+ req   denoise    vae x8   dec+enc   dload    total  alloc_end  resv_end
+   1      8.67      2.12      1.56    4.81    17.16       58.0      62.9
+   2      8.74      1.55      1.18    0.00    11.47       58.0      62.9
+   3      8.66      1.56      1.19    0.00    11.41       58.0      62.9
+   4      8.66      1.67      1.16    0.00    11.49       58.0      63.1
+   5      8.70      1.55      1.17    0.00    11.43       58.0      63.1
+   6      8.73      1.55      1.18    0.00    11.47       58.0      63.1
+   7      8.69      1.55      1.15    0.00    11.40       58.0      63.1
+   8      8.67      1.55      1.17    0.00    11.40       58.0      63.1
+   9      8.68      1.56      1.20    0.00    11.44       58.0      63.1
+  10      8.73      1.55      1.22    0.00    11.51       58.0      63.1
+```
+
+| 480p steady, requests 2–10 | mean | sd | min | max |
+|---|---:|---:|---:|---:|
+| **request total** | **11.45** | **0.040** | 11.40 | 11.51 |
+| denoise, 8 NFE | 8.70 | 0.032 | 8.66 | 8.74 |
+| video VAE ×8 | 1.57 | 0.039 | 1.55 | 1.67 |
+| decode+encode | 1.18 | 0.019 | 1.15 | 1.22 |
+
+**The real 480p steady state is 11.45 s, not the 13.20 s this file reported**, and the
+correction is not noise — it is 1.75 s, and it is systematic. A process's *first* request is
+slower than its later ones in stages that have nothing to do with the decoder load: the video
+VAE runs 2.12 s then 1.55 s forever after, and the tail 1.56 s then 1.18 s. Allocator arena,
+x264's thread pool, cuBLAS and cuDNN workspace selection — all first-request costs, all
+invisible to a method that renders once and subtracts.
+
+The other correction goes the other way and is the more embarrassing one: this file quoted
+**13.2 ± 0.6 s**, with the ±0.6 attributed to the video VAE's 2.11–3.82 s spread "across seven
+arms". Nine consecutive requests in one process put that stage at **1.57 ± 0.039**. The 0.6 was
+never run-to-run variance in a warm process; it was variance *between processes*, i.e. mostly
+first-request effects plus config differences. Steady state is an order of magnitude tighter
+than advertised: **sd 40 ms on an 11.45 s request.**
+
+Memory is flat, which is the leak check `repeat` exists for: `allocated` is 58.0 GiB after
+every one of the ten requests, and `reserved` settles at 63.1 by request 4 and does not move
+again (+0.254 GiB total, all of it arena growth in requests 3–4).
+
+**480p, 362 f, 10 requests** (arm `s5_480p_362f_rep10`) — the same, at the literal-15-second
+length:
+
+```
+ req   denoise    vae x8   dec+enc   dload    total  alloc_end  resv_end
+   1      9.02      2.00      1.56    4.60    17.18       58.1      62.9
+   2      9.05      1.56      1.17    0.00    11.78       58.1      63.0
+   3      9.01      1.56      1.18    0.00    11.76       58.1      63.2
+   4      9.00      1.56      1.24    0.00    11.81       58.1      63.2
+   5      9.01      1.56      1.16    0.00    11.73       58.1      63.2
+   6      9.04      1.56      1.19    0.00    11.80       58.1      63.2
+   7      8.99      1.56      1.18    0.00    11.73       58.1      63.2
+   8      9.04      1.56      1.21    0.00    11.82       58.1      63.2
+   9      9.00      1.57      1.17    0.00    11.75       58.1      63.2
+  10      9.04      1.56      1.21    0.00    11.81       58.1      63.2
+```
+
+| 480p / 362 f steady, requests 2–10 | mean | sd | min | max |
+|---|---:|---:|---:|---:|
+| **request total** | **11.78** | **0.035** | 11.73 | 11.82 |
+| denoise, 8 NFE | 9.02 | 0.022 | 8.99 | 9.05 |
+| video VAE ×8 | 1.56 | **0.001** | 1.56 | 1.57 |
+| decode+encode | 1.19 | 0.027 | 1.16 | 1.24 |
+
+Reserved: +0.234 GiB over ten requests, settled by request 3. Two things fall out of putting
+this next to the 345 f table:
+
+* **the parallel decode's sd is 1 ms.** Not 0.6 s, not 39 ms — one millisecond, over nine
+  requests, and the *same* 1.56 s at both clip lengths. This is the strongest confirmation of
+  the `ceil(chunks/8)` model in the file: 21 chunks and 20 chunks both take three rounds, and
+  three rounds take 1.56 s whichever they are. The stage that used to look like the noisiest
+  part of the request is the most deterministic thing in it.
+* **the subtraction had the two lengths in the wrong order.** It said 362 f was *faster* than
+  345 f (13.10 vs 13.20); measured, it is 0.33 s slower, which is +3.7 % on a +4.9 % row count
+  and lands where the denoise scaling says it should. The old ordering was an artifact of two
+  different processes' first-request decode noise, and it inverted a real effect.
+
+### 768p: residency survived one request and died on the second
+
+Same test at 768p, `keep` + streaming YUV + per-slot gather — the configuration the section
+above declared repeatable. Request 1 completed normally (denoise 19.75 s). **Request 2 died in
+the denoise**, on ranks 5, 6 and 7:
+
+```
+--- request 2/10
+[rank7]: OutOfMemoryError: Tried to allocate 444.00 MiB ... 439.88 MiB free, 64.74 GiB allocated
+[rank5]: OutOfMemoryError: Tried to allocate 468.00 MiB ... 119.88 MiB free, 65.06 GiB allocated
+  one_request -> sample -> generate_latents -> linear_attention/branch.py:313
+```
+
+Ranks 5–7 are exactly the three **linear-branch** ranks at `softmax_ranks: 5`. And the cause is
+the ordering that made the one-shot run work: **the decoders are loaded after the first
+denoise, so that denoise is the only one that never coexists with them.** Every subsequent
+request denoises with the video VAE already resident on all eight ranks. Measured directly:
+
+| resident per rank at 768p | GiB |
+|---|---:|
+| DiT (fp8) | 45.24 |
+| video VAE — **every** rank, because the decode is data-parallel | **9.70** |
+| audio VAE — rank 0 only | 0.56 |
+| non-PyTorch floor | ~13.6 |
+| subtotal, DiT + video VAE + floor | **68.5** |
+| left for the denoise | 10.6 |
+| what the denoise actually needs | **~16.9** |
+
+Short by ~6 GiB. Not a margin that a smaller buffer somewhere recovers — at 768p one of the
+two big residents has to leave on every request, and the choice is settled by size:
+
+| cycle this every request | data moved per rank | restore from a pinned host copy |
+|---|---:|---:|
+| **video VAE** | **9.70 GiB** | ~0.96 s at the measured 10.08 GiB/s |
+| DiT | 45.24 GiB | 4.49 s (measured) |
+
+So the answer to "can the DiT stay resident at 768p" is **yes, but only if the decoders do
+not** — and that is the good trade, because cycling the decoders moves 4.7x less data than
+cycling the weights. `parallel.vae_after_decode: free` implements it: the decoders are dropped
+after the frames are out and reloaded before the next decode, which the existing
+`model.vae is None` guard already knew how to do. Measured, arm `s4_768p_rep10`:
+
+```
+ req   denoise    vae x8   dec+enc   dload    total  alloc_end  resv_end
+   1     19.76      3.65      2.54    5.09    33.29       57.2      64.5
+   2     21.55      3.23      1.63    6.21    34.38       56.4      63.6
+   3     20.94      3.82      1.74    5.36    33.71       56.4      63.6
+   4     20.74      3.26      1.65    5.40    32.22       56.4      63.6
+   5     21.56      4.10      1.67    4.63    34.03       56.4      63.6
+   6     20.63      3.65      1.68    5.22    32.36       56.4      63.6
+   7     21.64      3.40      1.65    5.19    34.07       56.4      63.6
+   8     20.52      3.69      1.76    4.72    33.02       56.4      63.6
+   9     20.45      4.07      1.67    4.49    32.76       56.4      63.6
+  10     20.69      4.04      1.65    4.19    32.30       56.4      63.6
+```
+
+| 768p steady, requests 2–10 | mean | sd | min | max |
+|---|---:|---:|---:|---:|
+| **request total** | **33.21** | **0.850** | 32.22 | 34.38 |
+| denoise, 8 NFE | 20.97 | 0.483 | 20.45 | 21.64 |
+| video VAE ×8 | 3.70 | 0.343 | 3.23 | 4.10 |
+| decode+encode | 1.68 | 0.043 | 1.63 | 1.76 |
+| decoder load (now **per request**) | 5.05 | 0.607 | 4.19 | 6.21 |
+| decoder release | 1.82 | 0.415 | 1.17 | 2.34 |
+
+Ten requests, `reserved` identical after request 2 and request 10 to **+0.000 GiB**. So 768p is
+now repeatable — and it costs **33.21 s**, not the 26.79 s the one-shot run implied and not the
+29.50 s before that. Both earlier figures were arithmetic on a process that only ever served
+one request.
+
+Two things this table says that are worth not glossing over:
+
+* **6.87 s of the 33.21 is pure cycling overhead** — 5.05 s reloading the decoders from disk
+  plus 1.82 s releasing them. Both are attackable and neither is fundamental: a pinned host
+  copy of the 9.70 GiB video VAE restores at the measured 10.08 GiB/s in **~0.96 s**, and the
+  release is mostly `empty_cache()` over a large arena. That is the next patch, and it puts
+  768p at roughly **28 s** on arithmetic that is now grounded in measurements rather than
+  guesses. It is not built here.
+* **the denoise itself is 1.2 s slower in steady state** — 19.76 s on request 1, 20.97 ± 0.48
+  after. Two candidate causes and this run cannot separate them: the cycling churns 9.70 GiB
+  through the allocator every request and `empty_cache()` hands cached blocks back to the
+  driver that the next denoise has to re-acquire; or eight H100s at 768p for five minutes are
+  power/thermally limited in a way a single render never sees. 480p's denoise moves only
+  +0.03 s over ten requests, but 480p never cycles anything, so it is a control for the first
+  hypothesis and not for the second.
+
+The 480p configs stay on `keep` at both ends — 10 requests, no growth, nothing to cycle.
 
 Worth stating explicitly, since it is the obvious alternative: **tensor parallelism would
 also solve this, and it is the expensive way to.** TP=2 x Ulysses=4 halves the resident
@@ -375,19 +621,26 @@ mechanism as everything else in this file — a pinned copy DMAs, a pageable one
 through a bounce buffer — so the rule is: if you keep a host copy, pin it.
 
 **Even the good path is not cheap enough to want.** Release plus pinned restore is ~5 s
-(~7 s using the in-render 2.81 s release), added to a 29.50 s steady-state 768p request, for
-+17–24 %. And it wants 45.24 GiB of *page-locked* host memory per rank — **362 GiB across 8
+(~7 s using the in-render 2.81 s release), added to a 33.21 s steady-state 768p request, for
++15–21 %. And it wants 45.24 GiB of *page-locked* host memory per rank — **362 GiB across 8
 ranks**, which fits the box's 2 TiB but is locked away from the page cache and from the
 frames-to-host staging in patch 7. All of that to free the 102 MiB the OOM was short of.
 
 **So for a server the answer is not to cycle the weights at all.** At 480p — the primary
 target — this whole question is void: `keep` is the default, nothing is evicted, and the
-17.07 s / 13.20 s figures already are the API's numbers. At 768p the fix is the decode's
-peak, not the DiT: the YUV-before-all-gather patch sketched above returns ~5.4 GiB on rank 0,
-which is 50x the margin needed, and then 768p also runs `keep` and drops to ~26.7 s with no
-reload cost on any request. Cycling 45.24 GiB twice per request to recover 102 MiB is the
-wrong shape of fix; it is only in the tree because it was the cheapest thing that made a
-one-shot 768p render finish.
+17.16 s / 11.45 s figures already are the API's numbers, measured over ten requests. At 768p
+the fix is the decode's peak, not the DiT, and patches 11 and 12 are that fix: streaming the
+assembly and gathering per slot let `keep` hold at 64.5 GiB reserved, and what cycles instead
+is the **9.70 GiB video VAE**, 4.7x less data than the weights. Cycling 45.24 GiB twice per
+request is the wrong shape of fix; it is only in the tree because it was the cheapest thing
+that made a one-shot 768p render finish.
+
+The correction the repeat runs forced on the paragraph above: it used to end "and then 768p
+also runs `keep` and drops to ~26.7 s with no reload cost on any request", and the second half
+of that was wrong. `keep` on *both* sides survives exactly one request. Something has to cycle
+at 768p — the arithmetic is 45.24 + 9.70 + 13.6 = 68.5 GiB resident against a denoise that
+wants ~16.9 GiB of activations in the 10.6 that are left — and the only real choice is which
+side. 768p steady is 33.21 s, not 26.7.
 
 `scripts/reload_bench.py` takes no arguments beyond the config and prints the JSON above, so
 the numbers can be re-derived on other hardware — the pinned restore rate is a PCIe property
@@ -592,8 +845,8 @@ putting it in the request path would cost. On this box, 1300-token prompt:
 
 Three things fall out of that:
 
-1. **The forward is free. Everything else is memory movement.** 135 ms against a 13.2 s
-   render is 1 %. VDN reads `hidden_states[50]`, which HF fills with the *input* to layer 50,
+1. **The forward is free. Everything else is memory movement.** 135 ms against an 11.45 s
+   render is 1.2 %. VDN reads `hidden_states[50]`, which HF fills with the *input* to layer 50,
    so layers 52–64 — 13 of 64 — and the 5120×151936 LM head never contribute; dropping them
    is 13.3 GiB off what has to be resident, for free.
 2. **Per-request host offload is not an option, and it is the *unload* that kills it.** The

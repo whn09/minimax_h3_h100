@@ -1,7 +1,7 @@
 From 0e2c7b76342db728b1ad11d276f28a4b5d45883f Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 16:23:09 +0800
-Subject: [PATCH 10/10] vdn: free the DiT before the decode instead of copying
+Subject: [PATCH 10/12] vdn: free the DiT before the decode instead of copying
  it to the host
 
 At 768p on an 80 GiB card the DiT and a full-length decode do not fit, so patch

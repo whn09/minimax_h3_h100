@@ -32,7 +32,7 @@ The model is **`ckpts/stage-dmd-step-250`** = VDN-H3-8-step, the Stage-DMD disti
 
 ## What had to change for this box
 
-Ten patches, in `patches/`. All are needed; none is upstream. They fall into four groups.
+Twelve patches, in `patches/`. All are needed; none is upstream. They fall into five groups.
 Patches 1 and 6 are about the **workload** — 480P does not exist upstream, in the renderer
 or in the keyframe encoder. Patches 2 and 3 are the same underlying fact showing up at two
 different moments: **80 GiB is not 141 GiB**, and Ulysses replicates the whole DiT on every
@@ -40,7 +40,7 @@ rank. Patches 4, 5, 7 and 9 are about the **other half of the latency** — once
 fast the decode is the bigger number, and each one attacks whatever the previous one left
 largest: measure the stages, then the video VAE on one rank, then the colour conversion in
 swscale, then libx264 itself. Patch 8 is a **test**, and it is here rather than folded into
-patch 5 because finding out *why* the obvious test could not work is most of what it says.
+patch 5 because finding out *why* the obvious test could not work is most of what it says. Patches 11 and 12 are about **the request after this one** — a one-shot render cannot tell you what a server costs, and when we finally measured ten requests in one process it corrected the published 480p figure by 1.75 s and falsified the 768p one outright.
 
 | # | patch | why |
 |---|---|---|
@@ -54,7 +54,9 @@ patch 5 because finding out *why* the obvious test could not work is most of wha
 | 7 | `0007-vdn-convert-RGB-to-YUV420p-on-the-GPU-instead-of-in-.patch` | **the mux became the biggest single item.** Once patch 5 took the video VAE to 2.15 s, the 2.70 s mp4 mux was the largest thing left in a 480p render, and it is entirely host-side. Two things in it are avoidable: swscale's `rgb24→yuv420p` conversion, and the fact that PyAV leaves `thread_count` at 1. The pixels are already on the card as float32 in [0,1] and the conversion is a 3×3 matrix plus a 2×2 average, so it happens there; that also halves the host copy, yuv420p being 1.5 bytes/px against rgb24's 3 — measured 0.42 → 0.27 s. Matched-config, the mux goes 2.70 → 1.85 s at 480p and 4.32 → 2.39 s at 768p. **Of that 0.85 s, ~0.40 is the thread setting and ~0.45 the conversion** — an earlier version of this table said the conversion alone was 2.03 s, which came from timing `frame.reformat()` per frame in a loop (a fresh frame allocated each call); the real remainder, 1.85 s, is libx264, which is patch 9's problem. It re-implements a lossy conversion, so it sits behind `render.gpu_color_convert` and is verified numerically rather than assumed — `mux_bench.py --verify` reports Y within 1 level (71.42 dB) and chroma at 57.40/58.79 dB against swscale's own output on real render frames |
 | 8 | `0008-vdn-test-the-parallel-VAE-decode-against-the-serial-.patch` | **the correctness test for patch 5 was measuring the wrong thing.** The grid rendered a prompt twice, serial and parallel, and `cmp`'d the mp4s; it reported `MISMATCH`. But this pipeline does not reproduce run to run — two renders at the same seed and config sit ~17 dB apart with no bit-identical frame — so that diff compares two denoise trajectories and fails whatever the decoder does. The patch tests the decode where it lives: one process, one latent tensor, both paths back to back |
 | 9 | `0009-vdn-encode-the-mp4-in-parallel-segments-instead-of-o.patch` | **libx264 does not parallelise itself here.** With the conversion gone the mux *is* x264, and x264's own frame threading buys 1.12× on this canvas — 345 frames of 864×480 go 251 fps at `thread_count=0` against 224 at 1, on a box with 192 vCPUs — because the serial part is the per-frame Python plane writes, which hold the GIL. So the clip is split into `render.encode_segments` contiguous ranges, encoded concurrently in threads, and the bitstreams concatenated by copy: each segment opens with an IDR and references nothing outside itself, and mp4 carries one SPS/PPS in `avcC`, which is asserted identical rather than assumed. **4 segments is 3.2× (1.37 → 0.43 s) for +2.5 % bits and −0.38 dB.** Not free, but a better trade than the alternative of a faster preset, which is 1.9× for −2.8 dB *and* fewer bits. `scripts/clipinfo.py` is the structural check — every frame decoded, timestamps a clean run, audio present — because a PSNR against another render cannot see a concatenation bug through the run-to-run divergence |
-| 10 | `0010-vdn-free-the-DiT-before-the-decode-instead-of-copyin.patch` | **the 768p eviction cost 26.33 s and bought nothing.** Patch 3 evicts the DiT before the decode because the two do not fit on an 80 GiB card — measured, `keep` OOMs 102 MiB short in the assembly. But it evicted by *copying to the host*, and `.to("cpu")` is thousands of separate pageable allocations at ~1.7 GB/s. Both modes free the same GPU memory, and nothing downstream of the denoise reads the weights, so the copy is pure cost. `parallel.offload_transformer_before_decode` (bool) becomes `parallel.transformer_before_decode` = `keep | free | offload`; `free` uses `to_empty(device="meta")` rather than `del`, since the sampler closure and the Ulysses hooks still hold references and dropping the attribute would free nothing. **2.81 s against 26.33 s**, taking the 768p request 56.29 → 32.32 s post-warmup and 53.10 → 29.50 s steady, 1.80x, denoise unchanged |
+| 10 | `0010-vdn-free-the-DiT-before-the-decode-instead-of-copyin.patch` | **the 768p eviction cost 26.33 s and bought nothing.** Patch 3 evicts the DiT before the decode because the two do not fit on an 80 GiB card — measured, `keep` OOMs 102 MiB short in the assembly. But it evicted by *copying to the host*, and `.to("cpu")` is thousands of separate pageable allocations at ~1.7 GB/s. Both modes free the same GPU memory, and nothing downstream of the denoise reads the weights, so the copy is pure cost. `parallel.offload_transformer_before_decode` (bool) becomes `parallel.transformer_before_decode` = `keep | free | offload`; `free` uses `to_empty(device="meta")` rather than `del`, since the sampler closure and the Ulysses hooks still hold references and dropping the attribute would free nothing. **2.81 s against 26.33 s**, taking the 768p request 56.29 → 32.32 s post-warmup and 53.10 → 29.50 s by E2E-minus-decoder-load, 1.80x, denoise unchanged |
+| 11 | `0011-vdn-keep-the-DiT-resident-at-768p-by-never-building-.patch` | **the eviction was never the fix; rank 0's decode peak was.** Patch 3 evicts the DiT at 768p because `keep` OOMs by 102 MiB, and patch 10 only made the eviction cheap. Two allocations account for the peak and neither is necessary: the assembly's full-canvas fp16 RGB output (1.99 GiB at 345 f of 1344x768) plus its fp32 denormalisation (3.98 GiB), when the destination format is yuv420p at 1.5 bytes per pixel; and the all-gather destination, 24 pieces x 3 x 22 x 768 x 1344 = 3.045 GiB gathered at once. `parallel.stream_yuv_assembly` turns each chunk into its final planes as it leaves the assembly, and the gather goes **one slot at a time** (0.38 GiB) — which costs nothing, because slot `s` across the ranks in rank order *is* chunks `8s..8s+7`, exactly the order the blend consumes them in, so the gather is pipelined rather than merely split. Both bit-identical, asserted by `scripts/decode_parity.py` at both canvases (0 differing of 1,068,318,720 at 768p). 768p decode peak → **64.5 GiB reserved**, and the DiT stays |
+| 12 | `0012-vdn-serve-N-requests-from-one-process-and-cycle-the-.patch` | **every latency figure here was one render with the decoder load subtracted off, and that is wrong in both directions.** `render.repeat=N` serves N complete requests from one warm process. It found that 480p steady state is **11.45 s ± 0.040, not 13.20** — a first request is slower in stages that have nothing to do with the decoder load (video VAE 2.12 → 1.55 s, tail 1.56 → 1.18 s) — and that patch 11's 768p residency **does not survive a second request**: the decoders load *after* the first denoise, so only later ones coexist with them, and request 2 dies 444–468 MiB short on the three linear-branch ranks. So one side has to cycle per request at 768p, and `parallel.vae_after_decode` picks the cheaper one: the video VAE is 9.70 GiB per rank against the DiT's 45.24, **4.7x less data**. Ten requests at 768p: 33.21 s ± 0.850, memory growth **+0.000 GiB** |
 
 The two OOM failures, for the record. Patch 2's, during assembly:
 
@@ -145,13 +147,26 @@ means the whole request with the decoders already resident.
 | decoder load, NVMe → GPU | 1 | 2.53 s | 3.65 s | 3.87 s |
 | video VAE | 1 → **8** | ~11.23 s | **2.97 s** | 3.10 s |
 | audio VAE + frames-to-host + mux | 1 | (in the 14.38 s) | 3.18 s | **1.55 s** |
-| **post-warmup E2E** | | **25.63 s** | 18.53 s | **17.07 s** |
-| **steady state** (decoders resident) | | **23.10 s** | 14.88 s | **13.20 s** |
+| **post-warmup E2E** (request 1 of the process) | | **25.63 s** | 18.53 s | **17.07 s** |
 
-Decoder load is once per **process**, not once per request, so the steady-state per-request
-figure excludes it. Everything else is per request. `RESULTS.md` carries the full tables and
-the 768p equivalent (**32.32 s** post-warmup, **29.50 s** steady); the point here is the
-shape, and it changed twice:
+Decoder load is once per **process**, not once per request, so a second request does not pay
+it. Everything else is per request. That makes "steady state" a different number, and the
+honest way to get it is to serve ten requests from one process (`render.repeat`, patch 12)
+rather than to subtract the load from a single render — subtraction was how the earlier
+**13.20 s** figure in this table came about, and it was 1.75 s too slow, because a first
+request is systematically slower than a warm one in the decode and the tail as well:
+
+| 480p, 345 f, requests 2–10 of one process | mean | sd | min | max |
+|---|---:|---:|---:|---:|
+| **request, end to end** | **11.45 s** | 0.040 | 11.40 | 11.51 |
+| denoise, 8 NFE | 8.70 | 0.032 | 8.66 | 8.74 |
+| video VAE, 8 ranks | 1.57 | 0.039 | 1.55 | 1.67 |
+| audio VAE + frames-to-host + mux | 1.18 | 0.019 | 1.15 | 1.22 |
+
+Ten requests, ±40 ms, and `reserved` grew 0.254 GiB in total over all ten and then stopped —
+so it repeats. `RESULTS.md` carries the full tables and the 768p equivalent (**33.21 s ± 0.85**
+steady, which also only became honest under `render.repeat`: the one-shot run implied 26.79 s
+and the second request OOMed). The point here is the shape, and it changed twice:
 
 **First, the decode was bigger than the denoise and none of it was parallel.** Eight cards
 spent 8.7 s working and then one card spent 14.4 s working while seven sat at a barrier.
@@ -168,12 +183,14 @@ request's denoise. It would make the *latency* asked for here worse, not better,
 finished clip then has to cross a network before it exists.
 
 At `p5.48xlarge` on a **3-year no-upfront Instance Savings Plan** — $23.77728/instance-hour,
-$0.00660480/instance-second — those latencies price out at **$0.006065 per finished video
-second at 480p** ($0.087/clip, $21.83 per hour of video) and **$0.013554 at 768p**
-($0.195/clip, $48.80/hour). 480p renders for *less* than the instance costs to run, 0.92x an
-instance-second per finished second. This is a latency-optimised price and roughly 2x the
-cheapest way to buy the same seconds — see RESULTS.md for the throughput alternative and for
-what a per-request DiT reload would add.
+$0.00660480/instance-second — those steady-state latencies price out at **$0.005261 per
+finished video second at 480p** ($0.0756/clip, $18.94 per hour of video) and **$0.015259 at
+768p** ($0.219/clip, $54.93/hour). 480p renders for *less* than the instance costs to run,
+0.80x an instance-second per finished second. This is a latency-optimised price and roughly
+2x the cheapest way to buy the same seconds — see RESULTS.md for the throughput alternative.
+(The 768p figure is 13 % worse than the $0.013554 published here earlier, and that is not a
+regression in the code: the earlier number came from a process that only ever served one
+request, and 768p needs 6.87 s per request of decoder cycling to serve a second one.)
 
 ### What that means for an API, since `free` keeps no copy
 
@@ -193,8 +210,20 @@ So `offload` is **strictly dominated**: 26.67 s to write a pageable copy plus 10
 it back is 37.2 s, against 0.41 + 4.49 = **4.9 s** for `free` plus a retained pinned copy. And
 even the good path is not worth wanting — ~5 s per request and 362 GiB of page-locked host
 memory across 8 ranks, to recover the **102 MiB** the 768p decode was short of. For a server
-the fix is rank 0's decode peak, not the DiT: 480p already runs `keep`, and the
-YUV-before-all-gather change would let 768p run `keep` too.
+the fix is rank 0's decode peak, not the DiT, and patches 11 and 12 are that fix: streaming
+the assembly into yuv420p planes and gathering the parallel decode one round of chunks at a
+time take the 768p peak to 64.5 GiB reserved, so `transformer_before_decode: keep` holds at
+both canvases and nothing reloads 45.24 GiB ever again.
+
+What patch 11 alone does **not** do is let 768p keep everything — an earlier draft of this
+paragraph claimed it would, and `render.repeat=10` falsified that. The decoders are loaded
+*after* the first denoise, so they never coexist with it, and every denoise after the first
+one does: request 2 dies 444–468 MiB short on the three linear-branch ranks. Something has to
+cycle per request at 768p, and the choice is settled by size — the video VAE is 9.70 GiB per
+rank against the DiT's 45.24, so `parallel.vae_after_decode: free` cycles **4.7x less data**
+than reloading the weights would. It costs 5.05 s of decoder load plus 1.82 s of release, and
+a pinned host copy of those 9.70 GiB would restore in ~0.96 s at the measured 10.08 GiB/s —
+768p at ~28 s instead of 33.21. That patch is designed and not built.
 
 ## The VAE decoder: DP, not TP
 
@@ -295,7 +324,7 @@ service cannot, so the size of the thing matters:
 * VDN reads **`hidden_states[50]`**, which HF fills with the *input* to layer 50. So layers
   52–64 (13 of 64) and the 5120x151936 LM head never contribute: dropping them leaves
   **48.9 GiB resident**, measured, and takes the forward 169 → **135 ms** at 1300 tokens.
-* **The forward is free; only the residency is a problem.** 135 ms against a 13.2 s render.
+* **The forward is free; only the residency is a problem.** 135 ms against an 11.45 s render.
 * **Host offload is not viable, and the *unload* is what kills it.** 48.9 GiB to the host
   takes **29.6 s (1.65 GiB/s)** and 7.6 s (6.43 GiB/s) to come back — a 37 s round trip,
   three times the render. The slow direction is the one allocating pageable destinations,
@@ -433,15 +462,16 @@ they are the dominant term, not the sampler.
 | `scripts/summarize.py` | the `*.inference.json` records → one markdown table |
 | `scripts/text_encoder_bench.py` | what the Qwen3-VL conditioner would cost if it were in the request path |
 | `scripts/reload_bench.py` | how long the DiT takes to come **back** after patch 10 frees it — the question a long-lived API has and a one-shot render does not |
+| `scripts/decode_parity.py` | asserts patch 11's two memory changes are **bit-identical** to `vae.decode`, at both canvases, with fixed latents in one process — multi-rank denoise is not reproducible, so a whole-render A-B could not have shown this |
 | `scripts/p5.sh` | ssh/scp helper for the box |
 | `scripts/sync_box.sh` | push the patched sources + configs + driver onto the box — see trap 7 |
 | `configs/8nfe_480p_345f_ulysses_h100.yaml` | **the deliverable**: 480p, 345 frames (14.375 s), 8 NFE, fp8, 8 GPUs, 3+5 split, parallel decode |
 | `configs/8nfe_480p_362f_ulysses_h100.yaml` | the same at 362 frames (15.083 s), the literal "15 second" ask |
-| `configs/8nfe_768p_345f_ulysses_h100.yaml` | the control: upstream's published 768p shape, so the H100↔H200 gap is measured |
+| `configs/8nfe_768p_345f_ulysses_h100.yaml` | the control: upstream's published 768p shape, so the H100↔H200 gap is measured. Also the only config that cycles anything per request (`vae_after_decode: free`) |
 | `configs/8nfe_2k_ulysses_h100.yaml` | 2560x1440 — a lower bound on H3-Regenerate-2K, which is not open-sourced |
-| `patches/` | the ten patches above + `BASE.txt` (the upstream commit they apply to) |
+| `patches/` | the twelve patches above + `BASE.txt` (the upstream commit they apply to) |
 | `RESULTS.md` | the measured numbers |
-| `samples/` | the renders the numbers came from, video+audio muxed, all t2va from `prompts/example_2.pt`. The current best config, with all ten patches: **`n_480p_seg4.mp4`** (864x480, 345 f), **`n_480p_362f_seg4.mp4`** (the literal 15 s, 362 f) and **`p_768p_free.mp4`** (1344x768, 345 f, the 29.50 s steady-state render) — all `clipinfo.py`-checked. Earlier renders kept for comparison: `vdn_*` (pre-patch-7 swscale mux), `z_*` (patches 1–6), `n_768p_seg4` (768p with patch 3's host offload, before patch 10), `y_768p_345f_r5` (the 768p split winner), `f_*` (fl2va) |
+| `samples/` | the renders the numbers came from, video+audio muxed, all t2va from `prompts/example_2.pt`. The current best config, with all ten patches: **`n_480p_seg4.mp4`** (864x480, 345 f), **`n_480p_362f_seg4.mp4`** (the literal 15 s, 362 f) and **`p_768p_free.mp4`** (1344x768, 345 f) — all `clipinfo.py`-checked. The patch-11/12 renders (`r2_768p_keep_yuv`, `s2_480p_rep10`, `s5_480p_362f_rep10`, `s4_768p_rep10`) are **not** in the repo — they are the same prompt at the same canvas as the clips above and the patches change no pixels, which `scripts/decode_parity.py` asserts bit-exactly, so the mp4s carry no information the tracked ones do not. Earlier renders kept for comparison: `vdn_*` (pre-patch-7 swscale mux), `z_*` (patches 1–6), `n_768p_seg4` (768p with patch 3's host offload, before patch 10), `y_768p_345f_r5` (the 768p split winner), `f_*` (fl2va) |
 
 ## Traps found on this box
 

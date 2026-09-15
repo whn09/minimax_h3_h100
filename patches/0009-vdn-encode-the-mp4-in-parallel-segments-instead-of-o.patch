@@ -1,7 +1,7 @@
 From 7df9492e449e4b7e0bcffe8461e642f4ffab0b33 Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 14:46:19 +0800
-Subject: [PATCH 09/10] vdn: encode the mp4 in parallel segments instead of one
+Subject: [PATCH 09/12] vdn: encode the mp4 in parallel segments instead of one
  libx264 stream
 
 Once the colour conversion moved to the GPU, the mux is libx264 and nothing else, and

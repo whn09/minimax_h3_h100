@@ -1,9 +1,11 @@
 # CONTROL: the upstream 768p / 14.4 s headline workload, re-measured on H100 so the 480p
 # number has an anchor in the published table. Upstream reports 2.29 s/NFE on 8x H200 and
-# 1.40 s/NFE on 8x B200 for exactly this shape; this file is equivalent to their
-# 8nfe_tuned_fp8_ulysses_h200.yaml apart from carrying the (default) height/width
-# explicitly. Any gap here is the H100-vs-H200 gap, measured rather than assumed, and it
-# is the factor to apply when comparing the 480p result to a published H200 number.
+# 1.40 s/NFE on 8x B200 for exactly this shape. The denoise here is comparable to their
+# 8nfe_tuned_fp8_ulysses_h200.yaml -- same numerics, same NFE, same canvas, and their
+# published figure is denoise-only -- so any gap in s/NFE is the H100-vs-H200 gap, measured
+# rather than assumed, and it is the factor to apply when comparing the 480p result to a
+# published H200 number. The parallel.* decode fields below have no counterpart upstream;
+# they are what makes 80 GiB enough to hold the weights across the decode.
 #
 #   torchrun --standalone --nproc_per_node=8 src/inference/infer_ulysses.py \
 #       --config configs/inference/8nfe_768p_345f_ulysses_h100.yaml \
@@ -29,13 +31,32 @@ parallel:
   # ranks to spread it over. The split is a property of the canvas, not of the machine.
   softmax_ranks: 5
   profile: false
-  # 768p only. 45.2 GiB of weights on every rank, ~11 GiB of decoders on rank 0, and a
-  # 345-frame 1344x768 decode is past what an 80 GiB card has -- measured, it OOMs about
-  # 100 MiB short, in the assembly rather than the chunk decode. So the weights are released
-  # once denoising is done. "free" not "offload": both free the same 45.2 GiB, but the host
-  # copy costs 26.33 s against 2.81 s and nothing after the denoise reads the weights.
-  # 480p has the headroom and leaves this at "keep".
-  transformer_before_decode: free
+  # The DiT STAYS on the card at 768p, which took two patches to earn. 45.2 GiB of weights
+  # on every rank, ~11 GiB of decoders on rank 0, and a 345-frame 1344x768 decode used to be
+  # 102 MiB past what an 80 GiB card has, so this said "free" and the render paid 2.81 s to
+  # evict weights it would have to rebuild (138-232 s) on the next request. The two switches
+  # below take rank 0's decode peak down instead -- measured 64.5 GiB reserved, ~1 GiB clear
+  # of the non-PyTorch floor -- and the eviction stage disappears; a second request needs
+  # nothing rebuilt. "offload" remains strictly dominated and unused; see
+  # src/config/inference.py.
+  transformer_before_decode: keep
+  # ...and the DECODERS are what cycles instead, which is the half of this that a single
+  # render cannot show and `render.repeat=10` did: with both set to keep, request 1 renders
+  # and request 2's denoise dies 444-468 MiB short on the three linear-branch ranks, because
+  # the decoders are loaded after the first denoise and so coexist with every later one.
+  # One of the two has to go per request at this canvas; the video VAE is 9.70 GiB per rank
+  # against the DiT's 45.24, so cycling it moves 4.7x less data. Measured cost: 5.05 s of
+  # decoder load + 1.82 s of release inside a 33.21 s +/- 0.85 request, ten requests, zero
+  # memory growth. At 480p neither side has to cycle and both stay keep.
+  vae_after_decode: free
+  # Both are REQUIRED by transformer_before_decode: keep at this canvas, and stream_yuv_assembly
+  # is validated to imply parallel_vae_decode. Together they remove the three full-canvas
+  # buffers rank 0 used to hold: the fp16 RGB clip (1.99 GiB), the fp32 denormalisation
+  # (3.98 GiB), and the whole-decode all-gather destination (3.045 GiB, now gathered one
+  # round of chunks at a time, 0.38 GiB). Output is bit-identical either way --
+  # scripts/decode_parity.py checks both claims at this exact geometry.
+  parallel_vae_decode: true
+  stream_yuv_assembly: true
 
 render:
   height: 768
