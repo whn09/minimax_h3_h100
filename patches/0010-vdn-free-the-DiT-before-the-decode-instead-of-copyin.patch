@@ -1,4 +1,4 @@
-From 229634c65975056335e60864e42b695d38d0da4e Mon Sep 17 00:00:00 2001
+From 0e2c7b76342db728b1ad11d276f28a4b5d45883f Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 16:23:09 +0800
 Subject: [PATCH 10/10] vdn: free the DiT before the decode instead of copying
@@ -30,9 +30,9 @@ denoise unchanged at 2.471 s/NFE. Output verified with clipinfo.py.
 Renames the timing key to transformer_release_seconds and adds
 transformer_release_mode, so a record says which of the three ran.
 ---
- src/config/inference.py        | 29 ++++++++++++++++-----
- src/inference/infer_ulysses.py | 47 ++++++++++++++++++++++++++--------
- 2 files changed, 59 insertions(+), 17 deletions(-)
+ src/config/inference.py        | 29 +++++++++++---
+ src/inference/infer_ulysses.py | 71 ++++++++++++++++++++++++++++------
+ 2 files changed, 83 insertions(+), 17 deletions(-)
 
 diff --git a/src/config/inference.py b/src/config/inference.py
 index 4beb423..e6aedc3 100644
@@ -75,10 +75,10 @@ index 4beb423..e6aedc3 100644
      # on rank 0. The decode is the bigger half of a 480p render's post-warmup latency and it
      # is a grid of independent non-causal ViT forwards, so this is nearly free parallelism:
 diff --git a/src/inference/infer_ulysses.py b/src/inference/infer_ulysses.py
-index 02a27ec..deee1e7 100644
+index 02a27ec..5ca3eaa 100644
 --- a/src/inference/infer_ulysses.py
 +++ b/src/inference/infer_ulysses.py
-@@ -150,17 +150,41 @@ def main():
+@@ -150,17 +150,53 @@ def main():
          os.makedirs(os.path.dirname(lpath) or ".", exist_ok=True)
          torch.save({"video": latents.cpu(), "audio": audio_latents.cpu()}, lpath)
  
@@ -114,6 +114,9 @@ index 02a27ec..deee1e7 100644
 +    if mode not in ("keep", "free", "offload"):
 +        raise ValueError(f"parallel.transformer_before_decode must be one of "
 +                         f"keep/free/offload, got {mode!r}")
++    if runtime.is_main:
++        timings["reserved_before_release_gib"] = torch.cuda.memory_reserved(device) / 1024 ** 3
++        timings["allocated_before_release_gib"] = torch.cuda.memory_allocated(device) / 1024 ** 3
 +    if runtime.is_main and mode != "keep":
 +        if mode == "offload":
 +            model.transformer.to("cpu")
@@ -123,20 +126,48 @@ index 02a27ec..deee1e7 100644
 +            # would free nothing. Repointing every parameter and buffer at meta releases the
 +            # CUDA storages while leaving the module graph intact.
 +            model.transformer.to_empty(device="meta")
++        # NOT called in "keep" mode, which was tested rather than assumed: the theory that the
++        # 768p OOM was the denoise's cached arena not having been handed back is WRONG. Calling
++        # empty_cache() here in keep mode reproduces the failure to the byte -- same 102 MiB
++        # request, same 69.88 MiB free, same 79.10 GiB in use -- because
++        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is already reusing those blocks. So
++        # it would only add its ~0.5 s to every 480p render for nothing.
          torch.cuda.empty_cache()
 -    timings["transformer_offload_seconds"] = time.perf_counter() - offload_started
++    if runtime.is_main:
++        timings["reserved_after_release_gib"] = torch.cuda.memory_reserved(device) / 1024 ** 3
++        torch.cuda.reset_peak_memory_stats(device)
 +    timings["transformer_release_seconds"] = time.perf_counter() - release_started
 +    timings["transformer_release_mode"] = mode
  
      # The denoising activations are gone by now, so the decoders have room. Every rank
      # takes the video VAE when the decode is going to be data-parallel; only rank 0 ever
-@@ -225,7 +249,8 @@ def main():
+@@ -198,6 +234,14 @@ def main():
+     runtime.barrier()
+     timings["decode_and_encode_seconds"] = time.perf_counter() - decode_started
+     timings["end_to_end_seconds"] = time.perf_counter() - process_started
++    if runtime.is_main:
++        # Peak since the release, so it answers exactly one question: how much room the decode
++        # wanted on top of whatever the mode left resident. Without it, an OOM says only that
++        # the total did not fit and a success says nothing at all.
++        timings["decode_peak_allocated_gib"] = (
++            torch.cuda.max_memory_allocated(device) / 1024 ** 3)
++        timings["decode_peak_reserved_gib"] = (
++            torch.cuda.max_memory_reserved(device) / 1024 ** 3)
+ 
+     if runtime.is_main:
+         record = render_record(cfg, model)
+@@ -225,7 +269,12 @@ def main():
              f"denoise {timings['denoise_seconds']:.2f}s "
              f"({timings['seconds_per_step']:.2f}s/step; per NFE "
              + " ".join(f"{x:.2f}" for x in timings["step_seconds"]) + "), "
 -            f"offload {timings['transformer_offload_seconds']:.2f}s, "
 +            f"DiT {timings['transformer_release_mode']} "
-+            f"{timings['transformer_release_seconds']:.2f}s, "
++            f"{timings['transformer_release_seconds']:.2f}s "
++            f"(reserved {timings['reserved_before_release_gib']:.1f}"
++            f"->{timings['reserved_after_release_gib']:.1f} GiB, decode peak "
++            f"{timings['decode_peak_allocated_gib']:.1f} alloc / "
++            f"{timings['decode_peak_reserved_gib']:.1f} reserved), "
              f"decoder load {timings['decoder_load_seconds']:.2f}s, "
              f"decode+encode {timings['decode_and_encode_seconds']:.2f}s, "
              f"E2E {timings['end_to_end_seconds']:.2f}s",

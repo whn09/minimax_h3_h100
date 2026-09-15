@@ -259,22 +259,66 @@ torch.OutOfMemoryError: Tried to allocate 102.00 MiB. GPU 0 has a total capacity
 Rank 0 dies in the assembly, not the chunk decode, and it dies **102 MiB short of finishing**
 — which says the eviction is buying a couple of GiB, not tens. That margin is also why the
 remaining 2.81 s is worth attacking rather than accepting: if rank 0's peak came down by a
-few GiB the DiT could simply stay on the card and the whole stage would disappear. Where
-those GiB go, from the tensor shapes at 768p (6.19 MB per frame at 3 channels fp16):
+few GiB the DiT could simply stay on the card and the whole stage would disappear.
+
+**The cheapest possible explanation was tested first, and it is wrong.** `empty_cache()` was
+only ever called on the eviction path, never in `keep` mode, so the theory was that the
+denoise's cached arena had simply never been handed back and the *contiguous* 102 MiB was a
+fragmentation artefact. Calling it unconditionally reproduces the failure **to the byte** —
+same 102 MiB request, same 69.88 MiB free, same 79.10 GiB in use (arm `q2_768p_keep_ec`).
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is already reusing those blocks, so there
+was nothing to hand back. The call was reverted rather than left in, since in `keep` mode it
+would add ~0.5 s to every 480p render for nothing. What the arm did buy is the budget, which
+no earlier run had printed:
+
+| rank 0 at 768p, `keep` | GiB |
+|---|---:|
+| allocated by PyTorch at the OOM | 64.97 |
+| reserved by PyTorch, unallocated | 0.50 |
+| **non-PyTorch** — CUDA context, NCCL, cuBLAS/flash-attn workspaces | **14.1** |
+| total in use | 79.10 |
+| card | 79.18 |
+
+That 14.1 GiB is 18 % of the card and is the least examined number in this file. It is not
+reachable from the config, but it is the reason the margin is 102 MiB instead of several GiB:
+of a nominal 80 GiB, the decode is really working against ~65.
+
+A second arm (`q_768p_keep_ec`) fails differently and is worth recording as a distinct
+result: run **without** `parallel_vae_decode`, rank 0 falls back to the serial diffusers
+`_decode`, and the OOM moves to `autoencoder_kl_minimax_h3.py:830` asking for **1.99 GiB with
+1.73 GiB free**. 1.99 GiB is exactly `345 x 1344 x 768 x 3 ch x 2 B` — the whole clip in fp16
+RGB — so the serial path is short by ~260 MiB rather than 102, and both paths die building
+the same full-canvas tensor. Where those GiB go, from the tensor shapes at 768p (6.19 MB per
+frame at 3 channels fp16):
 
 * `gathered`, the all-gather destination — 24 slots of ~34 frames each, since every slot
   carries its chunk's decode overlap: **~5 GiB**.
 * `dec`, the concatenated clip that `_blend` builds on top of it: **2.1 GiB**.
 
 So rank 0 holds the whole clip roughly twice, in fp16 RGB at 6 bytes per pixel, while
-patch 7 already knows how to represent a finished frame in **1.5** bytes per pixel. Doing the
-YUV conversion per rank *before* the all-gather would cut both buffers 4x — ~5.4 GiB back,
-comfortably more than the offload is buying, and 4x less NCCL traffic as a bonus. It is not
-free to write: `_blend` ramps across chunk boundaries in float, and consecutive chunks live
-on different ranks by the round-robin, so the overlap frames would have to stay float while
-the interior went to uint8. That is the shape of the next patch if 768p ever becomes the
-deliverable — it would take the 768p request to ~26.7 s. At 480p there is nothing to fix,
-because there is nothing to evict.
+patch 7 already knows how to represent a finished frame in **1.5** bytes per pixel.
+
+**So yes, the DiT can stay resident at 768p — but it needs a patch, not a knob.** Two
+candidates, both measured against the same 102 MiB deficit:
+
+1. **Never materialise `dec`.** The assembly loop already yields one blended chunk at a time,
+   and `torch.cat` exists only to hand `decode_and_save` a single tensor. Converting each
+   chunk to YUV as it comes out of the loop and writing it into a preallocated plane set
+   removes the 1.99 GiB entirely — **20x the margin needed** — without touching the
+   all-gather, the NCCL traffic, or `_blend`'s arithmetic, which keeps running in fp16 RGB per
+   chunk pair exactly as it does now. The awkward part is the trailing `pad_frames` trim,
+   which has to be computed up front so the output can be sized before the loop rather than
+   after it.
+2. **YUV before the all-gather.** Cuts `gathered` *and* `dec` 4x — ~5.4 GiB back and 4x less
+   NCCL traffic — but this is the harder one: `_blend` ramps across chunk boundaries in float
+   and consecutive chunks live on different ranks by the round-robin, so the overlap frames
+   would have to stay float while the interior went to uint8.
+
+(1) is strictly smaller and already sufficient, so it is the one to write; (2) only becomes
+worth it if the all-gather's 5 GiB or its NCCL time start mattering on their own. Either way
+768p then runs `keep`, the release stage disappears, and the request goes 29.50 → **~26.7 s**
+steady with no reload cost on any request — which is the number an API wants, per the reload
+section above. At 480p there is nothing to fix, because there is nothing to evict.
 
 Worth stating explicitly, since it is the obvious alternative: **tensor parallelism would
 also solve this, and it is the expensive way to.** TP=2 x Ulysses=4 halves the resident
