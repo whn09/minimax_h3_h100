@@ -171,6 +171,58 @@ more than the choice of card.
 **2.08x**, against a row ratio of 2.41x. Sublinear, not superlinear — see the README for
 why the asymptotic argument gives the wrong answer here.
 
+### 768p end to end: half the request is one PCIe transfer
+
+The denoise is the fair comparison above, but it is not the request. Full 768p breakdown,
+arm `n_768p_seg4`, same nine patches and same parallel decode as the 480p headline:
+
+| stage | 768p / 345 f | 480p / 345 f |
+|---|---|---|
+| denoise, 8 NFE | 19.78 (2.473 s/NFE) | 8.55 (1.069) |
+| **DiT → host** | **26.33** | **0** (not needed) |
+| decoder load (once per process) | 3.19 | 3.87 |
+| video VAE, 8 ranks | 4.78 | 3.10 |
+| audio VAE + frames-to-host + mux | 2.21 | 1.55 |
+| **post-warmup end-to-end** | **56.29** | **17.07** |
+| **steady state** | **53.10** | **13.20** |
+| vs clip length | 3.69x slower than realtime | 1.09x faster |
+
+768p is **4.0x** the 480p request against a 2.41x row ratio, and the excess is almost
+entirely `offload_transformer_before_decode`: 45.2 GiB of fp8 weights back to the host at
+1.7 GB/s, the same unpinned-state-dict rate as everywhere else in this file. Note also that
+the steady-state row flatters 768p, because the DiT never comes *back* in a single-request
+process. A warm server serving 768p back to back also pays the return trip, ~7 s at the
+measured 6.43 GiB/s host→device, so the real cycle is **~60 s**. That last figure is
+arithmetic, not a measurement.
+
+**The offload is load-bearing, and that was tested rather than assumed.** Patch 3 introduced
+it when the decode was still serial on rank 0; patch 5 made the decode 8-way, which changes
+where the peak lives, so the arm was re-run with the offload off:
+
+```
+denoise 19.77s over 8 NFE = 2.472s/NFE      <- fine
+torch.OutOfMemoryError: Tried to allocate 102.00 MiB. GPU 0 has a total capacity of
+79.18 GiB of which 69.88 MiB is free ... this process has 79.10 GiB memory in use.
+  in parallel_vae.py:148 -> vae._blend -> torch.cat
+```
+
+Rank 0 dies in the assembly, not the chunk decode, and it dies **102 MiB short of finishing**
+— which says the offload is buying a couple of GiB, not tens. Where those GiB go, from the
+tensor shapes at 768p (6.19 MB per frame at 3 channels fp16):
+
+* `gathered`, the all-gather destination — 24 slots of ~34 frames each, since every slot
+  carries its chunk's decode overlap: **~5 GiB**.
+* `dec`, the concatenated clip that `_blend` builds on top of it: **2.1 GiB**.
+
+So rank 0 holds the whole clip roughly twice, in fp16 RGB at 6 bytes per pixel, while
+patch 7 already knows how to represent a finished frame in **1.5** bytes per pixel. Doing the
+YUV conversion per rank *before* the all-gather would cut both buffers 4x — ~5.4 GiB back,
+comfortably more than the offload is buying, and 4x less NCCL traffic as a bonus. It is not
+free to write: `_blend` ramps across chunk boundaries in float, and consecutive chunks live
+on different ranks by the round-robin, so the overlap frames would have to stay float while
+the interior went to uint8. That is the shape of the next patch if 768p ever becomes the
+deliverable; at 480p there is nothing to fix, because there is no offload to remove.
+
 ## The decode was the other half
 
 At 480p, upstream's decode takes **14.38 s** against the denoise's 8.72 s, and all of it
