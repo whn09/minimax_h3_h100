@@ -355,11 +355,41 @@ patch 5's claim holds exactly, and the earlier `MISMATCH` was an artefact of the
 ## Text encoding is not in any of these numbers
 
 Neither here nor upstream — the Qwen3-VL conditioner runs once, offline, and the render
-`torch.load`s a cached `prompt_embeds`. See the README for the sizing (63 GB checkpoint,
-~49 GB actually needed, host offload ruled out at 1.7 GB/s measured, 8-way shard at 6.1 GiB
-per rank) and `scripts/text_encoder_bench.py` for the measurement.
+`torch.load`s a cached `prompt_embeds`. Upstream's published 18.3 s excludes it for the same
+reason. A prompt-to-video service cannot, so `scripts/text_encoder_bench.py` measures what
+putting it in the request path would cost. On this box, 1300-token prompt:
 
-_Pending: bench results from the box._
+| | |
+|---|---|
+| load, checkpoint → GPU, bf16 | **8.3 s** for 62.1 GiB (7.51 GiB/s) |
+| full 64-layer forward | 169 ms → `hidden_states[50]`, (1, 1300, 5120) |
+| resident after dropping layers 52–64 and the LM head | **48.9 GiB** (was 62.1, saved 13.3) |
+| trimmed 51-layer forward | **135 ms** |
+| offload 48.9 GiB to host, then back | **29.6 s** (1.65 GiB/s) + 7.6 s (6.43 GiB/s) |
+| sharded over 8 ranks | **6.1 GiB per rank**, alongside the 45.2 GiB fp8 DiT = 51.3 of 79.2 |
+
+Three things fall out of that:
+
+1. **The forward is free. Everything else is memory movement.** 135 ms against a 13.2 s
+   render is 1 %. VDN reads `hidden_states[50]`, which HF fills with the *input* to layer 50,
+   so layers 52–64 — 13 of 64 — and the 5120×151936 LM head never contribute; dropping them
+   is 13.3 GiB off what has to be resident, for free.
+2. **Per-request host offload is not an option, and it is the *unload* that kills it.** The
+   round trip is 37 s, three times the render, and 29.6 of it is the trip *to* the host at
+   1.65 GiB/s — the same 1.7 GiB/s patch 3 measured on the DiT's `to("cpu")`, and for the
+   same reason: a state dict is thousands of separate unpinned tensors, so the direction that
+   allocates pageable destinations is the slow one. Keeping the conditioner permanently in
+   host memory and only paying the 7.6 s upload would be tolerable-ish; paying to evict it
+   every request is not.
+3. **The 8-way shard is the answer, and it needs no offloading at all.** 6.1 GiB per rank
+   next to the fp8 DiT leaves 28 GiB of headroom on each card, so the conditioner can simply
+   stay resident and the request path pays only the 135 ms forward.
+
+One number to read sceptically: the 7.51 GiB/s "NVMe → GPU" load is almost certainly served
+from the page cache — the box has 2 TiB of RAM and the checkpoint had just been downloaded —
+so it is a host-memory read wearing a filesystem's clothes, which is why it lands next to the
+6.43 GiB/s host→device figure rather than above it. A genuinely cold load would be slower.
+It does not change the conclusion, since the conclusion is not to move the weights at all.
 
 ## Conditioning: what fl2va costs over t2va
 

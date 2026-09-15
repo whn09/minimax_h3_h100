@@ -245,21 +245,21 @@ offline, on one GPU** and writes `prompt_embeds` to a `.pt`; `load_prompt()` jus
 service cannot, so the size of the thing matters:
 
 * `Qwen3VLForConditionalGeneration`, 64 text layers, hidden 5120, intermediate 25600,
-  64 heads / 8 KV, vocab 151936, vision depth 27 → **~31.5 B params = 63 GB in bf16**.
+  64 heads / 8 KV, vocab 151936, vision depth 27 → **~31.5 B params, 62.1 GiB in bf16**.
 * VDN reads **`hidden_states[50]`**, which HF fills with the *input* to layer 50. So layers
-  52–64 (13 of 64) and the 5120x151936 LM head never contribute: **~49 GB is what has to be
-  resident**, not 63.
-* **Host offload is not viable.** Patch 3 measures the real rate for this kind of move:
-  45.2 GiB in 26.69 s = **1.7 GB/s**, far off PCIe Gen5, because a state dict is thousands
-  of separate unpinned tensors. ~49 GB round-tripping per request is ~30 s on top of a 25 s
-  render. It more than doubles the latency.
+  52–64 (13 of 64) and the 5120x151936 LM head never contribute: dropping them leaves
+  **48.9 GiB resident**, measured, and takes the forward 169 → **135 ms** at 1300 tokens.
+* **The forward is free; only the residency is a problem.** 135 ms against a 13.2 s render.
+* **Host offload is not viable, and the *unload* is what kills it.** 48.9 GiB to the host
+  takes **29.6 s (1.65 GiB/s)** and 7.6 s (6.43 GiB/s) to come back — a 37 s round trip,
+  three times the render. The slow direction is the one allocating pageable destinations,
+  which is the same 1.7 GB/s patch 3 measured on the DiT's `to("cpu")`, and for the same
+  reason: a state dict is thousands of separate unpinned tensors.
 * **Sharding is.** 8-way, the needed weights are **6.1 GiB per rank**, which sits next to the
-  45.2 GiB fp8 DiT at 51.3 of 79.2 GiB. The forward is ~59 TFLOP for a ~1300-token prompt —
-  about 0.04 s spread over eight cards. It is not the compute that is the problem, it is
-  only ever the residency.
+  45.2 GiB fp8 DiT at 51.3 of 79.2 GiB — 28 GiB of headroom per card, so the conditioner
+  stays resident and the request pays only the 135 ms forward. Nothing has to move.
 
-`scripts/text_encoder_bench.py` measures all of the above on the box rather than asserting
-it.
+Measured by `scripts/text_encoder_bench.py`; the table is in RESULTS.md.
 
 ## 2K: not a super-resolution model, and not open
 
