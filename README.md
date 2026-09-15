@@ -167,6 +167,35 @@ these eight GPUs and raise their *throughput*, since the tail would overlap the 
 request's denoise. It would make the *latency* asked for here worse, not better, because a
 finished clip then has to cross a network before it exists.
 
+At `p5.48xlarge` on a **3-year no-upfront Instance Savings Plan** — $23.77728/instance-hour,
+$0.00660480/instance-second — those latencies price out at **$0.006065 per finished video
+second at 480p** ($0.087/clip, $21.83 per hour of video) and **$0.013554 at 768p**
+($0.195/clip, $48.80/hour). 480p renders for *less* than the instance costs to run, 0.92x an
+instance-second per finished second. This is a latency-optimised price and roughly 2x the
+cheapest way to buy the same seconds — see RESULTS.md for the throughput alternative and for
+what a per-request DiT reload would add.
+
+### What that means for an API, since `free` keeps no copy
+
+`parallel.transformer_before_decode: free` is right for a one-shot 768p render and wrong for a
+server, because `to_empty(device="meta")` leaves the weights nowhere: the next request has to
+get 45.24 GiB back onto the card. Measured (`scripts/reload_bench.py`, restores verified
+bit-identical over all 1802 tensors):
+
+| getting the DiT back | seconds |
+|---|---:|
+| from a **pinned** host copy | **4.49** (10.08 GiB/s) |
+| from a **pageable** host copy — what `offload` leaves | **10.53** (4.30 GiB/s) |
+| rebuild from the checkpoint, one process | **138.4** |
+| rebuild from the checkpoint, in the 8-rank job | **217–232** |
+
+So `offload` is **strictly dominated**: 26.67 s to write a pageable copy plus 10.53 s to read
+it back is 37.2 s, against 0.41 + 4.49 = **4.9 s** for `free` plus a retained pinned copy. And
+even the good path is not worth wanting — ~5 s per request and 362 GiB of page-locked host
+memory across 8 ranks, to recover the **102 MiB** the 768p decode was short of. For a server
+the fix is rank 0's decode peak, not the DiT: 480p already runs `keep`, and the
+YUV-before-all-gather change would let 768p run `keep` too.
+
 ## The VAE decoder: DP, not TP
 
 The instinct with a big module and eight idle cards is tensor parallelism. That is the wrong
@@ -403,6 +432,7 @@ they are the dominant term, not the sampler.
 | `scripts/runone.sh` | one arm, detached, with the environment this box needs — see trap 5 |
 | `scripts/summarize.py` | the `*.inference.json` records → one markdown table |
 | `scripts/text_encoder_bench.py` | what the Qwen3-VL conditioner would cost if it were in the request path |
+| `scripts/reload_bench.py` | how long the DiT takes to come **back** after patch 10 frees it — the question a long-lived API has and a one-shot render does not |
 | `scripts/p5.sh` | ssh/scp helper for the box |
 | `scripts/sync_box.sh` | push the patched sources + configs + driver onto the box — see trap 7 |
 | `configs/8nfe_480p_345f_ulysses_h100.yaml` | **the deliverable**: 480p, 345 frames (14.375 s), 8 NFE, fp8, 8 GPUs, 3+5 split, parallel decode |

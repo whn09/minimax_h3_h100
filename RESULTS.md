@@ -57,6 +57,45 @@ numbers measured at **different branch splits**:
 * The H100↔H200 gap was reported as 1.18x from H100 `r0` against H200 `r6`. At the same
   split it is **1.13x**. See the 768p section.
 
+## What a finished second costs
+
+`p5.48xlarge`, **EC2 3-Year No-Upfront Instance Savings Plan**: **$23.77728 / instance-hour**
+= $0.00660480 per instance-second, $2.9722 per GPU-hour. (`gpu-public-pricing.csv`, field
+`isp3Year`. The file carries only the us-east-1 row; the box is us-east-2, where p5 list
+pricing is the same, but that is an assumption and not from the file.)
+
+All eight GPUs work on one clip, so cost per clip is just wall clock x the instance rate:
+
+| | clip | steady state | $/clip | **$/finished video-second** | $ per video-hour |
+|---|---|---|---|---|---|
+| **480p, 345 f** | 14.375 s | 13.20 s | $0.0872 | **$0.006065** | $21.83 |
+| **480p, 362 f** | 15.083 s | 13.10 s | $0.0865 | **$0.005736** | $20.65 |
+| **768p, 345 f** | 14.375 s | 29.50 s | $0.1948 | **$0.013554** | $48.80 |
+
+Per 1000 clips: **$87** at 480p, **$195** at 768p. Using post-warmup E2E instead of steady
+state — i.e. charging every request for the one-time decoder load, which is only honest for a
+cold process serving a single clip — 480p is $0.007843/s ($113 per 1000) and 768p is
+$0.014850/s ($213 per 1000).
+
+Three things this table is and is not:
+
+* **480p renders for less than the instance costs to run.** At 1.09x realtime the finished
+  second costs 0.92x an instance-second; the 362-frame arm at 1.15x realtime costs 0.87x.
+  768p costs 2.05x an instance-second, and the whole 2.2x gap to 480p is the row count.
+* **The one-time build is not in here.** 138 s in a single process, 217–232 s in the 8-rank
+  job (`setup`), = $0.91–$1.53 of instance time per process lifetime. Over a few hundred
+  requests it rounds away; over three it doubles the bill. It is an argument for long-lived
+  workers, and against any per-request DiT reload — a 768p server that freed and restored the
+  weights each request would run 34.4–36.8 s and pay **$0.0158–0.0169 / video-second, +17 to
+  +25 %**.
+* **This is a latency-optimised price, and it is roughly 2x the cheapest way to buy these
+  seconds.** 8 GPUs give a 4.03x denoise speedup over 1 GPU (4.39 -> 1.069 s/NFE at 480p), so
+  eight independent single-GPU renders would produce about **1.98x** the clips per hour on the
+  same instance — call it ~$0.003 / video-second — at 3-4x the per-clip latency. A single card
+  holds the DiT and the decoders together at 480p (45.2 + ~11 GiB of 80), so that
+  configuration is plausible, but the number is denoise-only arithmetic and has not been run
+  end to end. It is the trade the brief chose against: the ask was minimum latency.
+
 ## 480p: the branch split matters more than anything else
 
 `parallel.softmax_ranks: n` gives n ranks the window-softmax branch and `8-n` the linear
@@ -202,11 +241,9 @@ so the copy bought nothing this path uses.
 
 That takes 768p to **2.2x** the 480p request, which is finally in line with the 2.41x row
 ratio, and the denoise is untouched at 2.471 s/NFE. `parallel.transformer_before_decode` is
-now `keep | free | offload`; 480p uses `keep`, 768p uses `free`, and `offload` survives as
-the measured comparison and for a server that will denoise again and wants the weights back
-without re-reading the checkpoint — though a *pinned* host copy retained from patch 2's
-host-side assembly would be the cheaper way to have that: 8 ranks x 45.2 GiB is 362 GiB of
-the box's 2 TiB, and a pinned upload runs at DMA rate rather than 1.7 GB/s.
+now `keep | free | offload`; 480p uses `keep`, 768p uses `free`, and `offload` survives only
+as the measured comparison — the section below shows it is strictly dominated as a way to get
+the weights *back*, which was the only thing it could have been for.
 
 **Releasing the weights at all is load-bearing, and that was tested rather than assumed.**
 Patch 3 introduced the eviction when the decode was still serial on rank 0; patch 5 made the
@@ -247,6 +284,70 @@ inside the attention modules — so it means column/row-parallel projections, an
 block, making patch 2's host-side fp8 assembly shard-aware, and re-deriving the branch split
 on a 4-way grid where 768p's measured optimum of 5-of-8 is not expressible (4-of-8 costs
 +12 %, 6-of-8 costs +5 %). Against that: a mode string, and 23.5 s recovered.
+
+### What `free` costs a server: how long the DiT takes to come back
+
+Everything above measures a one-shot render, where `free` is unambiguously right because
+nothing after the denoise reads the weights and the process exits. An API process denoises
+again, and `to_empty(device="meta")` leaves **no copy anywhere** — the storages are gone and
+every parameter points at meta. So "how long to reload" is a real question with four
+different answers depending on what you kept. Measured on one H100 at the 768p config's fp8
+numerics, `scripts/reload_bench.py`, 45.24 GiB over 1075 parameters + 727 buffers:
+
+| getting the weights back onto the card | seconds | rate |
+|---|---:|---|
+| from a **pinned** host copy | **4.49** (1.08 alloc + 3.41 copy) | 10.08 GiB/s |
+| from a **pageable** host copy — what `offload` leaves you | **10.53** (0.48 + 10.04) | 4.30 GiB/s |
+| rebuild from the checkpoint, 1 process, 192 threads | **138.36** | — |
+| rebuild from the checkpoint, inside the 8-rank job | **217–232** | — |
+
+and the costs on the way out, same run:
+
+| | seconds |
+|---|---:|
+| `to_empty(device="meta")` + `empty_cache()`, clean arena | 0.41 / 0.89 |
+| the same after a denoise, fragmented arena (in-render) | 2.81 |
+| `.to("cpu")` — the pageable snapshot `offload` makes | 26.67 |
+| pinning 45.24 GiB of host memory (once, at build) | 47.65 |
+
+Both restores were checked tensor by tensor against the host copy they came from: **0 of 1802
+bit-identical**. That is the right check and an end-to-end diff would not be — the multi-rank
+render is not reproducible run to run, but a weight copy is, so a copy either landed or it
+did not.
+
+Four things fall out of this.
+
+**The naive answer is a non-starter.** `free` with nothing retained means the next request
+pays a full rebuild: 138 s in a single process, and the grid logs' `setup` of 217–232 s is
+what it actually costs in the 8-rank job, where eight processes contend for the same 192
+vCPUs doing the same LoRA merge and the same 363-Linear fp8 quantisation. Either number is
+4–7x the entire 32.32 s request it is supposed to be helping.
+
+**`offload` is strictly dominated, and now provably so.** It pays 26.67 s to write a
+*pageable* copy, and pageable is exactly the copy that restores slowest: 26.67 + 10.53 =
+**37.2 s** round trip. Keeping a pinned copy instead is 0.41 + 4.49 = **4.9 s** round trip,
+7.6x cheaper on both legs at once. The 2.3x gap between the two restores is the same
+mechanism as everything else in this file — a pinned copy DMAs, a pageable one is staged
+through a bounce buffer — so the rule is: if you keep a host copy, pin it.
+
+**Even the good path is not cheap enough to want.** Release plus pinned restore is ~5 s
+(~7 s using the in-render 2.81 s release), added to a 29.50 s steady-state 768p request, for
++17–24 %. And it wants 45.24 GiB of *page-locked* host memory per rank — **362 GiB across 8
+ranks**, which fits the box's 2 TiB but is locked away from the page cache and from the
+frames-to-host staging in patch 7. All of that to free the 102 MiB the OOM was short of.
+
+**So for a server the answer is not to cycle the weights at all.** At 480p — the primary
+target — this whole question is void: `keep` is the default, nothing is evicted, and the
+17.07 s / 13.20 s figures already are the API's numbers. At 768p the fix is the decode's
+peak, not the DiT: the YUV-before-all-gather patch sketched above returns ~5.4 GiB on rank 0,
+which is 50x the margin needed, and then 768p also runs `keep` and drops to ~26.7 s with no
+reload cost on any request. Cycling 45.24 GiB twice per request to recover 102 MiB is the
+wrong shape of fix; it is only in the tree because it was the cheapest thing that made a
+one-shot 768p render finish.
+
+`scripts/reload_bench.py` takes no arguments beyond the config and prints the JSON above, so
+the numbers can be re-derived on other hardware — the pinned restore rate is a PCIe property
+and will differ on a box with a different topology.
 
 ## The decode was the other half
 
