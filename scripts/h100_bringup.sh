@@ -40,7 +40,14 @@ step "venv + torch 2.13.0 cu129"
 [ -d "$REPO/.venv" ] || uv venv --python 3.12 "$REPO/.venv"
 # shellcheck disable=SC1091
 source "$REPO/.venv/bin/activate"
-uv pip install -q torch==2.13.0 --index-url https://download.pytorch.org/whl/cu129
+# torchvision has to be named here too, and from the same index. pyproject pins
+# `torchvision==0.28.0` with no local version, so if it is left to `uv pip install -e .`
+# below, uv takes the PyPI default -- which is the cu130 build -- and every import of
+# diffusers.loaders.peft then dies with "PyTorch has CUDA Version=12.9 and torchvision has
+# CUDA Version=13.0". Worse, `uv pip install torchvision==0.28.0 --index-url .../cu129`
+# afterwards is a no-op: 0.28.0 already satisfies 0.28.0, so it never fetches 0.28.0+cu129.
+# Getting both from the cu129 index up front is the only ordering that works.
+uv pip install -q torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu129
 
 step "deps (flash-attn-4 needs --prerelease=allow for nvidia-cutlass-dsl)"
 uv pip install -q --prerelease=allow -e .

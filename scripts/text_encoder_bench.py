@@ -20,9 +20,23 @@ so this measures the three things that decide what it costs:
     python scripts/text_encoder_bench.py                      # 1300-token synthetic prompt
     python scripts/text_encoder_bench.py --tokens 3485        # the fl2va prompt's length
 
-The conclusion this is meant to settle: 8-way sharding versus host offload. Sharded, the
-needed weights are ~6 GiB per rank and sit alongside the 45.2 GiB fp8 DiT on an 80 GiB
-card, and the forward is dominated by nothing. Offloaded, the transfer below is the floor.
+There is a fourth number, and it is the one the first three make load-bearing:
+
+  4. **What a per-request upload of ONE SHARD costs, with all eight ranks doing it at once.**
+     The offload figures above are single-process, one card at a time. A request path that
+     keeps the conditioner in pinned host memory and uploads 1/8 of it per rank per request
+     has eight concurrent H2D streams competing for host memory bandwidth, so the per-rank
+     rate is not necessarily the single-rank rate. `--transfer` measures exactly that and
+     needs no checkpoint at all:
+
+    torchrun --standalone --nproc_per_node=8 scripts/text_encoder_bench.py --transfer 6.1
+
+The conclusion this is meant to settle: where the conditioner lives. Resident is the obvious
+answer and it does NOT fit -- 6.1 GiB per rank against the ~2.1 GiB the 480p pipeline leaves
+spare at its decode peak (RESULTS.md, "Text encoding is not in any of these numbers"). Host
+offload of the whole thing per request is 37 s and never in question. What is left is a
+pinned host copy uploaded per request, whose cost is (4) plus (2), and that is why (4) is
+here.
 """
 import argparse
 import os
@@ -65,6 +79,73 @@ def forward_seconds(model, input_ids, repeats):
     return best, tuple(embeds.shape)
 
 
+def transfer_bench(gib, repeats):
+    """Per-request cost of uploading one conditioner shard from a pinned host copy, with
+    every rank uploading at the same time -- the only version of this number that a request
+    path would actually see. Run under torchrun; falls back to one rank if not.
+
+    Three arms, because two of them are the alternatives being rejected:
+      pinned, all ranks    what the design costs
+      pinned, rank 0 only  the same transfer with no contention -- the difference IS the
+                           contention, and it is what a single-process benchmark hides
+      pageable, all ranks  what you get if the host copy is a plain state dict rather than
+                           page-locked, i.e. the mistake this measurement exists to price
+    """
+    import torch.distributed as dist
+
+    distributed = "RANK" in os.environ
+    if distributed:
+        dist.init_process_group("nccl")
+        rank, world = dist.get_rank(), dist.get_world_size()
+        torch.cuda.set_device(rank)
+        device = f"cuda:{rank}"
+    else:
+        rank, world, device = 0, 1, "cuda:0"
+
+    elements = int(gib * GIB) // 2                      # bf16
+    host_pinned = torch.empty(elements, dtype=torch.bfloat16, pin_memory=True)
+    host_pageable = torch.empty(elements, dtype=torch.bfloat16)
+    card = torch.empty(elements, dtype=torch.bfloat16, device=device)
+
+    def timed(source, participating):
+        """Best of `repeats`, measured only on the ranks that copy. The barrier is what makes
+        this concurrent rather than eight staggered transfers."""
+        best = None
+        for _ in range(repeats):
+            if distributed:
+                dist.barrier()
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            if participating:
+                card.copy_(source, non_blocking=True)
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - started
+            best = elapsed if best is None else min(best, elapsed)
+        return best
+
+    arms = [("pinned, all ranks", host_pinned, True),
+            ("pinned, rank 0 only", host_pinned, rank == 0),
+            ("pageable, all ranks", host_pageable, True)]
+    results = []
+    for name, source, participating in arms:
+        seconds = timed(source, participating)
+        results.append((name, seconds if participating else None))
+
+    if rank == 0:
+        print(f"H2D of a {gib:.2f} GiB shard, world={world}, best of {repeats}:", flush=True)
+        for name, seconds in results:
+            if seconds is None:
+                continue
+            per_rank = gib / seconds
+            note = f", {per_rank * world:.2f} GiB/s aggregate" if "all ranks" in name else ""
+            print(f"  {name:22s} {seconds:6.3f} s  ({per_rank:5.2f} GiB/s per rank{note})",
+                  flush=True)
+        print(f"\nA request path paying this once per request adds it to the 135 ms forward; "
+              f"compare 11.45 s (480p) and 33.21 s (768p).", flush=True)
+    if distributed:
+        dist.destroy_process_group()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--tokens", type=int, default=1300,
@@ -72,7 +153,14 @@ def main():
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--model_root", type=str, default=None)
+    p.add_argument("--transfer", type=float, default=None, metavar="GIB",
+                   help="skip the model entirely and measure a GIB-per-rank pinned H2D under "
+                        "torchrun (6.1 = the trimmed conditioner over 8 ranks)")
     args = p.parse_args()
+
+    if args.transfer is not None:
+        transfer_bench(args.transfer, max(args.repeats, 3))
+        return
 
     root = args.model_root or upstream_snapshot("processor", "text_encoder")
 
@@ -146,10 +234,23 @@ def main():
           f"to host {to_host:.1f}s ({trimmed_gib / to_host:.2f} GiB/s), "
           f"back {to_device:.1f}s ({trimmed_gib / to_device:.2f} GiB/s)", flush=True)
 
+    # The accounting that matters is not "shard + DiT" -- that comparison omits the decoders
+    # and both stages' activations, and it is how an earlier version of RESULTS.md talked
+    # itself into "28 GiB of headroom". The real ceiling is the card minus the non-PyTorch
+    # floor, and the real occupant is the pipeline's measured peak.
     world = 8
-    print(f"\nsharded over {world} ranks: {trimmed_gib / world:.1f} GiB per rank, "
-          f"alongside a 45.2 GiB fp8 DiT = {45.2 + trimmed_gib / world:.1f} GiB of 79.2",
-          flush=True)
+    shard = trimmed_gib / world
+    ceiling, floor, peak_480p = 79.18, 13.92, 63.14   # measured: OOM log, s2_480p_rep10
+    spare = ceiling - floor - peak_480p
+    print(f"\nsharded over {world} ranks: {shard:.1f} GiB per rank.", flush=True)
+    print(f"  card gives PyTorch {ceiling - floor:.2f} GiB ({ceiling} total - {floor} "
+          f"non-PyTorch floor); the 480p pipeline peaks at {peak_480p:.2f} "
+          f"-> {spare:.2f} GiB spare", flush=True)
+    print(f"  resident conditioner {'fits' if shard <= spare else 'DOES NOT FIT'}: "
+          f"needs {shard:.1f}, has {spare:.2f}", flush=True)
+    print(f"  so price the per-request upload instead: "
+          f"torchrun --standalone --nproc_per_node={world} {sys.argv[0]} "
+          f"--transfer {shard:.2f}", flush=True)
 
 
 if __name__ == "__main__":

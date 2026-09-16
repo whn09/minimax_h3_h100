@@ -330,9 +330,14 @@ service cannot, so the size of the thing matters:
   three times the render. The slow direction is the one allocating pageable destinations,
   which is the same 1.7 GB/s patch 3 measured on the DiT's `to("cpu")`, and for the same
   reason: a state dict is thousands of separate unpinned tensors.
-* **Sharding is.** 8-way, the needed weights are **6.1 GiB per rank**, which sits next to the
-  45.2 GiB fp8 DiT at 51.3 of 79.2 GiB — 28 GiB of headroom per card, so the conditioner
-  stays resident and the request pays only the 135 ms forward. Nothing has to move.
+* **Sharding is.** 8-way, the needed weights are **6.1 GiB per rank**. That is not enough on
+  its own to make it resident, though: the 480p pipeline already peaks at **63.1 of the
+  65.3 GiB** a rank can give PyTorch (DiT 45.24 + video VAE 9.70 + audio VAE 0.56 +
+  activations), so there are only ~2 GiB spare and the shard needs 6.1. The cheapest fit is
+  to keep the shard in **pinned** host memory and upload it per request — 6.1 GiB at the
+  measured 10.08 GiB/s is 0.61 s, so ~0.8 s including the forward, **+7 %** — because the
+  expensive direction (the 1.65 GiB/s trip *to* the host) then happens once at startup
+  instead of every request. Derived, not measured; RESULTS.md gives the alternatives.
 
 Measured by `scripts/text_encoder_bench.py`; the table is in RESULTS.md.
 
@@ -471,6 +476,7 @@ they are the dominant term, not the sampler.
 | `configs/8nfe_2k_ulysses_h100.yaml` | 2560x1440 — a lower bound on H3-Regenerate-2K, which is not open-sourced |
 | `patches/` | the twelve patches above + `BASE.txt` (the upstream commit they apply to) |
 | `RESULTS.md` | the measured numbers |
+| `RUNBOOK.md` | how to bring a fresh box back to the state these numbers were measured in, and the queue of arms still worth running — each with what it would settle and what to expect |
 | `samples/` | the renders the numbers came from, video+audio muxed, all t2va from `prompts/example_2.pt`. The current best config, with all ten patches: **`n_480p_seg4.mp4`** (864x480, 345 f), **`n_480p_362f_seg4.mp4`** (the literal 15 s, 362 f) and **`p_768p_free.mp4`** (1344x768, 345 f) — all `clipinfo.py`-checked. The patch-11/12 renders (`r2_768p_keep_yuv`, `s2_480p_rep10`, `s5_480p_362f_rep10`, `s4_768p_rep10`) are **not** in the repo — they are the same prompt at the same canvas as the clips above and the patches change no pixels, which `scripts/decode_parity.py` asserts bit-exactly, so the mp4s carry no information the tracked ones do not. Earlier renders kept for comparison: `vdn_*` (pre-patch-7 swscale mux), `z_*` (patches 1–6), `n_768p_seg4` (768p with patch 3's host offload, before patch 10), `y_768p_345f_r5` (the 768p split winner), `f_*` (fl2va) |
 
 ## Traps found on this box
@@ -478,8 +484,14 @@ they are the dominant term, not the sampler.
 1. **`torchvision` must come from the cu129 index too.** `pyproject.toml` pins
    `torchvision==0.28.0` but deliberately does not pin torch, so `uv pip install -e .`
    takes torchvision from PyPI — which is cu130 — and every `import transformers` then
-   dies with `PyTorch and torchvision were compiled with different CUDA major versions`.
+   dies with `PyTorch and torchvision were compiled with different CUDA major versions` —
+   surfacing, unhelpfully, as `Could not import module 'BloomPreTrainedModel'`.
    `scripts/h100_bringup.sh` installs it explicitly from `download.pytorch.org/whl/cu129`.
+   It did **not** until the box was rebuilt, and the repair is not the obvious one:
+   `uv pip install torchvision==0.28.0 --index-url .../cu129` is a no-op, because `0.28.0`
+   already satisfies `0.28.0` and uv never fetches `0.28.0+cu129`. It needs
+   `--reinstall-package torchvision`, or — better — both wheels named from that index before
+   `-e .` ever resolves. Check with `torchvision.__version__`: it must read `+cu129`.
 2. **Do not use the DLAMI's `/opt/pytorch`.** It is python 3.13 + torch 2.13.0+cu130;
    the repo requires `>=3.12,<3.13` and the cu129 wheels.
 3. **Everything goes on `/opt/dlami/nvme`** (27 TB). `/` is 484 GB and the checkpoint

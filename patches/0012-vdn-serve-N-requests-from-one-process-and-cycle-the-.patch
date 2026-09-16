@@ -1,4 +1,4 @@
-From 2221979cc64f5c5c6aec3414b2709897a29b75b3 Mon Sep 17 00:00:00 2001
+From 1ca6f26cbea0ca6b06f19f4fd56d5c89c7f1710b Mon Sep 17 00:00:00 2001
 From: whn09 <wanghenan09@gmail.com>
 Date: Tue, 15 Sep 2026 18:57:34 +0800
 Subject: [PATCH 12/12] vdn: serve N requests from one process, and cycle the
@@ -65,15 +65,15 @@ requests, which controls for the first and not for the second.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ---
- src/config/inference.py        |  47 ++++
+ src/config/inference.py        |  51 +++++
  src/inference/infer_ulysses.py | 388 ++++++++++++++++++++++-----------
- 2 files changed, 307 insertions(+), 128 deletions(-)
+ 2 files changed, 311 insertions(+), 128 deletions(-)
 
 diff --git a/src/config/inference.py b/src/config/inference.py
-index 57f4b3e..df44ec9 100644
+index 57f4b3e..8645563 100644
 --- a/src/config/inference.py
 +++ b/src/config/inference.py
-@@ -97,6 +97,24 @@ class ParallelConfig:
+@@ -97,6 +97,28 @@ class ParallelConfig:
      # parallel_vae_decode (there is nothing to stream out of vae.decode) and
      # render.gpu_color_convert (it produces planes, not RGB).
      stream_yuv_assembly: bool = False
@@ -90,15 +90,19 @@ index 57f4b3e..df44ec9 100644
 +    #           per request and is the only thing at 768p that makes the DiT's residency real.
 +    #
 +    # Which side to cycle is settled by measurement, not preference: the video VAE is 9.70 GiB
-+    # per rank (audio 0.564, rank 0 only) against the DiT's 45.24, and at 768p the denoise needs
-+    # ~16.9 GiB of activations on top of whatever is resident. 45.24 + 9.70 + 13.6 non-PyTorch
-+    # leaves 10.6 GiB where 16.9 is needed, so one of the two has to go every request -- and
-+    # cycling the decoders moves 4.7x less data than cycling the weights.
++    # per rank (audio 0.564, rank 0 only) against the DiT's 45.24. The card gives PyTorch
++    # 65.26 GiB (79.18 total minus a measured 13.92 non-PyTorch floor), keeping both leaves
++    # 65.26 - 54.94 = 10.32 GiB, and the 768p denoise's activations peak at 10.3-10.6 on a
++    # linear-branch rank -- so it misses by a few hundred MiB, which is why one request passes
++    # and the second does not. Cycling the decoders moves 4.7x less data than cycling the
++    # weights. (The decode's own activations are the smaller of the two stages, ~8.1 GiB, once
++    # stream_yuv_assembly and the per-slot gather are on; before them the decode was the
++    # binding stage instead.)
 +    vae_after_decode: str = "keep"
  
  
  @dataclass
-@@ -125,6 +143,23 @@ class RenderConfig:
+@@ -125,6 +147,23 @@ class RenderConfig:
      num_steps: int = 50
      warmup_steps: int = 0                # NFE run and discarded first: 2 for any timing
                                           # (compile + the 2nd-timestep re-specialisation)
@@ -122,7 +126,7 @@ index 57f4b3e..df44ec9 100644
      seed: int = 42
      device: str = "cuda:0"
      video_shift: float = 12.0            # scheduler shifts; a distilled adapter is only
-@@ -203,6 +238,18 @@ def validate_parallel(cfg) -> None:
+@@ -203,6 +242,18 @@ def validate_parallel(cfg) -> None:
      world-size bound (softmax_ranks < WORLD_SIZE) is checked at install."""
      if cfg.parallel.softmax_ranks < 0:
          raise ValueError("parallel.softmax_ranks must be >= 0 (0 = standard Ulysses)")

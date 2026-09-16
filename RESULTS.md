@@ -154,9 +154,9 @@ property of the canvas, see the two sweeps below):
 
 **31.5 % of the gap is memory cycling, not arithmetic.** 480p holds the DiT (45.24 GiB per
 rank), both decoders (9.70 + 0.564) and a full-length decode's activations simultaneously and
-never moves anything; 768p cannot — 45.24 + 9.70 + a ~13.6 GiB non-PyTorch floor leaves 10.6
-where the denoise needs ~16.9 — so it drops the decoders after every decode and reloads them
-before the next. Take that away and 768p is **26.35 s (2.30x)**; give it the pinned host copy
+never moves anything; 768p cannot — 45.24 + 9.70 against a 65.26 GiB PyTorch ceiling leaves
+10.32 where the 768p denoise's activations peak at 10.3–10.6 — so it drops the decoders after
+every decode and reloads them before the next. Take that away and 768p is **26.35 s (2.30x)**; give it the pinned host copy
 that is designed but not built, ~1.5 s instead of 6.86, and it is **27.85 s (2.43x)**.
 
 Both of those bracket the **2.406x row ratio**. So the honest statement is: *the model scales
@@ -493,6 +493,27 @@ every time and never lets two requests share a resident model, which is the enti
   10      8.73      1.55      1.22    0.00    11.51       58.0      63.1
 ```
 
+This arm is the one thing here that has been **reproduced on a rebuilt machine.** The box was
+stopped, which wipes the ephemeral NVMe and with it python, the venv, the repo and all 82 GB of
+weights; it was brought back up from `scripts/h100_bringup.sh` on a fresh instance store with a
+newer driver (595.91.07) and re-run:
+
+```
+ req   denoise    vae x8   dec+enc   dload    total  alloc_end  resv_end     <- arm f1, rebuilt box
+   1      8.85      1.95      1.71    3.63    16.14       57.4      62.3
+   2      8.84      1.56      1.16    0.00    11.56       57.4      62.3
+   ...
+  10      8.73      1.56      1.16    0.00    11.46       57.4      62.6
+steady (2-10)  total 11.44 +/- 0.052   denoise 8.71 +/- 0.054   vae 1.56 +/- 0.003
+```
+
+**11.44 ± 0.052 against 11.45 ± 0.040** — a 0.06 % difference on the mean, from a clean
+install. The stage breakdown lands within a few milliseconds too (denoise 8.71 vs 8.70, video
+VAE 1.56 vs 1.57, tail 1.17 vs 1.18). Two things did move, neither of them the headline: the
+decode peak came out slightly *lower* (61.7 alloc / **62.3 reserved** against 62.5 / 62.9),
+and request 1 was 1.0 s faster because the decoder load off a fresh instance store was 3.63 s
+rather than 4.81 s. Per-request reserved growth reproduced as well: +0.273 GiB against +0.254.
+
 | 480p steady, requests 2–10 | mean | sd | min | max |
 |---|---:|---:|---:|---:|
 | **request total** | **11.45** | **0.040** | 11.40 | 11.51 |
@@ -573,18 +594,39 @@ the ordering that made the one-shot run work: **the decoders are loaded after th
 denoise, so that denoise is the only one that never coexists with them.** Every subsequent
 request denoises with the video VAE already resident on all eight ranks. Measured directly:
 
-| resident per rank at 768p | GiB |
+The OOM message is itself the accounting, so it is worth reading digit by digit rather than
+paraphrasing. Rank 7 reported a **79.18 GiB** card with **78.74 GiB in use by this process**,
+of which **64.74 GiB allocated by PyTorch** and 82.18 MiB reserved-but-unallocated, and
+**439.88 MiB free** against a 444.00 MiB request:
+
+| per rank at 768p, a **linear**-branch rank | GiB |
 |---|---:|
+| card capacity | 79.18 |
+| non-PyTorch floor (78.74 in use − 64.82 PyTorch reserved) | **13.92** |
+| ⇒ ceiling available to PyTorch | **65.26** |
 | DiT (fp8) | 45.24 |
 | video VAE — **every** rank, because the decode is data-parallel | **9.70** |
-| audio VAE — rank 0 only | 0.56 |
-| non-PyTorch floor | ~13.6 |
-| subtotal, DiT + video VAE + floor | **68.5** |
-| left for the denoise | 10.6 |
-| what the denoise actually needs | **~16.9** |
+| ⇒ resident, both kept | **54.94** |
+| ⇒ left for the denoise | **10.32** |
+| denoise activation peak (64.74 allocated + 444 MiB; rank 5: 65.06 + 468 MiB) | **10.3–10.6** |
 
-Short by ~6 GiB. Not a margin that a smaller buffer somewhere recovers — at 768p one of the
-two big residents has to leave on every request, and the choice is settled by size:
+(The audio VAE's 0.56 GiB lands on rank 0 only, and rank 0 is a softmax rank, so it is not
+part of the rank that fails.)
+
+**It is short by a few hundred MiB, not by gigabytes** — and that is exactly why it took a
+second request to find. The margin is a rounding error on an 80 GiB card: rank 7 was refused
+444 MiB with 439.88 MiB free, i.e. it missed by about 4 MiB of free space, and rank 5 wanted
+468 with 119.88. An earlier version of this section put the denoise's demand at ~16.9 GiB,
+which was wrong: **~17–18 GiB is the *decode*'s peak above the DiT, not the denoise's.** The
+decode reserves 63.59 GiB peak, and 63.59 − 45.24 = 18.35 is the video VAE (9.70) plus the
+audio VAE (0.56) plus ~8.1 GiB of decode activations. So the two stages want **~10.4 GiB
+(denoise)** and **~8.1 GiB (decode)** of transient memory respectively, and after patches 11
+and 12 the denoise is the tighter of the two by about 2 GiB. Before patch 11 it was the other
+way round — the full-canvas assembly buffers put the decode ~102 MiB over — which is what
+patch 11 removed and what moved the binding constraint onto the denoise.
+
+The conclusion does not move: at 768p one of the two big residents has to leave on every
+request, and the choice is settled by size:
 
 | cycle this every request | data moved per rank | restore from a pinned host copy |
 |---|---:|---:|
@@ -715,9 +757,9 @@ that made a one-shot 768p render finish.
 The correction the repeat runs forced on the paragraph above: it used to end "and then 768p
 also runs `keep` and drops to ~26.7 s with no reload cost on any request", and the second half
 of that was wrong. `keep` on *both* sides survives exactly one request. Something has to cycle
-at 768p — the arithmetic is 45.24 + 9.70 + 13.6 = 68.5 GiB resident against a denoise that
-wants ~16.9 GiB of activations in the 10.6 that are left — and the only real choice is which
-side. 768p steady is 33.21 s, not 26.7.
+at 768p — the arithmetic is a 65.26 GiB PyTorch ceiling (79.18 card − 13.92 non-PyTorch floor)
+against 45.24 + 9.70 = 54.94 resident and a denoise whose activations peak at 10.3–10.6 in the
+10.32 that are left — and the only real choice is which side. 768p steady is 33.21 s, not 26.7.
 
 `scripts/reload_bench.py` takes no arguments beyond the config and prints the JSON above, so
 the numbers can be re-derived on other hardware — the pinned restore rate is a PCIe property
@@ -933,9 +975,41 @@ Three things fall out of that:
    allocates pageable destinations is the slow one. Keeping the conditioner permanently in
    host memory and only paying the 7.6 s upload would be tolerable-ish; paying to evict it
    every request is not.
-3. **The 8-way shard is the answer, and it needs no offloading at all.** 6.1 GiB per rank
-   next to the fp8 DiT leaves 28 GiB of headroom on each card, so the conditioner can simply
-   stay resident and the request path pays only the 135 ms forward.
+3. **The 8-way shard is the answer — but "leave it resident" needs the whole card counted,
+   not just the DiT.** An earlier version of this line said 6.1 GiB per rank next to the
+   45.2 GiB fp8 DiT is 51.3 of 79.2 and therefore "28 GiB of headroom, so the conditioner
+   just stays resident". That subtraction leaves out the two decoders and both stages'
+   activations, and once those are in it does not hold:
+
+   | 480p, per rank, from the ten-request run | GiB |
+   |---|---:|
+   | ceiling available to PyTorch (79.18 − 13.92 non-PyTorch) | 65.26 |
+   | DiT 45.24 + video VAE 9.70 + audio VAE 0.56 | 55.50 |
+   | measured peak reserved, request 2 → request 10 | **62.89 → 63.14** |
+   | ⇒ spare under the ceiling at the peak | **~2.1** |
+   | conditioner shard wanted | **6.1** |
+
+   So a permanently resident conditioner does **not** fit at 480p as the pipeline stands —
+   it is short by about 4 GiB at the decode peak, and still short by ~0.6 GiB at the denoise
+   (55.50 + ~4.3 GiB of 480p denoise activations, the 768p figure divided by the 2.406x row
+   ratio). Three ways out, in order of measured cost:
+
+   * **Cycle the conditioner from a pinned host shard.** 6.1 GiB per rank at the measured
+     10.08 GiB/s pinned H2D is **0.61 s** up, 135 ms of forward, then free — call it ~0.8 s
+     per request, **+7 %** on 11.45 s, and 48.9 GiB of page-locked host memory total. This
+     is the cheapest thing that fits, and unlike the DiT round trip the expensive direction
+     never happens: the host copy is made once at startup and kept.
+   * **Keep it resident and cycle the decoders instead** (`vae_after_decode: free` at 480p
+     too). Measured at 768p that is 5.05 s of load plus 1.82 s of release; the video VAE is
+     the same 9.70 GiB at either canvas, so 480p would go 11.45 → ~18 s. Strictly worse.
+   * **Don't co-locate it.** The conditioner's output is 1,300 × 5,120 bf16 = **13 MB**, and
+     it runs for 135 ms per 11,450. A separate conditioner process — on its own card, or a
+     ninth GPU, or one held warm for many renderers — removes the question entirely, at the
+     cost of no longer being an eight-GPU answer.
+
+   The first option is derived, not measured: nothing in this repo shards Qwen3-VL yet, so
+   0.61 s is the pinned transfer rate applied to 6.1 GiB and does not include a
+   tensor-parallel forward's own activations (small at 1,300 tokens, but not zero).
 
 One number to read sceptically: the 7.51 GiB/s "NVMe → GPU" load is almost certainly served
 from the page cache — the box has 2 TiB of RAM and the checkpoint had just been downloaded —
