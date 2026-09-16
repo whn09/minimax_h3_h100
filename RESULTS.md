@@ -119,6 +119,49 @@ Three things that were open questions before this ran, now answered:
   8x H200, denoise only. This is **19.04 s end to end, including text encoding and mux**, one
   hardware generation down.
 
+### fl2va works on the same server; ref2va is refused, and correctly
+
+`scripts/sglang_cond.py`, same server, three measured requests per row after one discarded
+warmup, keyframes cut from an existing render at the target canvas so nothing measures a resize:
+
+| 345 f | task | E2E median | server inference | peak/GPU | vs t2va |
+|---|---|---:|---:|---:|---:|
+| **480p** | t2va | 7.85 s | 6.82 s | 54,682 MB | — |
+| | fl2va, first+last | 8.88 s | 7.85 s | 55,162 MB | **+13.1 %** |
+| | fl2va, first only | 9.07 s | 7.81 s | 54,804 MB | +15.5 % E2E, +14.5 % inference |
+| **768p** | t2va | 18.11 s | 16.33 s | 62,022 MB | — |
+| | fl2va, first+last | 20.96 s | 19.09 s | 62,364 MB | **+15.7 %** |
+| | fl2va, first only | 19.94 s | 18.09 s | 62,382 MB | +10.1 % |
+
+**No restart, no second checkpoint, and no meaningful memory** — fl2va costs 340–480 MB/GPU over
+t2va, which is the two keyframes and their latents. The condition wire format is
+`{"role":"keyframe","type":"image","uri":<path>,"frame_index":0|-1}`; `frame_index` accepts `0`,
+`-1`, or both, so first-only, last-only and first+last are all one task name.
+
+This is **more than the +8.9 % this file measured for fl2va on the reference stack**, and the
+difference is the interesting part: that figure was denoise-only against an offline prompt cache
+with the keyframes already latent, while these requests run the visual tokenizer inside the
+request (`visual_tokenizer_encode=True` on the fl2va condition rule). At 768p the second keyframe
+costs a further 1.0 s of inference (18.09 → 19.09) and at 480p it costs nothing measurable
+(7.81 vs 7.85), so the per-image encode is what scales with canvas, not the count.
+
+**The keyframes are honoured, not merely accepted.** Frame 0 of an fl2va render against its own
+input keyframe: **31.6 dB** PSNR, against the *other* keyframe 12.7 dB; last frame 27.6 dB against
+12.2 dB. Not pixel-identical, which is the VAE round-trip plus h264, and it is 15 dB clear of the
+wrong-keyframe control either way.
+
+**ref2va is not available and should not be faked.** `MINIMAX_H3_TASK_PARTITIONS` maps t2va and
+fl2va onto the `fl2va` partition and ref2va onto a `ref2va` partition, and vdn-minimax-h3 ships
+only the former. The server says so itself:
+
+> VDN-H3 serves t2va and fl2va; ref2va was not trained (got task='ref2va'). Use
+> MiniMaxAI/MiniMax-H3 --model-variant ref2va for that task.
+
+That agrees with this repo's own reading of the checkpoint, and it is a **training** limit, not a
+runtime one — no flag, patch or framework changes it. ref2va means the base MiniMax-H3 weights,
+which have no 8-step distill, so it is a different and much slower model, not this one with an
+extra argument.
+
 The single change that made 768p fit was not an offload flag — it was
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The first 480p attempt OOM'd during warmup
 with **51.89 GiB allocated and 18.70 GiB reserved-but-unallocated**: online fp8 quantization frees
