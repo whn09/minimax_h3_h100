@@ -147,6 +147,18 @@ and the tree it produces is byte-identical to the one the 11.44 s measurement ca
 
 ## 3. The queue
 
+> **A is done, and it won: 480p 8.02 s median / 768p 19.04 s median, ten requests each, nothing
+> offloaded, peak 62.1 GB/GPU at 768p** (2026-09-16, sglang main `3f8eb35e`). That is 1.43× and
+> 1.74× the reference stack, with text encoding inside SGLang's number and outside the reference
+> stack's. **A0 and A1 below are still the instructions to reproduce it**, with two additions the
+> run needed and this file did not predict: `ffmpeg`/`ffprobe` must exist before startup, and
+> `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is what makes it fit — the offload ladder in
+> A1 was never used. `scripts/sglang_arm.sh` carries all five fixes with the symptom each produced.
+> Numbers and the full account: `RESULTS.md`, "SGLang Diffusion is faster than all of it".
+>
+> This makes **B1–B5 optional**, and B4 (pricing a conditioner in the request path) moot: the
+> conditioner is resident in the winning configuration and its cost is already inside the 8.02 s.
+
 **Arm A comes first, and it may make most of B obsolete.** SGLang Diffusion now serves this
 exact checkpoint, and on 8× B200 it beats the stack measured here by 1.43–1.60× at the same GPU
 count. Run A1 before spending time on B1–B5.

@@ -46,6 +46,19 @@ if [ -n "${VIRTUAL_ENV:-}" ]; then
   exit 2
 fi
 
+step "ffmpeg"
+# H3's pipeline validates output delivery through ffmpeg/ffprobe and raises at startup if
+# either is missing -- checked before the 250 GB download, not after. On this box apt was
+# broken first: /etc/apt/sources.list.d/cuda-ubuntu2604-x86_64.list serves a malformed
+# Packages file ("Encountered a section with no Package: header"), and no amount of clearing
+# /var/lib/apt/lists fixes it because apt re-fetches the same bad file. Moving that one
+# source out of the way and re-running update is what worked; nothing here installs CUDA
+# from apt anyway (the venv carries its own).
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  sudo -n apt-get update -qq && sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
+  command -v ffprobe >/dev/null 2>&1 || { echo "install ffmpeg+ffprobe first; see the apt note above"; exit 2; }
+fi
+
 step "uv"
 command -v uv >/dev/null 2>&1 || \
   curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=$HOME/.local/bin sh
@@ -69,6 +82,14 @@ python -V | grep -q '3\.12' || { echo "venv is not python 3.12; see the 3.13 not
 # the only source of it. No CUDA build: sglang-kernel==0.4.7 ships a cp310-abi3 x86_64 wheel
 # that installs on 3.12, and the VDN delta-factors kernel JITs through apache-tvm-ffi with
 # nvidia-cuda-nvcc as a pip dependency, so the missing /usr/local/cuda does not matter.
+#
+# SGLANG_BUILD_RUST_EXTS=none is not optional. main's setup.py shells out to `cargo` just to
+# *discover* the Rust extension modules under rust/ (the LLM router), so with no toolchain the
+# build fails in get_requires_for_build_wheel, before any Python is compiled. The escape hatch
+# is the error message's own suggestion; nothing in the diffusion path uses those modules.
+# Installing rustup instead would work and would also spend ten minutes building a router this
+# never calls.
+export SGLANG_BUILD_RUST_EXTS=none
 uv pip install -q --prerelease=allow \
   "sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git#subdirectory=python"
 uv pip install -q 'huggingface_hub[hf_transfer]'
@@ -87,11 +108,14 @@ else
   exit 2
 fi
 # deep_gemm asserts on import if CUDA_HOME is unset (its find_cuda_home has no fallback),
-# and this box has no /usr/local/cuda. Point it at the pip CUDA the venv already carries.
+# and this box has no /usr/local/cuda. Point it at the pip CUDA the venv already carries --
+# found by locating bin/nvcc, since the wheel layout is nvidia/cu13/ here. sglang_arm.sh does
+# the same thing; this only reports it.
 python - <<'PY'
-import os, sysconfig, pathlib
-nv = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia" / "cuda_nvcc"
-print(f"CUDA_HOME={nv}" if nv.exists() else "CUDA_HOME: no pip nvcc found, set it by hand")
+import pathlib, sysconfig
+nv = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia"
+hit = next((p.parent.parent for p in sorted(nv.glob("*/bin/nvcc"))), None)
+print(f"CUDA_HOME={hit}" if hit else "CUDA_HOME: no pip nvcc found, set it by hand")
 PY
 
 step "weights"

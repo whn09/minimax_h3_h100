@@ -23,12 +23,19 @@ The question: **how long does one 480P 15-second clip take on a `p5.48xlarge` (8
 > to 8 cards against 56–64 %), with the two stacks within 4 % on a **single** card — so it is a
 > scaling result, not a Blackwell-precision one, and it ought to carry here.
 >
-> **No H100 VDN number exists on either side of that comparison.** The cookbook's VDN tables are
-> B200 and RTX PRO 6000; its H100 rows are 4-card *base* H3. Its 8× B200 Ulysses8 peak of
-> 79,972 MB/GPU is above what an 80 GB H100 gives PyTorch here (65.26 GiB), so whether it even
-> fits at 768p is open. **`RUNBOOK.md` arm A is the measurement**, and it runs before anything
-> else in the queue. If it wins, the conclusion is that the twelve patches below were the right
-> way to learn *where the time goes* and the wrong way to *serve* it.
+> **No H100 VDN number existed on either side of that comparison. Now one does — it is measured
+> here, and SGLang wins.** On these eight H100s, ten requests each at 345 frames:
+> **480p 8.02 s median** against this repo's 11.45 (**1.43x**) and **768p 19.04 s median** against
+> 33.21 (**1.74x**), with text encoding *inside* SGLang's number and *outside* this repo's. The
+> 768p memory worry was unfounded: peak 62.1 GB/GPU with the DiT, both VAEs and the conditioner
+> all resident, so none of the offload ladder was needed — but
+> `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` was, because online fp8 quantization of a
+> 65.65 GiB bf16 checkpoint fragments the allocator by 18.7 GiB. Details, and the five unrelated
+> errors between a fresh box and a working server, in
+> [`RESULTS.md`](RESULTS.md#sglang-diffusion-is-faster-than-all-of-it-on-the-same-eight-cards).
+>
+> So the conclusion the correction was reaching for is the right one: the twelve patches below
+> were the right way to learn *where the time goes* and the wrong way to *serve* it.
 
 The stack measured in the rest of this document is **not** the SGLang path used in
 `../minimax_h3_h200/` and `../minimax_h3_g7e/`. Those serve **stock MiniMax-H3** plus the
@@ -46,7 +53,7 @@ fp8 kernels and Ulysses sequence parallelism:
 | **VDN Ulysses (used here)** | `src/inference/infer_ulysses.py` | the tuned kernels + fp8 + 8-GPU branch-parallel Ulysses. Upstream's published numbers are this path |
 | VDN single GPU | `src/inference/infer.py` | same kernels, one GPU |
 | plain diffusers | `src/inference/infer_diffusers.py` | `ModularPipeline`, one GPU, no tuned kernels — a "does it render" entrypoint |
-| **SGLang Diffusion** | `sglang serve --attention-backend hybrid_window_attn_h3` | an HTTP server, text encoding folded across idle ranks, and 1.43–1.60x over this table's stack **on 8x B200**. Unmeasured on H100 — `RUNBOOK.md` arm A |
+| **SGLang Diffusion (fastest)** | `sglang serve --attention-backend hybrid_window_attn_h3` | an HTTP server, resident conditioner, and **8.02 s at 480p / 19.04 s at 768p measured on these 8x H100** — 1.43x / 1.74x over this table's stack, text encoding included. `scripts/sglang_arm.sh` |
 
 The model is **`ckpts/stage-dmd-step-250`** = VDN-H3-8-step, the Stage-DMD distilled
 `turbo` adapter. That is the fastest tier upstream ships and the one behind their headline

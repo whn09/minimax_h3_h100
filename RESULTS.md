@@ -8,6 +8,13 @@ by the run itself; `scripts/summarize.py` regenerates the tables from those reco
 
 ## The answer
 
+**8.02 s** for 480P/345 f and **19.04 s** for 768P/345 f, post-warmup end to end on 8x H100, both
+served by **SGLang Diffusion** — measured over ten requests each, text encoding included, nothing
+offloaded. That is 1.43x and 1.74x better than the hand-patched stack the rest of this file
+measures, and it is the answer to "how fast can 8x H100 do this". See
+"SGLang Diffusion is faster than all of it" below; the numbers immediately following are the
+patched-diffusers stack, which is still what everything after that section is about.
+
 **480P, 8 NFE, 8x H100, branch-parallel Ulysses at 3 softmax + 5 linear ranks, video VAE
 data-parallel over all eight ranks.** Both reachable lengths near 15 s, since they cost
 almost the same, and every per-request figure is a ten-request measurement:
@@ -68,6 +75,65 @@ numbers measured at **different branch splits**:
   tracks the +4.9 % row count. Clip length is linear here; nothing about 362 is special.
 * The H100↔H200 gap was reported as 1.18x from H100 `r0` against H200 `r6`. At the same
   split it is **1.13x**. See the 768p section.
+
+## SGLang Diffusion is faster than all of it, on the same eight cards
+
+Measured 2026-09-16, after the box was rebuilt. `sglang` main at `3f8eb35e`
+(`0.5.6.post3.dev10594+g3f8eb35ea`, PyPI's 0.5.19 has base H3 but no VDN), `OpenVDN/vdn-minimax-h3`
+served over HTTP, `--num-gpus 8 --ulysses-degree 8 --quantization fp8 --attention-backend
+hybrid_window_attn_h3 --encoder-parallel auto --performance-mode speed`, ten requests at
+`--max-concurrency 1` after one warmup request, `--dataset vbench`. Both canvases at 345 frames:
+
+| 345 f / 14.375 s | this repo's stack | SGLang, same 8x H100 | ratio |
+|---|---:|---:|---:|
+| **480p** (864x480) steady E2E | 11.45 | **8.02** median (8.42 mean, 9.02 P99) | **1.43x** |
+| **768p** (1344x768) steady E2E | 33.21 | **19.04** median (18.94 mean, 19.96 P99) | **1.74x** |
+| 480p peak/GPU | 63.14 GiB reserved | 54.7 GB | |
+| 768p peak/GPU | (DiT offloaded) | 62.1 GB, **nothing offloaded** | |
+
+**And SGLang is carrying a stage this file's numbers do not run at all.** Every latency above in
+the left column excludes text encoding, because the reference stack `torch.load`s an offline
+prompt cache (see "Text encoding is not in any of these numbers"). SGLang's includes it: the
+Qwen3-VL conditioner is resident and folded across ranks, and each request encodes its own vbench
+prompt. So the honest reading of 1.43x / 1.74x is *at least* that.
+
+Server-side `inference_time_s` from the response object, against client-side latency, splits the
+wall clock: 480p **6.94–7.15 s** of inference inside an 8.02 s request; 768p **16.31–17.36 s**
+inside 19.04 s. The remaining ~1 s / ~2 s is mux, file write, and the benchmark client's polling
+granularity — it is real latency for an HTTP client, and it is not denoise.
+
+Three things that were open questions before this ran, now answered:
+
+* **768p fits with everything resident.** The prediction here was that it would not: the
+  cookbook's 8x B200 run peaked at 79,972 MB/GPU, above what an H100 gives PyTorch, and the
+  RUNBOOK laid out a three-rung fallback ladder (`--performance-mode auto`, then offload the text
+  encoder, then the DiT at 14 resident layers). None of it was needed. Peak was 62.1 GB with the
+  DiT, both VAEs and the conditioner all on-card. This is the same 768p that cost this repo's
+  stack a `to_empty(device="meta")` dance and a 4.8 s reload per process.
+* **`--quantization fp8` really does halve the DiT, online.** The checkpoint is bf16 —
+  1426 BF16 tensors + 13 F32, **65.65 GiB** read straight off the safetensors headers — and
+  H100 keeps per-channel fp8 rather than the SM100+ mxfp8 path. So this is 35B params of DiT
+  (video tower + audio tower + bridge) quantized after load, leaving 29.17 GB free on an 80 GB
+  card once all six components are up.
+* **The 8x H200 readme number is matched on H100.** Upstream publishes 18.3 s for 768p/14.4 s on
+  8x H200, denoise only. This is **19.04 s end to end, including text encoding and mux**, one
+  hardware generation down.
+
+The single change that made 768p fit was not an offload flag — it was
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The first 480p attempt OOM'd during warmup
+with **51.89 GiB allocated and 18.70 GiB reserved-but-unallocated**: online fp8 quantization frees
+65 GiB of bf16 blocks that the fp8 weights cannot reuse, and the allocator kept the holes. The fit
+was never 12 GiB short, it was fragmented by that much. Cost in latency: none.
+
+Everything the arm had to get past is in `scripts/sglang_arm.sh`, each with the symptom it
+produced, because none of the five errors named its own cause: missing `ffmpeg`/`ffprobe` (surfaced
+as `EOFError` from a dead worker pipe), `-lcudart` unresolvable because the pip CUDA wheel ships
+`lib/libcudart.so.13` and the JIT links `-L$CUDA_HOME/lib64 -lcudart`, deep_ep asserting
+"Duplicate NCCL runtime" on AWS's OFI plugin and taking the diffusion worker down through an
+`except ImportError` that cannot catch an `AssertionError` (surfaced as
+`Model architectures ['MiniMaxH3Qwen3VLEncoder'] failed to be inspected`), `seconds` typed as an
+int against a 14.375 s clip (surfaced as ten instant 400s reported by the benchmark as `0/10` in
+0.01 s), and the allocator fragmentation above.
 
 ## What a finished second costs
 

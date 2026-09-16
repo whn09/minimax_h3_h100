@@ -31,12 +31,73 @@ mode=${1:?serve|bench|stop}
 source "$ROOT/.venv/bin/activate"
 # This box has no /usr/local/cuda and deep_gemm's find_cuda_home asserts rather than falling
 # back, which kills `import sglang.multimodal_gen` before any of the above matters. The venv
-# carries nvidia-cuda-nvcc as a pip dependency (the VDN delta-factors kernel JITs against it
-# through apache-tvm-ffi), so point at that.
-export CUDA_HOME=${CUDA_HOME:-$(python -c "import sysconfig,pathlib;print(pathlib.Path(sysconfig.get_paths()['purelib'])/'nvidia'/'cuda_nvcc')")}
+# carries a full pip CUDA (the VDN delta-factors kernel JITs against nvcc through
+# apache-tvm-ffi), so point at that -- and find it by looking for bin/nvcc rather than by
+# guessing the directory, because it is nvidia/cu13/, not the per-component nvidia/cuda_nvcc/
+# layout the older wheels used, and a CUDA_HOME that merely exists satisfies deep_gemm's
+# assert while leaving the JIT to fail later with something far less obvious.
+export CUDA_HOME=${CUDA_HOME:-$(python - <<'PY'
+import pathlib, sysconfig
+nv = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia"
+print(next((str(p.parent.parent) for p in sorted(nv.glob("*/bin/nvcc"))), ""))
+PY
+)}
+[ -x "$CUDA_HOME/bin/nvcc" ] || echo "warning: no nvcc under CUDA_HOME=$CUDA_HOME; the VDN delta-factors JIT will fail"
+
+# H3's pipeline hard-requires both binaries and raises before it touches a GPU -- every rank
+# dies with "missing executables: ffmpeg, ffprobe" and the parent shows only an EOFError from
+# the pipe, which reads like a crash rather than a missing package. Checked here so the message
+# is the message. `apt-get install ffmpeg`; on this box that first needed the broken
+# developer.download.nvidia.com cuda-ubuntu2604 source moved out of sources.list.d.
+for b in ffmpeg ffprobe; do
+  command -v "$b" >/dev/null 2>&1 || { echo "missing $b -- sglang H3 refuses to start without it"; exit 2; }
+done
+
+# The JIT link line is `c++ ... -L$CUDA_HOME/lib64 -lcudart`, which assumes a system CUDA
+# install. The pip wheel ships neither: the directory is lib/, not lib64/, and it carries
+# only the runtime soname libcudart.so.13, not the libcudart.so a -l flag resolves. nvcc
+# compiles fine and then ld says "cannot find -lcudart", every rank dies, and the parent
+# reports EOFError. Two symlinks inside the venv close it -- cheaper than a system CUDA
+# install, and scoped to this venv so the reference stack is untouched.
+if [ -d "$CUDA_HOME/lib" ]; then
+  [ -e "$CUDA_HOME/lib64" ] || ln -sfn lib "$CUDA_HOME/lib64"
+  for so in "$CUDA_HOME"/lib/lib*.so.[0-9]*; do
+    base=${so%%.so.*}.so
+    [ -e "$base" ] || ln -sfn "$(basename "$so")" "$base"
+  done
+fi
+
+# NCCL_NET_PLUGIN=none, on an AWS box specifically. The DLAMI puts the EFA/OFI plugin on the
+# system loader path (/etc/ld.so.conf.d/100_ofinccl.conf), so NCCL dlopens
+# /opt/amazon/ofi-nccl/lib/libnccl-net.so during comm init. deep_ep's check_nccl_so() then
+# scans /proc/self/maps for anything matching "libnccl", sees that plugin next to the venv's
+# libnccl.so.2, and asserts "Duplicate NCCL runtime found" -- it is a plugin, not a second
+# runtime, so the check is simply wrong here. It is fatal because sglang guards the deep_ep
+# import with `except ImportError` and this is an AssertionError, so the MoE token dispatcher
+# takes down a diffusion worker: the visible symptom is
+# "Model architectures ['MiniMaxH3Qwen3VLEncoder'] failed to be inspected", two import layers
+# away from the cause. Nothing here is multi-node; the plugin buys nothing on eight NVLinked
+# cards in one box. Drop this line before running anything across nodes.
+export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
+
+# expandable_segments, because --quantization fp8 here is ONLINE quantization: the loader
+# reads the 65.65 GiB bf16 checkpoint (measured from the safetensors headers: 1426 BF16
+# tensors + 13 F32) onto the card and casts afterwards, so every bf16 block it frees leaves a
+# hole the fp8 weights cannot reuse. First 480p attempt died with 51.89 GiB allocated and
+# 18.70 GiB reserved-but-unallocated -- the fit was never 12 GiB short, it was fragmented by
+# that much. Expandable segments let the allocator give the holes back instead of hoarding
+# them. This is the cheapest of the memory levers and the only one that costs no latency, so
+# it goes before --performance-mode auto and before any offload.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 if [ "$mode" = stop ]; then
-  pkill -f 'sglang.*serve' && sleep 5 && echo stopped
+  # The [s] is not decoration. `pkill -f 'sglang.*serve'` matches any shell whose command line
+  # merely mentions both words -- including `ssh box 'pkill -f sglang.*serve; bash sglang_arm.sh
+  # serve 480'`, which kills the session issuing it and returns 255 with nothing started. The
+  # bracketed class makes the pattern unable to match its own text. Also stops a stale
+  # bench_serving, which otherwise sits polling a dead port for the rest of the day.
+  pkill -f '[s]glang.*serve' ; pkill -f '[b]ench_serving'
+  sleep 5; echo stopped
   exit 0
 fi
 
@@ -63,8 +124,12 @@ if [ "$mode" = serve ]; then
   # --performance-mode speed keeps components resident. 8x B200 Ulysses8 peaked at
   #   79,972 MB/GPU, which is over what this card gives PyTorch, so if load or warmup
   #   OOMs, that flag is the first thing to trade -- see RUNBOOK arm A.
+  # NOT `exec ... | tee`: exec inside a pipeline replaces only that subshell, so when the
+  # server exits the parent shell falls straight through into the bench section below and
+  # starts polling a port nothing is listening on. Run the pipeline, then exit on the
+  # server's status, not tee's.
   set -x
-  exec sglang serve \
+  sglang serve \
     --model-path "$MODEL" \
     --num-gpus "$GPUS" \
     --ulysses-degree "$GPUS" \
@@ -76,11 +141,18 @@ if [ "$mode" = serve ]; then
     --warmup-resolutions "$canvas" \
     --host 127.0.0.1 --port "$PORT" \
     "$@" 2>&1 | tee "$ROOT/logs/serve_${edge}p.log"
+  exit "${PIPESTATUS[0]}"
 fi
 
 # ---------------------------------------------------------------------------- bench
 nreq=${3:-10}
 tag=sg_${edge}p_${FRAMES}f_rep${nreq}
+# NOTE on the body: `seconds` is NOT sent, even though the cookbook's example carries it.
+# VideoGenerationsRequest types it as an int, and 345 frames at 24 fps is 14.375 s, so the
+# server answered every request with 400 and pydantic's int_from_float -- ten instant failures
+# and a benchmark that reported 0/10 in 0.01 s rather than an error. target.duration_seconds
+# takes the float, and the accepted response echoes size 864x480 / seconds 14.375, so the
+# fractional duration survives; it is only that one integer field that cannot express it.
 # --warmup-requests 1 then nreq measured, --max-concurrency 1: post-warmup single-request
 # latency, the same metric as `steady (2-10)` in the reference stack's logs. Ten of them
 # because a mean of one is what the first version of this study reported and had to retract.
@@ -90,5 +162,5 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
   --model "$MODEL" \
   --dataset vbench --task text-to-video \
   --num-prompts "$nreq" --max-concurrency 1 --warmup-requests 1 \
-  --extra-body "{\"task\":\"t2va\",\"conditions\":[],\"target\":{\"short_edge\":$edge,\"aspect_ratio\":\"16:9\",\"duration_seconds\":$SECONDS_OUT},\"seconds\":$SECONDS_OUT,\"flow_shift\":12.0,\"audio_flow_shift\":3.0}" \
+  --extra-body "{\"task\":\"t2va\",\"conditions\":[],\"target\":{\"short_edge\":$edge,\"aspect_ratio\":\"16:9\",\"duration_seconds\":$SECONDS_OUT},\"flow_shift\":12.0,\"audio_flow_shift\":3.0}" \
   2>&1 | tee "$ROOT/logs/$tag.log"
