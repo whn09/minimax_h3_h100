@@ -3,14 +3,37 @@
 The question: **how long does one 480P 15-second clip take on a `p5.48xlarge` (8x H100
 80GB), using the VDN-tuned model** [`OpenVDN/vdn-minimax-h3`](https://huggingface.co/OpenVDN/vdn-minimax-h3)?
 
-## Which stack this is — not SGLang
+## Which stack this is — and the SGLang option, which has changed
 
-This is **not** the SGLang path used in `../minimax_h3_h200/` and `../minimax_h3_g7e/`.
-Those serve **stock MiniMax-H3** plus the community
-[`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora).
-The VDN checkpoint adds a **second attention branch** (frame-wise linear attention
-alongside the window softmax) that SGLang has no code for, so SGLang cannot load it at
-all — `linear_branch/model.safetensors` has nowhere to go.
+> **Correction, and it is a load-bearing one.** This section used to read "SGLang cannot load
+> this checkpoint — `linear_branch/model.safetensors` has nowhere to go." **That is no longer
+> true.** SGLang's cookbook now has a
+> [VDN-H3 section](https://github.com/sgl-project/sglang/blob/main/docs/cookbook/diffusion/MiniMax/MiniMax-H3.mdx#7-vdn-h3-hybrid-attention-8-step-distill):
+> `--model-path OpenVDN/vdn-minimax-h3` with `--attention-backend hybrid_window_attn_h3`, which
+> implements both branches and the gates, prefuses the linear branch and the 8-step DMD2 LoRA
+> into the transformer on first launch, and hard-links the conditioner and VAEs from
+> `MiniMaxAI/MiniMax-H3`. It serves `t2va` and `fl2va` and rejects `ref2va`, which matches this
+> repo's own reading of the checkpoint.
+>
+> **And it is measured against this stack, on the same workload.** On 8× B200 at 345 frames /
+> 1344×768, SGLang runs **0.88 s/NFE against the reference stack's published 1.40** — the
+> cookbook's "OpenVDN reference" rows are `8nfe_tuned_fp8.yaml` + `infer_ulysses.py` with
+> `parallel.softmax_ranks` swept, i.e. exactly what is measured below. On the per-channel fp8
+> path an H100 would take, **0.98**. It credits the gap to parallel efficiency (86–91 % from 2
+> to 8 cards against 56–64 %), with the two stacks within 4 % on a **single** card — so it is a
+> scaling result, not a Blackwell-precision one, and it ought to carry here.
+>
+> **No H100 VDN number exists on either side of that comparison.** The cookbook's VDN tables are
+> B200 and RTX PRO 6000; its H100 rows are 4-card *base* H3. Its 8× B200 Ulysses8 peak of
+> 79,972 MB/GPU is above what an 80 GB H100 gives PyTorch here (65.26 GiB), so whether it even
+> fits at 768p is open. **`RUNBOOK.md` arm A is the measurement**, and it runs before anything
+> else in the queue. If it wins, the conclusion is that the twelve patches below were the right
+> way to learn *where the time goes* and the wrong way to *serve* it.
+
+The stack measured in the rest of this document is **not** the SGLang path used in
+`../minimax_h3_h200/` and `../minimax_h3_g7e/`. Those serve **stock MiniMax-H3** plus the
+community [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora),
+which is a different model, not a different runtime for this one.
 
 The stack here is VDN's own research repo,
 [`OpenVDN/vdn-minimax-h3`](https://github.com/OpenVDN/vdn-minimax-h3) (Apache-2.0, weights
@@ -23,7 +46,7 @@ fp8 kernels and Ulysses sequence parallelism:
 | **VDN Ulysses (used here)** | `src/inference/infer_ulysses.py` | the tuned kernels + fp8 + 8-GPU branch-parallel Ulysses. Upstream's published numbers are this path |
 | VDN single GPU | `src/inference/infer.py` | same kernels, one GPU |
 | plain diffusers | `src/inference/infer_diffusers.py` | `ModularPipeline`, one GPU, no tuned kernels — a "does it render" entrypoint |
-| SGLang | — | **cannot load this checkpoint** |
+| **SGLang Diffusion** | `sglang serve --attention-backend hybrid_window_attn_h3` | an HTTP server, text encoding folded across idle ranks, and 1.43–1.60x over this table's stack **on 8x B200**. Unmeasured on H100 — `RUNBOOK.md` arm A |
 
 The model is **`ckpts/stage-dmd-step-250`** = VDN-H3-8-step, the Stage-DMD distilled
 `turbo` adapter. That is the fastest tier upstream ships and the one behind their headline
@@ -468,6 +491,9 @@ they are the dominant term, not the sampler.
 | `scripts/text_encoder_bench.py` | what the Qwen3-VL conditioner would cost if it were in the request path |
 | `scripts/reload_bench.py` | how long the DiT takes to come **back** after patch 10 frees it — the question a long-lived API has and a one-shot render does not |
 | `scripts/decode_parity.py` | asserts patch 11's two memory changes are **bit-identical** to `vae.decode`, at both canvases, with fixed latents in one process — multi-rank denoise is not reproducible, so a whole-render A-B could not have shown this |
+| `scripts/box_check.sh` | run **on the box**: is it in the state these numbers were measured in? Every line is something that has silently been wrong once — the two `+cu129` suffixes most of all |
+| `scripts/sglang_bringup.sh` | the alternative runtime, in its own venv beside the reference stack, gated on whether the installed build actually has `hybrid_window_attn_h3` |
+| `scripts/sglang_arm.sh` | `serve` / `bench` / `stop` one SGLang arm at 480 or 768, 345 frames, 1 warmup + 10 measured — the same post-warmup metric as `steady (2-10)` |
 | `scripts/p5.sh` | ssh/scp helper for the box |
 | `scripts/sync_box.sh` | push the patched sources + configs + driver onto the box — see trap 7 |
 | `configs/8nfe_480p_345f_ulysses_h100.yaml` | **the deliverable**: 480p, 345 frames (14.375 s), 8 NFE, fp8, 8 GPUs, 3+5 split, parallel decode |

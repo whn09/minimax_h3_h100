@@ -1011,6 +1011,21 @@ Three things fall out of that:
    0.61 s is the pinned transfer rate applied to 6.1 GiB and does not include a
    tensor-parallel forward's own activations (small at 1,300 tokens, but not zero).
 
+   **And there is a fourth way out, which is to stop hand-building this.** SGLang Diffusion
+   serves this checkpoint (see the correction at the top of `README.md`) and has the encoder
+   question as a flag: `--encoder-parallel auto` folds the Qwen encoder across the otherwise
+   idle Ulysses ranks on a single-node H100/H200/B200/B300 host with peer-to-peer access,
+   `fold` and `replicate` force it either way, and `--layerwise-offload-components text_encoder`
+   is the capacity fallback. Its published numbers *include* text encoding inside the request,
+   which is why they are directly comparable to nothing in this table and why arm A in
+   `RUNBOOK.md` breaks that stage out separately. Two calibration points from its cookbook: the
+   fold costs ~0.2 s of an ~8.7 s request on 8× B200, while streaming the whole 46 GiB encoder
+   off an NVMe on a single RTX 5090 costs 4.2 s. The first is what an 8-way fold should look
+   like here; the second is what happens when it cannot fold. On 8× B300 the same choice moved
+   only peak memory, not latency — 19.04 s at 83,578 MB for `auto`/`fold` against 19.04 s at
+   124,158 MB for `replicate` — which is the same conclusion this section reaches by arithmetic:
+   the forward is free, and only the placement matters.
+
 One number to read sceptically: the 7.51 GiB/s "NVMe → GPU" load is almost certainly served
 from the page cache — the box has 2 TiB of RAM and the checkpoint had just been downloaded —
 so it is a host-memory read wearing a filesystem's clothes, which is why it lands next to the
