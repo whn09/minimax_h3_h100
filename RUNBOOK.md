@@ -60,14 +60,15 @@ tmux new -s vdn          # then ctrl-b d to detach, `tmux a -t vdn` to come back
 
 ## 1. SGLang — install, serve, measure
 
-### 1a. Copy the three scripts up **[on your Mac]**
+### 1a. Copy the scripts up **[on your Mac]**
 
 The box has no GitHub credentials, so this private repo cannot be cloned there.
 
 ```bash
 cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
 for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py \
-         scripts/sglang_parity.py; do
+         scripts/sglang_parity.py scripts/sglang_base_arm.sh scripts/sglang_base_steps.py \
+         scripts/lora_merge_h3.py; do
   bash scripts/p5.sh --put "$f" "/opt/dlami/nvme/vdn/$(basename "$f")"
 done
 ```
@@ -236,6 +237,56 @@ ffmpeg -i samples/n_480p_seg4.mp4 -i out/sglang/parity/parity_480p_345f_seed42.m
 `output_path` in the request is treated as a **directory**, not a filename — the mp4 lands inside it
 under a UUID.
 
+### 1f. Base MiniMax-H3, the denominator. **~8 min startup, ~5 min for four arms.**
+
+"VDN is 1.43× / 1.74× faster than the reference stack" compares two *implementations of VDN*. This
+compares two *models*, on the same eight cards, same prompt, same seed 42, same 345 frames. It needs
+its own server, on port 30011 so the VDN server on 30010 can stay up — but 8 GPUs cannot hold both,
+so in practice stop VDN first (`bash sglang_arm.sh stop`).
+
+```bash
+cd /opt/dlami/nvme/vdn
+setsid nohup bash sglang_base_arm.sh serve 480 \
+    > /opt/dlami/nvme/sglang/base_wrap.log 2>&1 < /dev/null &
+tail -f /opt/dlami/nvme/sglang/logs/serve_base_480p.log     # wait for uvicorn on 30011
+/opt/dlami/nvme/sglang/.venv/bin/python -u sglang_base_steps.py 480:50 480:8 768:50 768:8
+```
+
+The `serve 480` argument only sizes the startup warmup; both resolutions are then requested against
+the one server. 50 is base H3's own asserted schedule
+(`MiniMaxH3SamplingParams.num_inference_steps = 50`); the `8` arms are step-cost probes, not
+shippable renders. Measured: **480p 45.13 s / 768p 187.50 s at 50 steps**, against VDN's 8.55 / 19.10
+— **5.28× and 9.82×** — and at a matched 8 steps base costs 0.98 vs 0.95 s/step at 480p but 3.73 vs
+2.17 s/step at 768p. Full reading in `RESULTS.md`, "Base MiniMax-H3 on the same eight cards".
+
+**Pull the mp4s before you stop the box.** They were lost once already: `/opt/dlami/nvme` is instance
+store and the four base renders never left it.
+
+```bash
+bash scripts/p5.sh 'cd /opt/dlami/nvme/vdn/pull/base && for d in base_*; do \
+  mv "$d"/*.mp4 "$d".mp4 && rmdir "$d"; done && ls -l'
+bash scripts/p5.sh --get /opt/dlami/nvme/vdn/pull/base out/sglang/base    # [on your Mac]
+```
+
+**The Turbo LoRA arm does not run at fp8, and knowing why saves an hour.** `--lora-path` together
+with `--quantization fp8` aborts during warmup with `AttributeError:
+'RowParallelLinearWithLoRA' object has no attribute 'quant_method'` — the dynamic-LoRA wrapper is not
+quantization-aware. (This is *not* the failure the g7e project recorded; that one, an in-place add on
+a transposed fp8 weight, is fixed upstream.) And the offline bf16 merge cannot be pointed at a t2va
+tree: the adapter is named for the native layout, every t2va transformer on disk is named for the
+diffusers layout, and `scripts/lora_merge_h3.py` matches 0/259 and refuses. What still works:
+
+```bash
+# bf16, so --lora-path runs with no key mapping. FOR PICTURES ONLY -- bf16 latency is not
+# comparable to any fp8 arm here, and 62 GB of bf16 weights may need --use-fsdp-inference to fit.
+cd /opt/dlami/nvme/vdn && QUANT= LOGTAG=turbo setsid nohup bash sglang_base_arm.sh serve 480 \
+    --lora-path /opt/dlami/nvme/vdn/lora/minimax_h3_turbo_v4_step600_ema.safetensors \
+    --lora-nickname turbo > /opt/dlami/nvme/sglang/turbo_wrap.log 2>&1 < /dev/null &
+```
+
+The fp8 Turbo *latency* needs no run at all: merging an adapter changes weight values, not shapes and
+not the graph, so it is the 8-step row already measured — 9.02 s at 480p, 31.57 s at 768p.
+
 ---
 
 ## 2. The reference stack — the control
@@ -367,6 +418,15 @@ Kept for the record; run one only if a specific question needs it.
 
 ## 3. Still open
 
+* **The four base-H3 renders, and the 8-step quality question.** §1f's latencies are measured but the
+  mp4s died with the instance store, so nothing shows whether base H3 at 8 steps is as undercooked as
+  the theory says. Re-render the two `8` arms: 41 s of GPU once a server is up. **Do this first
+  tomorrow** — it is the cheapest open item on the list.
+* **Base + Turbo LoRA, as a picture.** §1f has the working bf16 invocation. The fp8 latency needs no
+  run. Open question if anyone wants it at fp8: invert the three diffusers↔native translations named
+  in `scripts/lora_merge_h3.py`, or wait for SGLang to make its dynamic-LoRA wrapper
+  quantization-aware, which is the smaller upstream fix and would make `--lora-path --quantization
+  fp8` work directly.
 * **The non-inference tail.** SGLang's E2E minus `inference_time_s` is ~1 s at 480p and ~2 s at
   768p: mux plus disk write. This repo's finding that libx264 does not parallelise itself and needs
   segmented encoding points straight at it — but that is upstream code now, so it is a PR, not a

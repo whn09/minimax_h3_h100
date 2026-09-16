@@ -42,6 +42,21 @@ The stack measured in the rest of this document is **not** the SGLang path used 
 community [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora),
 which is a different model, not a different runtime for this one.
 
+> **How much of "fast" is VDN and how much is SGLang?** Stock `MiniMaxAI/MiniMax-H3` was served on
+> the same eight cards with every other knob held fixed — same fp8, same Ulysses 8, same prompt, same
+> seed 42, same 345 frames — at its own asserted 50-step schedule: **45.13 s at 480p** and
+> **187.50 s at 768p**, against VDN's 8.55 / 19.10. That is **5.28x** and **9.82x**, and the two
+> numbers have different causes. At a matched 8 steps the two models cost the *same* per step at 480p
+> (0.98 vs 0.95 s) but VDN's step is **1.72x cheaper** at 768p (2.17 vs 3.73 s): per step from 480p to
+> 768p, against 2.49x the tokens, base H3 scales 3.81x and VDN 2.28x. So at 480p the whole win is the
+> distilled schedule, and the hybrid linear/window attention earns nothing until the sequence is long.
+> The Turbo LoRA arm is blocked on SGLang's LoRA path, not on GPU time — `--lora-path` and
+> `--quantization fp8` cannot currently run together, and the offline merge does not port to t2va
+> because the adapter is named for the native checkpoint layout and every t2va tree on disk is named
+> for the diffusers one. Both failures, and why the fp8 Turbo *latency* needs no run at all, in
+> [`RESULTS.md`](RESULTS.md#base-minimax-h3-on-the-same-eight-cards-528x-at-480p-982x-at-768p-for-different-reasons)
+> and `RUNBOOK.md` §1f.
+
 The stack here is VDN's own research repo,
 [`OpenVDN/vdn-minimax-h3`](https://github.com/OpenVDN/vdn-minimax-h3) (Apache-2.0, weights
 under the MiniMax H3 Community License), which uses **patched diffusers** for the

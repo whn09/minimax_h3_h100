@@ -230,6 +230,95 @@ as `EOFError` from a dead worker pipe), `-lcudart` unresolvable because the pip 
 int against a 14.375 s clip (surfaced as ten instant 400s reported by the benchmark as `0/10` in
 0.01 s), and the allocator fragmentation above.
 
+## Base MiniMax-H3 on the same eight cards: 5.28x at 480p, 9.82x at 768p, for different reasons
+
+VDN being fast is only a claim until "normal H3" runs on the same GPUs with the same prompt, the
+same seed 42 and the same 345 frames. `scripts/sglang_base_arm.sh` serves `MiniMaxAI/MiniMax-H3`
+on port 30011 with everything else held fixed — fp8, Ulysses 8, `--performance-mode speed`, no
+offload — and drops the one flag that *is* the VDN architecture, `--attention-backend
+hybrid_window_attn_h3`. `scripts/sglang_base_steps.py` walks the step ladder.
+
+| 345 f | model | steps | E2E | server inference | s/step | peak/GPU |
+|---|---|---|---|---|---|---|
+| **480p** | base H3 | 50 (its own schedule) | **45.13 s** | 43.96 s | 0.88 | 57,594 MB |
+| | base H3 | 8 (probe) | 9.02 s | 7.87 s | 0.98 | 51,294 MB |
+| | **VDN** | 8 | **8.55 s** | 7.60 s | 0.95 | 54,940 MB |
+| **768p** | base H3 | 50 (its own schedule) | **187.50 s** | 185.41 s | 3.71 | 57,376 MB |
+| | base H3 | 8 (probe) | 31.57 s | 29.87 s | 3.73 | 57,416 MB |
+| | **VDN** | 8 | **19.10 s** | 17.36 s | 2.17 | 62,282 MB |
+
+50 steps is not a handicap picked to flatter VDN, it is what the model asserts: base H3's
+`MiniMaxH3SamplingParams.num_inference_steps = 50` (`configs/sample/minimax_h3.py:41`), `FastH3`
+asserts exactly 5 sigma points, and VDN asserts exactly 9. Three members of one family with the
+same DiT shape and the same VAEs, distilled for different schedules.
+
+**480p: 5.28×, and all of it is the schedule.** At a matched 8 steps the two models cost the same
+per step — base 0.98 s against VDN 0.95 s, a 3 % gap. VDN's hybrid attention earns nothing here.
+
+**768p: 9.82×, and it splits about evenly.** At a matched 8 steps VDN's step is **1.72× cheaper**
+(2.17 s against 3.73 s). 6.25× (schedule) × 1.72× (step) ≈ 10.7×, and the measured 9.82× is that
+minus fixed cost — which the two-point fit puts at 0.86 s/step + 1.00 s fixed for 480p and
+3.70 s/step + 0.24 s fixed for 768p, so the ladder is clean and linear in steps.
+
+Why the conclusion flips with canvas, from the scaling alone: 1344×768 carries **2.49×** the tokens
+of 864×480, and per step base H3 goes 0.98 → 3.73 s (**3.81×**, superlinear, which is what dense
+softmax does) while VDN goes 0.95 → 2.17 s (**2.28×**, below the token growth, i.e. effectively
+linear). The linear/window branch is not a general speedup; it starts paying only once the sequence
+is long. That is the honest reason VDN's own README argues its case at 768p.
+
+One inversion worth noting: base H3 at 50 steps peaks **lower** than VDN at 8 (57.6 GB against
+62.3 GB at 768p). VDN's linear branch buys time with memory.
+
+At `p5.48xlarge` 3-year ISP ($0.00660480/instance-second, see below) that is **$0.0039 against
+$0.0207** per finished second at 480p, and **$0.0088 against $0.0861** at 768p.
+
+**No pictures from this arm.** The four base-H3 mp4s were written to
+`/opt/dlami/nvme/vdn/pull/base/` and the box was stopped before they were pulled; `/opt/dlami/nvme`
+is instance store, so they are gone. The latency table above is the whole surviving result, and the
+undercooked-vs-shippable question at 8 steps is not answered by it. Re-rendering the two 8-step
+arms costs 41 s once a box is up.
+
+### The Turbo LoRA arm did not run, and both blockers are in the LoRA plumbing
+
+`larryvrh/MiniMax-H3-Turbo-Lora` (`minimax_h3_turbo_v4_step600_ema.safetensors`, 780 MB, 259
+modules / 518 tensors, ranks 16 and 64, its own metadata declaring `W_eff = W + lora_B @ lora_A`)
+was meant to answer whether base weights plus a distill adapter reach VDN's latency at 8 steps.
+
+The g7e project's recorded failure — a runtime "merge" doing an in-place add on `[out, in]` against
+an fp8 weight stored transposed, their fc1 reporting `21504 vs 5376` — **has been fixed upstream**.
+`_should_merge_lora_for_layers` now sees `can_merge_base_weight == False` on a quantized layer and
+falls back to dynamic LoRA on its own. It fails one layer later instead:
+
+```
+AttributeError: 'RowParallelLinearWithLoRA' object has no attribute 'quant_method'
+```
+
+The dynamic-LoRA wrapper is not quantization-aware, so `--quantization fp8 --lora-path …` aborts
+during server warmup. Alpha handling, at least, is right for free: this adapter records no
+`adapter_config.json` and no global alpha (its ranks are mixed, so there is none to record), and
+`pipeline.py:705` falls back to `alpha = rank`, i.e. scale 1.0 — exactly what the file declares.
+
+g7e's fallback, merging into bf16 offline and quantizing the merged directory, **does not port to
+t2va**. `scripts/lora_merge_h3.py` ran and matched **0 of 259** modules, because there are two
+naming conventions inside the one HF repo: the LoRA and `FL2VA/`, `Ref2VA/` use the native layout
+(`blocks.N.attn.qkv_proj`, `mlp.fc1`, 535 tensors, `model-*.safetensors`), while every t2va
+transformer — `MiniMaxAI/MiniMax-H3/transformer` *and* `OpenVDN/vdn-minimax-h3/h3-base/transformer`
+— uses the diffusers layout (`transformer_blocks.N.attn.to_{q,k,v}`, `ff.net.0.proj`, 638 tensors).
+g7e merged against `FL2VA/transformer` because their pipeline was fl2va, which is why they saw
+259/259. Translating needs three steps, all readable in SGLang's own loader rather than guessable:
+the name/fusion map from `get_param_names_mapping` (to_q/to_k/to_v are merge indices 0/1/2 of
+`qkv_proj`), the SwiGLU half order (`ff.net.0.proj` is `[value, gate]`, `mlp.fc1` is `[gate, value]`,
+`minimax_h3.py:128`), and the per-head q,k,v row interleave that `_reorder_grouped_qkv_to_qkv` undoes
+at load. Each fails silently in a way shapes will not catch.
+
+What this does *not* cost us is the latency answer. A merged adapter changes weight values, not
+tensor shapes and not the graph, so **fp8 base H3 at 8 steps already is fp8 Turbo at 8 steps**:
+9.02 s at 480p and 31.57 s at 768p, i.e. still 1.05× and 1.65× slower than VDN, which is the
+matched-step-count row read a second way. What is missing is the picture: whether Turbo's 8 steps
+look shippable where base H3's 8 steps do not. That needs `QUANT= bash sglang_base_arm.sh serve …
+--lora-path …` (bf16, where `--lora-path` runs with no mapping work and merge mode `auto` folds
+the adapter in at load), and its latency must not be quoted next to the fp8 arms.
+
 ## What a finished second costs
 
 `p5.48xlarge`, **EC2 3-Year No-Upfront Instance Savings Plan**: **$23.77728 / instance-hour**
