@@ -29,6 +29,11 @@ export SGLANG_DIFFUSION_CACHE_ROOT=${SGLANG_DIFFUSION_CACHE_ROOT:-$ROOT/cache}
 mode=${1:?serve|bench|stop}
 # shellcheck disable=SC1091
 source "$ROOT/.venv/bin/activate"
+# This box has no /usr/local/cuda and deep_gemm's find_cuda_home asserts rather than falling
+# back, which kills `import sglang.multimodal_gen` before any of the above matters. The venv
+# carries nvidia-cuda-nvcc as a pip dependency (the VDN delta-factors kernel JITs against it
+# through apache-tvm-ffi), so point at that.
+export CUDA_HOME=${CUDA_HOME:-$(python -c "import sysconfig,pathlib;print(pathlib.Path(sysconfig.get_paths()['purelib'])/'nvidia'/'cuda_nvcc')")}
 
 if [ "$mode" = stop ]; then
   pkill -f 'sglang.*serve' && sleep 5 && echo stopped
