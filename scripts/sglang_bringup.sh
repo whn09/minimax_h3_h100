@@ -139,4 +139,4 @@ hf download MiniMaxAI/MiniMax-H3 > /dev/null
 step "done"
 df -h --output=avail "$ROOT" | tail -1
 du -sh "$HF_HOME" "$SGLANG_DIFFUSION_CACHE_ROOT" 2>/dev/null
-echo "next: bash $ROOT/../vdn/sglang_arm.sh serve 768   (see RUNBOOK section 3, arm A)"
+echo "next: bash $ROOT/../vdn/sglang_arm.sh serve 480   (see RUNBOOK section 1c)"

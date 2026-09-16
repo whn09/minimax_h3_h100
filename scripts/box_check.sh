@@ -12,7 +12,7 @@ ROOT=${ROOT:-/opt/dlami/nvme/vdn}
 REPO=$ROOT/vdn-minimax-h3
 BASE=2f740c9
 
-cd "$REPO" 2>/dev/null || { echo "NOT SET UP: $REPO missing -- see RUNBOOK section 2"; exit 1; }
+cd "$REPO" 2>/dev/null || { echo "NOT SET UP: $REPO missing -- see RUNBOOK section 2b"; exit 1; }
 
 head=$(git rev-parse --short HEAD)
 commits=$(git log --oneline "$BASE"..HEAD 2>/dev/null | wc -l | tr -d ' ')

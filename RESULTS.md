@@ -1126,8 +1126,8 @@ Three things fall out of that:
    idle Ulysses ranks on a single-node H100/H200/B200/B300 host with peer-to-peer access,
    `fold` and `replicate` force it either way, and `--layerwise-offload-components text_encoder`
    is the capacity fallback. Its published numbers *include* text encoding inside the request,
-   which is why they are directly comparable to nothing in this table and why arm A in
-   `RUNBOOK.md` breaks that stage out separately. Two calibration points from its cookbook: the
+   which is why they are directly comparable to nothing in this table and why `RUNBOOK.md`
+   section 1c breaks that stage out separately. Two calibration points from its cookbook: the
    fold costs ~0.2 s of an ~8.7 s request on 8× B200, while streaming the whole 46 GiB encoder
    off an NVMe on a single RTX 5090 costs 4.2 s. The first is what an 8-way fold should look
    like here; the second is what happens when it cannot fold. On 8× B300 the same choice moved

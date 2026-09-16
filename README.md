@@ -509,7 +509,7 @@ they are the dominant term, not the sampler.
 | `configs/8nfe_2k_ulysses_h100.yaml` | 2560x1440 — a lower bound on H3-Regenerate-2K, which is not open-sourced |
 | `patches/` | the twelve patches above + `BASE.txt` (the upstream commit they apply to) |
 | `RESULTS.md` | the measured numbers |
-| `RUNBOOK.md` | how to bring a fresh box back to the state these numbers were measured in, and the queue of arms still worth running — each with what it would settle and what to expect |
+| `RUNBOOK.md` | how to run this on the box. **Section 1 is SGLang** — a wiped box to the 8.02 s / 19.04 s numbers, plus fl2va. Section 2 rebuilds the patched reference stack as the *control* that makes those a measured ratio rather than a claim |
 | `samples/` | the renders the numbers came from, video+audio muxed, all t2va from `prompts/example_2.pt`. The current best config, with all ten patches: **`n_480p_seg4.mp4`** (864x480, 345 f), **`n_480p_362f_seg4.mp4`** (the literal 15 s, 362 f) and **`p_768p_free.mp4`** (1344x768, 345 f) — all `clipinfo.py`-checked. The patch-11/12 renders (`r2_768p_keep_yuv`, `s2_480p_rep10`, `s5_480p_362f_rep10`, `s4_768p_rep10`) are **not** in the repo — they are the same prompt at the same canvas as the clips above and the patches change no pixels, which `scripts/decode_parity.py` asserts bit-exactly, so the mp4s carry no information the tracked ones do not. Earlier renders kept for comparison: `vdn_*` (pre-patch-7 swscale mux), `z_*` (patches 1–6), `n_768p_seg4` (768p with patch 3's host offload, before patch 10), `y_768p_345f_r5` (the 768p split winner), `f_*` (fl2va) |
 
 ## Traps found on this box

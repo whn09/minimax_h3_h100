@@ -123,7 +123,8 @@ if [ "$mode" = serve ]; then
   #   precisely the request-1-vs-steady gap this study measures separately.
   # --performance-mode speed keeps components resident. 8x B200 Ulysses8 peaked at
   #   79,972 MB/GPU, which is over what this card gives PyTorch, so if load or warmup
-  #   OOMs, that flag is the first thing to trade -- see RUNBOOK arm A.
+  #   OOMs, that flag is the first thing to trade -- see RUNBOOK section 1c. It did NOT OOM:
+  #   768p peaked at 62.1 GB with everything resident, so the ladder was never used.
   # NOT `exec ... | tee`: exec inside a pipeline replaces only that subshell, so when the
   # server exits the parent shell falls straight through into the bench section below and
   # starts polling a port nothing is listening on. Run the pipeline, then exit on the

@@ -1,12 +1,21 @@
 # Runbook — everything here runs **on the box**
 
-Every command below is meant to be typed in a shell on the p5.48xlarge. The two exceptions are
-marked **[on your Mac]**: getting in, and pulling results out. Nothing needs this repo to be
-checked out on the box — the box already has what it needs, and section 2 says how to get it
-back if it doesn't.
+Every command below is meant to be typed in a shell on the p5.48xlarge. The exceptions are marked
+**[on your Mac]**: getting in, copying scripts up, and pulling results out.
 
-Sections: **0** get in · **1** check the box · **2** rebuild a fresh box · **3** the queue of
-arms still worth running · **4** results · **5** traps.
+> **Use SGLang.** It is measured on these eight cards at **480p/345f 8.02 s** and
+> **768p/345f 19.04 s** post-warmup end-to-end, nothing offloaded, and it serves fl2va from the
+> same process. That is 1.43× and 1.74× the patched reference stack, and it is an HTTP server,
+> which is the shape the deployment needs. **Section 1 is the whole path from a wiped box to those
+> numbers.**
+>
+> **Section 2 is the reference stack, and it is kept on purpose.** It is not an alternative
+> deployment — it is the *control*. Its 11.44 s and 33.21 s are what SGLang is 1.43×/1.74× faster
+> than, and both were measured here rather than read off someone's table. Rebuild it when you need
+> to re-establish a baseline on a new box, driver or CUDA; otherwise skip it.
+
+Sections: **0** get in · **1** SGLang, the path · **2** the reference stack, the control ·
+**3** what is still open · **4** results · **5** traps.
 
 ---
 
@@ -21,27 +30,27 @@ ssh -i /Users/henanwan/Documents/account/579019700964/henanwan/henanwan-us-east-
 public DNS record stopped resolving while the address stayed put. If the instance is ever
 replaced, the address changes and `scripts/p5.sh` on the Mac needs its `HOST=` updated too.
 
-Once in, everything lives under one directory, and it is on the **ephemeral** NVMe:
+Two independent trees, both on the **ephemeral** NVMe:
 
 ```
-/opt/dlami/nvme/vdn/
-├── vdn-minimax-h3/          the code. upstream repo at 2f740c9 + the 12 patches as commits
-│   ├── .venv/               python 3.12, torch 2.13.0+cu129 -- runone.sh sources it for you
-│   ├── src/  scripts/       patched sources; scripts/ holds the benches
-│   ├── configs/inference/   the four 8nfe_*_h100.yaml
-│   ├── prompts/             example_{0,1,2}.pt -- prompt caches, shipped in the repo
-│   └── ckpts -> ../ckpts    82 GB of weights
-├── runone.sh h100_grid.sh summarize.py box_check.sh   the drivers, one level UP from the repo
-├── patches/                 the 12 .patch files, for rebuilding the tree
-├── out/                     renders + their .inference.json records
-└── *.log                    one per arm
+/opt/dlami/nvme/
+├── sglang/                  section 1 -- the one you want
+│   ├── .venv/               python 3.12, sglang main, its own torch. NOT shared with vdn/
+│   ├── cache/               the 62 GB fused overlay the first launch writes
+│   └── logs/                serve_*.log, sg_*_rep10.log, cond.log
+└── vdn/                     section 2 -- the control, plus the shared HF cache
+    ├── hf/                  HF_HOME, 407 GB. BOTH stacks read this. Do not wipe it casually.
+    ├── vdn-minimax-h3/      upstream at 2f740c9 + the 12 patches as commits, own .venv
+    ├── outputs/             where the sglang server writes its mp4s (relative to its cwd)
+    ├── keyframes/           first_{480,768}.png, last_{480,768}.png for the fl2va arm
+    ├── out/                 the reference stack's renders + .inference.json records
+    └── *.sh *.py            the drivers, staged from this repo
 ```
 
-`/opt/dlami/nvme` is an **instance store: a stop/start wipes it.** `/` is 484 GB and the
-checkpoint alone is 82 GB, so nothing can move there. Assume everything above is gone after a
-stop and that section 2 is the price of restarting.
+`/opt/dlami/nvme` is an **instance store: a stop/start wipes it.** `/` is 484 GB and the HF cache
+alone is 407 GB, so nothing can move there. Assume all of the above is gone after a stop.
 
-Long arms take 6–15 minutes. Use `tmux` (installed) rather than hoping the ssh session holds:
+Long steps take 6–15 minutes. Use `tmux` (installed) rather than hoping the ssh session holds:
 
 ```bash
 tmux new -s vdn          # then ctrl-b d to detach, `tmux a -t vdn` to come back
@@ -49,7 +58,167 @@ tmux new -s vdn          # then ctrl-b d to detach, `tmux a -t vdn` to come back
 
 ---
 
-## 1. Check the box before trusting it
+## 1. SGLang — install, serve, measure
+
+### 1a. Copy the three scripts up **[on your Mac]**
+
+The box has no GitHub credentials, so this private repo cannot be cloned there.
+
+```bash
+cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
+for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py; do
+  bash scripts/p5.sh --put "$f" "/opt/dlami/nvme/vdn/$(basename "$f")"
+done
+```
+
+### 1b. Install. **~25 min, ~250 GB, all download.**
+
+```bash
+mkdir -p /opt/dlami/nvme/sglang
+setsid nohup bash /opt/dlami/nvme/vdn/sglang_bringup.sh \
+    > /opt/dlami/nvme/sglang/bringup.log 2>&1 < /dev/null &
+tail -f /opt/dlami/nvme/sglang/bringup.log        # ends with "=== [..] done"
+```
+
+The script asserts what matters instead of hoping: python is 3.12, `$VIRTUAL_ENV` is unset,
+`ffmpeg`/`ffprobe` exist, and `import sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn`
+succeeds. Four things it handles that are easy to get wrong on a fresh box:
+
+* **sglang from git, not PyPI.** Checked here: release 0.5.19 has base MiniMax-H3 but zero
+  occurrences of `vdn` or `hybrid_window_attn_h3`. On main VDN is a whole subsystem. Retry PyPI
+  once 0.5.20 ships. The verified build is `0.5.6.post3.dev10594+g3f8eb35ea` (main at `3f8eb35e`).
+* **`SGLANG_BUILD_RUST_EXTS=none`.** main's `setup.py` shells out to `cargo` just to *discover* the
+  Rust router extensions, so with no toolchain the build dies in
+  `get_requires_for_build_wheel` before any Python compiles. Nothing in the diffusion path uses
+  them; installing rustup instead works and wastes ten minutes.
+* **`ffmpeg` before the download, not after.** H3's pipeline raises at startup without it, on every
+  rank, and the parent shows only an `EOFError` from the pipe — which reads like a crash.
+* **`MiniMaxAI/MiniMax-H3` comes down too.** The OpenVDN checkpoint has no `text_encoder/` or
+  `processor/` — the Qwen3-VL conditioner has never been on this machine, because the reference
+  stack `torch.load`s offline prompt caches. A server that takes a text prompt over HTTP needs it.
+
+> **apt is currently patched by hand on this box.**
+> `/etc/apt/sources.list.d/cuda-ubuntu2604-x86_64.list` serves a malformed `Packages` file
+> ("Encountered a section with no Package: header") and clearing `/var/lib/apt/lists` does not help,
+> because apt re-fetches the same bad file. It is moved to
+> `/root/cuda-ubuntu2604-x86_64.list.disabled-by-claude`. Nothing here installs CUDA from apt (the
+> venv carries its own), so leaving it disabled is fine — but **know that it is disabled** before
+> blaming apt for something else.
+
+### 1c. Serve and measure. **~6 min startup, ~2 min per bench.**
+
+```bash
+cd /opt/dlami/nvme/vdn
+setsid nohup bash sglang_arm.sh serve 480 > /dev/null 2>&1 < /dev/null &
+tail -f /opt/dlami/nvme/sglang/logs/serve_480p.log     # wait for warmup to finish
+bash sglang_arm.sh bench 480 10                        # 1 discarded warmup + 10 measured
+```
+
+Then the same with `768`. **Stop and launch must be separate ssh invocations** — see trap 8.
+
+```bash
+bash sglang_arm.sh stop
+```
+
+**Measured, 2026-09-16, sglang main `3f8eb35e`, 345 frames, ten requests each:**
+
+| 345 f | E2E median | server `inference_time_s` | peak/GPU | reference stack |
+|---|---:|---:|---:|---:|
+| 480p (864×480) | **8.02 s** | 6.9 s | 54.7 GB | 11.44 s → **1.43×** |
+| 768p (1344×768) | **19.04 s** | 17.0 s | 62.1 GB | 33.21 s → **1.74×** |
+
+Both ratios are **floors**: SGLang encodes the text prompt inside the request, and every number in
+RESULTS.md excludes text encoding entirely. The ~1 s / ~2 s between E2E and `inference_time_s` is
+mux plus disk write, outside the model.
+
+`sglang_arm.sh` carries five fixes, each commented with the symptom it produced. Two of them this
+runbook did not predict and you cannot skip:
+
+* **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is what makes it fit.** `--quantization fp8`
+  on SM90 is *online* quantization: the loader reads the 65.71 GiB bf16 checkpoint onto the card
+  and casts afterwards, so freed bf16 blocks leave holes fp8 weights cannot reuse. The first 480p
+  attempt died with 51.89 GiB allocated and **18.70 GiB reserved-but-unallocated** — never 12 GiB
+  short, fragmented by that much. Costs no latency.
+* **`NCCL_NET_PLUGIN=none`, on AWS specifically.** The DLAMI puts the EFA/OFI plugin on the system
+  loader path, `deep_ep`'s `check_nccl_so()` scans `/proc/self/maps`, sees it next to the venv's
+  `libnccl.so.2` and asserts "Duplicate NCCL runtime" — fatal because sglang guards that import
+  with `except ImportError`, which cannot catch `AssertionError`. Surfaces two layers away as
+  `Model architectures ['MiniMaxH3Qwen3VLEncoder'] failed to be inspected`. **Drop this line before
+  running anything across nodes.**
+
+**The offload ladder was never needed.** 768p fits with the DiT, both VAEs and the Qwen3-VL
+conditioner all resident at `--performance-mode speed`, peak 62.1 GB against 79.18 GiB visible.
+If a future build stops fitting, trade in this order — each costs latency, so record which one was
+used, because "SGLang is faster" and "SGLang is faster while offloading the DiT" are different
+findings:
+
+```bash
+bash sglang_arm.sh serve 768 --performance-mode auto
+bash sglang_arm.sh serve 768 --layerwise-offload-components text_encoder
+bash sglang_arm.sh serve 768 --layerwise-offload-components dit,text_encoder \
+                             --dit-layerwise-resident-layers 14
+```
+
+### 1d. fl2va, on the same server. **~5 min, no restart, no second checkpoint.**
+
+Run **after** 1c: it cuts its keyframes out of an existing render at the target canvas, so
+`/opt/dlami/nvme/vdn/outputs/` needs one 864×480 and one 1344×768 mp4 already there.
+
+```bash
+cd /opt/dlami/nvme/vdn
+python3 sglang_cond.py 2>&1 | tee /opt/dlami/nvme/sglang/logs/cond.log
+```
+
+**Measured**, 3 requests each after a discarded warmup:
+
+| 345 f | task | E2E median | server inference | peak/GPU | vs t2va |
+|---|---|---:|---:|---:|---:|
+| 480p | t2va | 7.85 s | 6.82 s | 54,682 MB | — |
+| | fl2va first+last | 8.88 s | 7.85 s | 55,162 MB | **+13.1 %** |
+| | fl2va first only | 9.07 s | 7.81 s | 54,804 MB | |
+| 768p | t2va | 18.11 s | 16.33 s | 62,022 MB | — |
+| | fl2va first+last | 20.96 s | 19.09 s | 62,364 MB | **+15.7 %** |
+| | fl2va first only | 19.94 s | 18.09 s | 62,382 MB | |
+
+The wire format, from `runtime/.../minimax_h3/{task_profiles,request_validation}.py`:
+
+```json
+{"task": "fl2va",
+ "conditions": [{"role": "keyframe", "type": "image", "uri": "/abs/path.png", "frame_index": 0},
+                {"role": "keyframe", "type": "image", "uri": "/abs/path.png", "frame_index": -1}]}
+```
+
+`MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES` is `((0,), (-1,), (0,-1))`: first-only, last-only and
+first+last are all the one task name. Only +340–480 MB resident.
+
+**`ref2va` is refused, and correctly** — `MINIMAX_H3_TASK_PARTITIONS` maps t2va and fl2va to the
+`fl2va` partition and ref2va to a `ref2va` partition, and VDN shipped only the former:
+
+> `VDN-H3 serves t2va and fl2va; ref2va was not trained (got task='ref2va'). Use
+> MiniMaxAI/MiniMax-H3 --model-variant ref2va for that task.`
+
+That is a training-time limit, not a runtime one. No flag, patch or framework gets around it; base
+MiniMax-H3 has ref2va but no 8-step distill, i.e. a different and much slower model.
+
+**Two gotchas in the API**, both of which cost a debugging cycle:
+
+* **Do not send `seconds`.** `VideoGenerationsRequest` types it `Optional[int]` and 345f at 24 fps
+  is 14.375, so every request 400s with pydantic's `int_from_float` — and `bench_serving` reports
+  `0/10 in 0.01 s` rather than an error. `target.duration_seconds` takes the float.
+* **`file_path` in the response is relative to the server's cwd**, `/opt/dlami/nvme/vdn`, not the
+  caller's. The API is async: `POST /v1/videos` returns `queued`; poll `GET /v1/videos/{id}` for
+  `completed`, which carries `inference_time_s` and `peak_memory_mb`.
+
+---
+
+## 2. The reference stack — the control
+
+Rebuild this only to **re-establish a baseline**: new box, new driver, new CUDA, or a claim that
+needs a same-machine comparison. It is not a deployment path any more; SGLang beats it at both
+canvases, keeps 768p resident where patch 11's residency died on the second request, and serves
+fl2va without a restart.
+
+### 2a. Check what is there
 
 ```bash
 bash /opt/dlami/nvme/vdn/box_check.sh
@@ -57,52 +226,32 @@ bash /opt/dlami/nvme/vdn/box_check.sh
 
 ```
 repo        : HEAD 5f4406b, 12 commits past 2f740c9, 0 tracked files modified
-              -> series as commits, tree clean
 configs     : 4/4 h100 yamls
 weights     : 82G (expect 82G)
 prompts     : 3 caches
 drivers     : 3/3 in /opt/dlami/nvme/vdn
-free on nvme: 27T
-gpus busy   : 0 processes
 python env  : torch 2.13.0+cu129  torchvision 0.28.0+cu129  diffusers 0.40.0.dev0  gpus 8
-              OK
 ```
 
-**Both `+cu129` suffixes matter more than anything else on that list** — see trap 1. If the
-script says `NOT SET UP`, go to section 2. If `gpus busy` is not 0, something is still running:
+**Both `+cu129` suffixes matter more than anything else on that list** — see trap 1. If `gpus busy`
+is not 0, something is still running (`nvidia-smi`; `pkill -f 'infer_ulysses\.py'`).
 
-```bash
-nvidia-smi                                  # what
-pkill -f 'infer_ulysses\.py'; sleep 4       # stop it (runone.sh does this itself)
-```
+### 2b. Rebuild from scratch. **~10 min, mostly download.**
 
----
-
-## 2. Rebuilding a fresh box
-
-Needed after any stop/start. ~10 minutes, most of it download.
-
-### 2a. Get the two files the box cannot fetch by itself **[on your Mac]**
-
-The bringup script and the patch series live in this private repo, and the box has no GitHub
-credentials. One copy, and it is the only Mac-side step in the rebuild:
+**[on your Mac]**, stage the files the box cannot fetch:
 
 ```bash
 cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
 bash scripts/p5.sh 'mkdir -p /opt/dlami/nvme/vdn/staging'
 bash scripts/p5.sh --put scripts/h100_bringup.sh /opt/dlami/nvme/vdn/h100_bringup.sh
 bash scripts/p5.sh --put scripts/box_check.sh    /opt/dlami/nvme/vdn/box_check.sh
-for f in patches/*.patch configs/*.yaml scripts/{runone,h100_grid,sglang_bringup,sglang_arm}.sh \
+for f in patches/*.patch configs/*.yaml scripts/{runone,h100_grid}.sh \
          scripts/{summarize,text_encoder_bench,mux_bench,reload_bench,clipinfo,vidcmp,vidscale,vidshift}.py; do
   bash scripts/p5.sh --put "$f" "/opt/dlami/nvme/vdn/staging/$(basename "$f")"
 done
 ```
 
-Everything lands in one `staging/` directory, which is what section 2b copies out of. (The box
-currently has these files in `patches/` from the last rebuild; either name works as long as the
-`cp` lines below match.)
-
-### 2b. Everything else, on the box
+Then, on the box:
 
 ```bash
 cd /opt/dlami/nvme/vdn
@@ -132,407 +281,158 @@ cp /opt/dlami/nvme/vdn/staging/8nfe_*_h100.yaml configs/inference/
 cp /opt/dlami/nvme/vdn/staging/{text_encoder_bench,mux_bench,reload_bench,clipinfo,vidcmp,vidscale,vidshift}.py scripts/
 cp /opt/dlami/nvme/vdn/staging/{runone.sh,h100_grid.sh,summarize.py} /opt/dlami/nvme/vdn/
 
-# --- 5. verify, then run the control (B0) before trusting any new number
+# --- 5. verify, then run the control below before trusting any new number
 bash /opt/dlami/nvme/vdn/box_check.sh
 ```
 
 `scripts/decode_parity.py`, `src/inference/utils/parallel_vae.py` and
 `src/inference/utils/yuv.py` come from the patch series, not from step 4 — if they are missing,
-`git am` did not run.
-
-`git am --3way` on the 12 patches has been verified clean against a fresh 2f740c9 on this box,
+`git am` did not run. `git am --3way` has been verified clean against a fresh 2f740c9 on this box,
 and the tree it produces is byte-identical to the one the 11.44 s measurement came off.
 
----
+### 2c. The two control runs
 
-## 3. The queue
-
-> **A is done, and it won: 480p 8.02 s median / 768p 19.04 s median, ten requests each, nothing
-> offloaded, peak 62.1 GB/GPU at 768p** (2026-09-16, sglang main `3f8eb35e`). That is 1.43× and
-> 1.74× the reference stack, with text encoding inside SGLang's number and outside the reference
-> stack's. **A0 and A1 below are still the instructions to reproduce it**, with two additions the
-> run needed and this file did not predict: `ffmpeg`/`ffprobe` must exist before startup, and
-> `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is what makes it fit — the offload ladder in
-> A1 was never used. `scripts/sglang_arm.sh` carries all five fixes with the symptom each produced.
-> Numbers and the full account: `RESULTS.md`, "SGLang Diffusion is faster than all of it".
->
-> This makes **B1–B5 optional**, and B4 (pricing a conditioner in the request path) moot: the
-> conditioner is resident in the winning configuration and its cost is already inside the 8.02 s.
-
-**Arm A comes first, and it may make most of B obsolete.** SGLang Diffusion now serves this
-exact checkpoint, and on 8× B200 it beats the stack measured here by 1.43–1.60× at the same GPU
-count. Run A1 before spending time on B1–B5.
-
-The B arms are the patched reference stack. Ordered so each is interpretable given the ones above
-it. Times include the ~220 s model build, which every arm pays once, and all of them run from
-`/opt/dlami/nvme/vdn`.
-
-The pattern is always the same:
+The pattern is always the same, from `/opt/dlami/nvme/vdn`. `runone.sh` sources the venv, sets
+`OMP_NUM_THREADS=24` (trap 2) and `expandable_segments`, kills any previous `infer_ulysses.py`, and
+passes `render.record=true`. Overrides are OmegaConf dotlist. Each run pays a ~220 s model build.
 
 ```bash
-cd /opt/dlami/nvme/vdn
-setsid nohup bash runone.sh <tag> <config> 8 [key=value ...] > <tag>.log 2>&1 < /dev/null &
-tail -f <tag>.log
-```
-
-`runone.sh` sources the venv, sets `OMP_NUM_THREADS=24` (trap 2), `expandable_segments`, kills
-any previous `infer_ulysses.py`, and passes `render.record=true`. Overrides are OmegaConf
-dotlist, so anything in `src/config/inference.py` can go on the end.
-
-### A0 — install SGLang Diffusion beside the reference stack. **~15 min, ~250 GB.**
-
-```bash
-mkdir -p /opt/dlami/nvme/sglang
-cp /opt/dlami/nvme/vdn/staging/sglang_{bringup,arm}.sh /opt/dlami/nvme/vdn/
-setsid nohup bash /opt/dlami/nvme/vdn/sglang_bringup.sh \
-    > /opt/dlami/nvme/sglang/bringup.log 2>&1 < /dev/null &
-tail -f /opt/dlami/nvme/sglang/bringup.log
-```
-
-**Why this is now the top of the queue.** SGLang's cookbook
-([`docs/cookbook/diffusion/MiniMax/MiniMax-H3.mdx`](https://github.com/sgl-project/sglang/blob/main/docs/cookbook/diffusion/MiniMax/MiniMax-H3.mdx),
-section 7) serves `OpenVDN/vdn-minimax-h3` directly, on the same 345-frame 1344×768 workload,
-and publishes a head-to-head against *this* stack — its "OpenVDN reference" rows are
-`8nfe_tuned_fp8.yaml` + `infer_ulysses.py` with `parallel.softmax_ranks` swept, i.e. the thing
-B0–B2 measure. On 8× B200: **0.88 s/NFE against the reference stack's 1.40**, and **0.98** on
-the per-channel fp8 path, which is the one an H100 (SM90) takes. It also implements as *flags*
-three things this repo carries as patches — encoder folding across idle ranks, VAE
-residency/offload policy, layerwise DiT placement — and it is an HTTP server, which is the shape
-the eventual deployment needs anyway.
-
-The cookbook credits the gap to parallel efficiency, not Blackwell precision: 86–91 % from 2 to
-8 cards against the reference stack's 56–64 %, with the two stacks within 4 % of each other on
-**one** card (6.03 vs 6.25 s/NFE fp8). That is the claim to test here, because it is the claim
-that should carry to H100 — and H100's NVLink is roughly half B200's, so the all-to-all it
-attributes the win to is *relatively more* expensive on this box, not less.
-
-**What the cookbook does not have: any H100 VDN number.** Its VDN tables are B200 and
-RTX PRO 6000; its H100 rows are 4-card *base* H3 (TP2+Ulysses2, 13.25 s). 8× H100 Ulysses8 for
-VDN is legal but unverified, and 480p is off the released 768 target (it appears only in the
-consumer sections, at 864×480 — our exact canvas). So A1 is a measurement, not a lookup.
-
-Two failure modes to expect at install time. The PyPI wheel may predate section 7 — the script
-gates on `sglang serve --help | grep hybrid_window_attn_h3` and tells you the `git+` line if it
-is missing. And disk: it cannot reuse `/opt/dlami/nvme/vdn/ckpts` (that was a `--local-dir`
-download with no cache layout), it hard-links the conditioner and VAEs out of
-`MiniMaxAI/MiniMax-H3` so that repo comes down too, and the first launch prefuses both adapters
-into the transformer as a **62 GB write**. ~250 GB on the NVMe, which has 27 TB.
-
-### A1 — SGLang on eight H100s, both canvases. **~10 min each after A0.**
-
-```bash
-cd /opt/dlami/nvme/vdn
-setsid nohup bash sglang_arm.sh serve 480 > /dev/null 2>&1 < /dev/null &
-tail -f /opt/dlami/nvme/sglang/logs/serve_480p.log      # wait for the warmup to finish
-bash sglang_arm.sh bench 480 10                          # 1 warmup + 10 measured
-bash sglang_arm.sh stop
-```
-
-Then the same with `768`. **Compare against B0's 11.44 s and B1's 33.21 s** — and note the
-comparison is loaded *against* SGLang: its request latency includes text encoding, which every
-number in RESULTS.md excludes, because the reference stack `torch.load`s an offline prompt cache.
-Read the broken-out `text encoding` line before the totals. On 8× B200 that stage costs ~0.2 s
-folded across ranks, so if it costs similarly here it does not decide anything; on one RTX 5090
-it was 4.2 s, so it is not free by construction.
-
-**Expect, and this is a prediction rather than a reading:** if the parallel-efficiency claim
-carries, 768p denoise goes 20.97 → **~14–15 s** and 480p 8.71 → **~6 s**, putting 480p
-end-to-end near **8 s** against 11.44. If instead it lands within noise of the reference stack,
-the 1.43× was Blackwell-specific and the patched stack stays.
-
-**The first thing this settles is memory, not speed.** 8× B200 Ulysses8 peaked at
-**79,972 MB/GPU**. This card has 81,559 MiB total and gives PyTorch **65.26 GiB** after the
-measured 13.92 GiB non-PyTorch floor, so `--performance-mode speed` at 768p may simply not fit.
-In order, the things to trade:
-
-```bash
-bash sglang_arm.sh serve 768 --performance-mode auto           # 120 GiB residency threshold
-bash sglang_arm.sh serve 768 --layerwise-offload-components text_encoder
-bash sglang_arm.sh serve 768 --layerwise-offload-components dit,text_encoder \
-                             --dit-layerwise-resident-layers 14
-```
-
-Each of those costs latency, so record which one was needed: "SGLang is faster" and "SGLang is
-faster while offloading the DiT" are different findings. A 480p fit is much more likely than a
-768p one — 480p is a quarter of the packed rows (43,759 vs 105,265) — which is why A1 runs 480p
-first, and 480p is the target anyway.
-
-If A1 wins, the honest conclusion is that this repo's twelve patches were the right way to find
-out *where the time goes* (the 3+5 branch split, the decode's 8.1 GiB, the fp8 host assembly) and
-the wrong way to *serve* it, and B3–B5 should be dropped in favour of re-running fl2va and the
-conditioner questions inside SGLang, where both are already flags.
-
-### B0 — the control: 480p/345f, ten requests. **~7 min. Nothing means anything without it.**
-
-```bash
+# 480p / 345f, ten requests. ~7 min. Expect 11.44 +- 0.05 s over requests 2-10.
 setsid nohup bash runone.sh f1_480p_rep10 8nfe_480p_345f_ulysses_h100.yaml 8 \
     render.repeat=10 > f1_480p_rep10.log 2>&1 < /dev/null &
-```
 
-**Why:** a rebuilt environment is not the same environment until it is shown to be. Everything
-else here is a comparison against numbers measured on a machine that no longer exists.
+# 768p / 345f, ten requests. ~10 min. Expect 33.21 +- 0.85 s, and peak reserved 63.59 GiB
+# IDENTICAL at request 2 and request 10 -- zero memory growth is as much the point as the mean.
+setsid nohup bash runone.sh f2_768p_rep10 8nfe_768p_345f_ulysses_h100.yaml 8 \
+    render.repeat=10 > f2_768p_rep10.log 2>&1 < /dev/null &
 
-**Expect**, requests 2–10: total **11.44 ± 0.05 s**, denoise 8.71, video VAE 1.56,
-decode+encode 1.17; request 1 ≈ **16.1 s** (decoder load ~3.6 inside it); decode peak
-~62.3 GiB reserved; reserved growth over the ten +0.27 GiB. **Already done on this box** — it
-reproduced the old 11.447 ± 0.040 to 0.06 %. Re-run it after any environment change and
-nowhere else. Outside ±2 % on the mean, stop and check the two `+cu129` suffixes.
-
-Read the result with:
-
-```bash
 grep -E "^(steady|reserved after| req|  [0-9])" f1_480p_rep10.log
 ```
 
-### B1 — the 768p control. **~10 min.**
+480p breakdown to expect: denoise 8.71, video VAE 1.56, decode+encode 1.17; request 1 ≈ 16.1 s.
+**Outside ±2 % on the mean, stop and check the two `+cu129` suffixes** before reading anything into
+it. The 480p arm has already reproduced the old 11.447 ± 0.040 to 0.06 % on this box.
 
-```bash
-setsid nohup bash runone.sh f2_768p_rep10 8nfe_768p_345f_ulysses_h100.yaml 8 \
-    render.repeat=10 > f2_768p_rep10.log 2>&1 < /dev/null &
-```
+### 2d. The other reference-stack arms, and why they are no longer queued
 
-**Expect:** **33.21 ± 0.85 s** over requests 2–10, with a decoder load ~5.0 s and release
-~1.8 s *inside each request* (that config cycles the decoders on purpose), and peak reserved
-63.59 GiB **identical at request 2 and request 10**. Zero memory growth is as much the point of
-this arm as the mean is.
+Kept for the record; run one only if a specific question needs it.
 
-### B2 — reproduce the OOM the whole 768p design rests on. **~6 min, expected to fail.**
+* **`vae_after_decode=keep` at 768p, expected to OOM.** The load-bearing negative result of the
+  whole 768p design rests on one OOM from one run, and it has never been reproduced. Cheap
+  (~6 min) and it re-measures the non-PyTorch floor on the current driver:
+  `runone.sh f3_768p_keepkeep 8nfe_768p_345f_ulysses_h100.yaml 8 render.repeat=2 parallel.vae_after_decode=keep`.
+  Expect request 2 to die on ranks **5, 6, 7** — exactly the three linear-branch ranks at
+  `softmax_ranks: 5`.
+* **fl2va in the reference stack** (`PROMPT=prompts/image/example_fl2va.pt`, +8.9 % denoise at
+  768p) — **superseded by 1d**, which measures it end to end with the visual tokenizer inline.
+  The two numbers are reconciled in RESULTS.md: the +8.9 % was denoise-only against pre-encoded
+  latents.
+* **Pricing a conditioner in the request path** (`text_encoder_bench.py --transfer 6.1`) —
+  **moot**. The conditioner is resident in the winning configuration and its cost is already
+  inside the 8.02 s.
+* **cu130 in a second venv** — worth knowing, not worth mixing. cu129 is upstream VDN's own pin
+  and sm90 is not where cu130's work went. Note that SGLang resolves its own torch and already
+  runs nvidia cu13 / nvcc 13.4 in its venv, so the interesting half of this question is answered.
 
-```bash
-setsid nohup bash runone.sh f3_768p_keepkeep 8nfe_768p_345f_ulysses_h100.yaml 8 \
-    render.repeat=2 parallel.vae_after_decode=keep > f3_768p_keepkeep.log 2>&1 < /dev/null &
-```
+---
 
-**Why this one first if you only run one:** `vae_after_decode: free`, the 4.7x argument, and the
-corrected memory table in RESULTS.md all rest on **one** OOM message from **one** run. It is
-the load-bearing negative result in the study, it has never been reproduced, and it is the
-cheapest arm here.
+## 3. Still open
 
-**Expect:** request 1 completes (denoise ~19.8 s); request 2 dies in the denoise on ranks
-**5, 6, 7** — exactly the three linear-branch ranks at `softmax_ranks: 5` — asking for
-444–468 MiB with 120–440 MiB free and 64.7–65.1 GiB already allocated by PyTorch.
-
-```bash
-grep -E "OutOfMemory|is allocated by PyTorch|total capacity" f3_768p_keepkeep.log | sort -u
-```
-
-**What it settles:** the non-PyTorch floor on this newer driver (595.91.07). RESULTS.md derives
-13.92 GiB from the old log, and the 10.32 GiB of denoise headroom is that number's complement.
-If the floor moved, the 768p config's justification needs re-stating, not just re-measuring.
-
-### B3a — fl2va end to end at 768p. **~11 min, no download, nothing to prepare.**
-
-The only fl2va numbers so far are **denoise-only**: +8.9 % at 768p, +8.7 % at 480p. What a
-first/last-frame request actually costs a caller has never been measured, and it has to come out
-*lower* than the per-NFE figure, because the decode and the tail do not scale with conditioning
-rows — only the denoise does.
-
-The repo ships a ready 768p keyframe cache, `prompts/image/example_fl2va.pt` (3,485 embedding
-rows, anchors `first`+`last`, `condition_latents` 2 × (1,24,1,48,84), encoded from
-`prompts/image/{first,last}.png` at 768×1344), so this arm needs **no conditioner download and
-no encoding step**:
-
-```bash
-cd /opt/dlami/nvme/vdn
-setsid nohup env PROMPT=prompts/image/example_fl2va.pt bash runone.sh f4_768p_fl2va_rep10 \
-    8nfe_768p_345f_ulysses_h100.yaml 8 render.repeat=10 \
-    > f4_768p_fl2va_rep10.log 2>&1 < /dev/null &
-```
-
-**Expect** requests 2–10: denoise 20.97 × 1.089 ≈ **22.8 s**, so a request total of
-**~35.1 s against B1's 33.21 — about +5.6 %**, not +8.9 %. If it lands near +8.9 % instead, the
-premise above is wrong and something *does* scale with the conditioning rows outside the
-denoise, which is worth knowing. Run B1 in the same session or immediately before, so the
-comparison is same-process-generation.
-
-Note this cache carries a **different prompt** from `prompts/example_2.pt` (same 1,299 text
-rows, different words). That is fine for a cost comparison — the row counts are recorded and
-they are what the time tracks — but it is not a same-prompt A/B, so do not compare the *pixels*.
-
-Check the row split before reading the timings; it is what makes the result a mechanism rather
-than a number:
-
-```bash
-cd /opt/dlami/nvme/vdn/vdn-minimax-h3 && .venv/bin/python -c "import json; \
-print(json.load(open('/opt/dlami/nvme/vdn/out/f4_768p_fl2va_rep10.mp4.inference.json'))['sequence_splits'])"
-# expect text+vision 3485, condition 2016, audio 1150, video 102816 -> 109467
-```
-
-### B3b — fl2va at 480p. **~15 min, plus a 62 GiB download.**
-
-Only worth doing after B3a, and only if you need 480p specifically: it tests whether fl2va's
-overhead really is **proportional rather than additive** (the claim that explains why +8.9 % and
-+8.7 % came out the same at two canvases). **A keyframe cache is only valid at the canvas it was
-encoded for** — `condition_latents` come out at that canvas's latent size — so 480p needs its
-own, which is what patch 6 is for. Encoding needs the **Qwen3-VL conditioner**: 62 GiB from
-`MiniMaxAI/MiniMax-H3`, which is *not* in the OpenVDN checkpoint.
-
-Reuse the shipped cache's own prompt and images so B3a and B3b differ only in canvas:
-
-```bash
-cd /opt/dlami/nvme/vdn/vdn-minimax-h3 && source .venv/bin/activate
-export HF_HOME=/opt/dlami/nvme/vdn/hf HF_HUB_ENABLE_HF_TRANSFER=1
-
-TEXT=$(python -c "import torch; print(torch.load('prompts/image/example_fl2va.pt', \
-    weights_only=True)['prompt'], end='')")
-python src/inference/encode_keyframes.py --prompt "$TEXT" \
-    --first prompts/image/first.png --last prompts/image/last.png \
-    --height 480 --width 864 --out prompts/fl2va_480p.pt
-# prints: wrote ... N tokens (980 vision rows), 2 keyframes [(1, 24, 1, 30, 54), ...]
-
-cd /opt/dlami/nvme/vdn
-setsid nohup env PROMPT=prompts/fl2va_480p.pt bash runone.sh f5_480p_fl2va_rep10 \
-    8nfe_480p_345f_ulysses_h100.yaml 8 render.repeat=10 \
-    > f5_480p_fl2va_rep10.log 2>&1 < /dev/null &
-```
-
-**Expect:** rows `2279 / 810 / 1150 / 41310 = 45549`, and 11.44 → **~12.2 s (+6.5 %)**. The
-prediction that matters is that B3b's percentage and B3a's are again the *same*, because the
-vision rows and the condition latents both scale with the canvas.
-
-### B4 — pricing a conditioner in the request path. **~5 min, needs no weights at all.**
-
-```bash
-cd /opt/dlami/nvme/vdn/vdn-minimax-h3 && source .venv/bin/activate
-torchrun --standalone --nproc_per_node=8 scripts/text_encoder_bench.py --transfer 6.1
-```
-
-**Why:** the recommendation in RESULTS.md — keep the trimmed conditioner as a **pinned** host
-copy and upload 6.1 GiB per rank per request, ~0.8 s, +7 % — rests on a **single-rank**
-10.08 GiB/s figure applied to eight simultaneous uploads. Eight H2D streams share host memory
-bandwidth and NUMA paths. If the per-rank rate collapses to 4 GiB/s the answer is 1.5 s and
-+13 %, which changes the recommendation. The arm prints the single-rank transfer next to the
-eight-rank one, so the contention is measured instead of assumed. It needs no checkpoint, so it
-is nearly free.
-
-The same numbers price the unbuilt **pinned host copy of the video VAE** (9.70 GiB/rank), which
-would take 768p from 33.21 to ~28 s by replacing the 5.0 s disk load. Run B4 and that becomes
-arithmetic.
-
-The model-side numbers, if the conditioner is downloaded anyway (single GPU, ~10 min):
-
-```bash
-python scripts/text_encoder_bench.py --tokens 1300      # load, forward, trim, offload
-```
-
-Then, and only if the transfer holds up, the actual implementation: because VDN reads
-`hidden_states[50]`, only **layers 0–50** are needed, so a **pipeline** shard is enough — rank
-*r* owns a contiguous slice of the 51 layers and hands on a 1300×5120 bf16 = **13 MB** tensor,
-seven hops over NVLink. No tensor parallelism, no custom kernels. Designed, **not implemented**;
-`--transfer` prices its dominant cost first on purpose.
-
-### B5 — cu130, in a separate venv. **~20 min.**
-
-Worth knowing, not worth mixing — so build a second venv and leave the control intact:
-
-```bash
-cd /opt/dlami/nvme/vdn/vdn-minimax-h3
-export PATH=$HOME/.local/bin:$PATH UV_CACHE_DIR=/opt/dlami/nvme/vdn/uvcache
-uv venv --python 3.12 .venv130 && source .venv130/bin/activate
-uv pip install -q torch==2.13.0 torchvision==0.28.0          # cu130 IS the PyPI default
-uv pip install -q --prerelease=allow -e .
-DIFFUSERS_DIR=diffusers130 bash scripts/setup_diffusers.sh
-```
-
-(That cu130 is the default with no index specified is exactly why trap 1 exists.) Then re-run
-**B0 inside it** and compare against 11.44 ± 0.05 — `runone.sh` hardcodes `.venv`, so either
-edit it or run `torchrun` directly.
-
-**Expect little.** cu129 is upstream VDN's own pin (their README requires `2.13.0+cu129`,
-because flash-attn-4's `nvidia-cutlass-dsl` otherwise drags in the cu130 default), the hot path
-is FA4's CuteDSL kernels plus this repo's Triton kernels and `torch.compile` rather than cuBLAS,
-and sm90 is not where cu130's work went. It may also simply not build — that is a real risk,
-not a formality. If it *is* faster by more than the control's ±2 %, the whole table has to be
-re-measured there, and that cost is what the gain has to beat.
-
-### Still open, no code yet
-
-* **Pinned host copy of the video VAE** — 768p 33.21 → ~28 s. B4 gives the transfer rate.
-  Superseded if A1 wins: SGLang's `--component-residency vae=resident` is the same idea as a
-  flag, and its cookbook already reports 4.8 GiB/GPU for it on a 2×H100 CI recipe.
-* **Why 768p's steady denoise is *slower* than its own first request** (19.77 → 20.97 s) while
-  480p's is flat. Investigate with `parallel.profile=true` appended to B1. Worth doing either
-  way — it is a property of the reference stack that no SGLang number explains.
-* **fl2va and the conditioner inside SGLang.** Both are flags there (`task: "fl2va"` with
-  keyframe conditions; `--encoder-parallel auto`), which is what B3 and B4 exist to hand-build.
-  If A1 lands, re-ask them there instead.
+* **The non-inference tail.** SGLang's E2E minus `inference_time_s` is ~1 s at 480p and ~2 s at
+  768p: mux plus disk write. This repo's finding that libx264 does not parallelise itself and needs
+  segmented encoding points straight at it — but that is upstream code now, so it is a PR, not a
+  patch.
+* **Why the reference stack's 768p steady denoise is *slower* than its own first request**
+  (19.77 → 20.97 s) while 480p is flat. `parallel.profile=true` appended to the 768p control. A
+  property of the reference stack that no SGLang number explains.
+* **2K upscale is not open source.** MiniMax's own page says so. Nothing to run.
+* **Territory.** The MiniMax H3 Community License's applicable territory excludes the United
+  States, EU, UK and South Korea, and this box is in `us-east-2`. Flagged in README.md; a licensing
+  question, not a technical one.
 
 ---
 
 ## 4. Results
 
-Every arm writes an mp4 and, because `runone.sh` passes `render.record=true`, a JSON record
-next to it:
+**SGLang** writes its mp4s under `/opt/dlami/nvme/vdn/outputs/` (the server's cwd) and its logs
+under `/opt/dlami/nvme/sglang/logs/`. Latency comes from the bench log and from each response's
+`inference_time_s` / `peak_memory_mb`.
+
+**The reference stack** writes an mp4 and, because `runone.sh` passes `render.record=true`, a JSON
+record next to it holding the checkpoint identity, the resolved config, the actual kernel state,
+per-NFE and per-request timings, and `sequence_splits`:
 
 ```bash
-ls -la /opt/dlami/nvme/vdn/out/
-cd /opt/dlami/nvme/vdn/vdn-minimax-h3 && .venv/bin/python scripts/clipinfo.py \
-    /opt/dlami/nvme/vdn/out/<tag>.mp4                      # canvas, frames, duration, audio
-python /opt/dlami/nvme/vdn/summarize.py /opt/dlami/nvme/vdn/out   # the RESULTS.md tables
+cd /opt/dlami/nvme/vdn/vdn-minimax-h3
+.venv/bin/python scripts/clipinfo.py /opt/dlami/nvme/vdn/out/<tag>.mp4   # canvas, frames, audio
+python /opt/dlami/nvme/vdn/summarize.py /opt/dlami/nvme/vdn/out          # the RESULTS.md tables
 ```
 
-`<tag>.mp4.inference.json` holds the checkpoint identity, the fully resolved config, the actual
-kernel state, per-NFE timings, per-request timings under `requests`, and `sequence_splits`.
-**Copy the JSON off the box even for a run that failed** — it is the only durable record, and
-the previous instance was terminated with an mp4 transfer half-finished.
+**Copy records off the box even for a run that failed** — they are the only durable record, and the
+previous instance was terminated with an mp4 transfer half-finished.
 
-**[on your Mac]**, to pull things back:
+**[on your Mac]**:
 
 ```bash
 cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
+bash scripts/p5.sh --get '/opt/dlami/nvme/sglang/logs/*.log'            out/sglang/logs/
+bash scripts/p5.sh --get '/opt/dlami/nvme/vdn/outputs/<name>.mp4'       out/sglang/
 bash scripts/p5.sh --get '/opt/dlami/nvme/vdn/out/<tag>.mp4.inference.json' rescue/
-bash scripts/p5.sh --get '/opt/dlami/nvme/vdn/out/<tag>.mp4' samples/
 ```
+
+`out/` is gitignored — mp4s stay local.
 
 ---
 
 ## 5. Traps
 
-1. **`torchvision` must be `+cu129`.** `pyproject.toml` pins `torchvision==0.28.0` with no
-   local version, so if it is left to `uv pip install -e .` the resolver takes the PyPI
-   default — **cu130** — and then every `import diffusers.loaders.peft` dies with `PyTorch has
-   CUDA Version=12.9 and torchvision has CUDA Version=13.0`, surfacing unhelpfully as
-   `Could not import module 'BloomPreTrainedModel'`. `h100_bringup.sh` now names both wheels
-   from the cu129 index up front, which is the only ordering with no repair step, because the
-   obvious repair does not work: `uv pip install torchvision==0.28.0 --index-url .../cu129` is
-   a **no-op** (0.28.0 already satisfies 0.28.0, so `0.28.0+cu129` is never fetched). If you
-   are already in that state:
+1. **`torchvision` must be `+cu129`** *(reference stack only)*. `pyproject.toml` pins
+   `torchvision==0.28.0` with no local version, so `uv pip install -e .` takes the PyPI default —
+   **cu130** — and then every `import diffusers.loaders.peft` dies with `PyTorch has CUDA
+   Version=12.9 and torchvision has CUDA Version=13.0`, surfacing unhelpfully as `Could not import
+   module 'BloomPreTrainedModel'`. `h100_bringup.sh` names both wheels from the cu129 index up
+   front, which is the only ordering with no repair step, because the obvious repair is a **no-op**
+   (0.28.0 already satisfies 0.28.0, so `0.28.0+cu129` is never fetched). If already broken:
 
    ```bash
-   cd /opt/dlami/nvme/vdn/vdn-minimax-h3 && source .venv/bin/activate
    uv pip install --reinstall-package torchvision torchvision==0.28.0 \
        --index-url https://download.pytorch.org/whl/cu129
    ```
 
-2. **`torchrun` sets `OMP_NUM_THREADS=1`** and says so in its own output. Right for a GPU
-   render, wrong for patch 2's host-side LoRA merge and fp8 quantise: at 1 thread all 8 ranks
-   sit at 99 % of a single core and are still going after six minutes. `runone.sh` sets
-   `192 / nproc_per_node`, which brings the assembly in at ~200 s. If you invoke `torchrun`
-   by hand, set it by hand.
+2. **`torchrun` sets `OMP_NUM_THREADS=1`** and says so in its own output. Right for a GPU render,
+   wrong for patch 2's host-side LoRA merge and fp8 quantise: at 1 thread all 8 ranks sit at 99 %
+   of a single core and are still going after six minutes. `runone.sh` sets `192 / nproc_per_node`.
 
-3. **Do not use the DLAMI's `/opt/pytorch`.** Python 3.13 + cu130; the repo requires
-   `>=3.12,<3.13` and the cu129 wheels. **SGLang fails there too, and the error names the
-   wrong culprit:** `sglang[diffusion]` pins an `outlines_core` 0.1.x whose newest wheel is
-   **cp312** (checked on PyPI: every 0.1.x stops at cp312; cp313 first appears in 0.2.9), so
-   under 3.13 pip has no wheel, falls back to the sdist, and dies on
-   `error: can't find Rust compiler`. Installing Rust is the wrong fix — it makes that one
-   package build, leaves you on 3.13 for the next gap, and installing into `/opt/pytorch` at
-   all would overwrite the shared DLAMI torch. Build a private 3.12 instead, which is what
-   `sglang_bringup.sh` does; it now refuses to run with `$VIRTUAL_ENV` set and asserts the
-   venv is 3.12 before installing anything.
+3. **Do not use the DLAMI's `/opt/pytorch`.** Python 3.13 + cu130. The reference stack requires
+   `>=3.12,<3.13` and cu129. **SGLang fails there too, and the error names the wrong culprit:**
+   `sglang[diffusion]` pins an `outlines_core` 0.1.x whose newest wheel is **cp312** (every 0.1.x
+   stops at cp312; cp313 first appears in 0.2.9), so under 3.13 pip falls back to the sdist and
+   dies on `error: can't find Rust compiler`. Installing Rust is the wrong fix — it makes that one
+   package build and leaves you on 3.13 for the next gap. Both bringup scripts build a private 3.12.
 
-4. **Everything on `/opt/dlami/nvme`.** `/` is 484 GB, the checkpoint is 82 GB, and the NVMe
-   is 27 TB — but it is an instance store and a stop/start wipes it.
+4. **Everything on `/opt/dlami/nvme`.** `/` is 484 GB, the HF cache is 407 GB, the NVMe is 27 TB —
+   but it is an instance store and a stop/start wipes it.
 
-5. **Host RAM is a real constraint.** Patch 2 assembles on the CPU, so 8 ranks each hold
-   ~78 GiB of bf16 weights at once, ~620 GB. Fine on this box's 2 TB; it would not fit a
-   smaller one.
+5. **The two venvs are not interchangeable and must stay separate.**
+   `/opt/dlami/nvme/vdn/vdn-minimax-h3/.venv` is torch 2.13.0+cu129 and must keep reproducing
+   11.44 s; `/opt/dlami/nvme/sglang/.venv` resolves its own torch. They share only `HF_HOME`.
+   Installing sglang into the reference venv overwrites the number sglang is compared against.
 
-6. **`git checkout .` / `git stash` / `git reset --hard` inside the repo.** Harmless in the
-   current state (the 12 patches are commits, `box_check.sh` says `tree clean`), destructive in
-   the older one where they were file copies. `box_check.sh` tells you which state you are in.
+6. **Host RAM is a real constraint for the reference stack.** Patch 2 assembles on the CPU, so 8
+   ranks each hold ~78 GiB of bf16 weights at once, ~620 GB. Fine on this box's 2 TB.
 
-7. **Multi-rank denoise is not bit-reproducible** — `index_add_` atomics plus `all_reduce`
-   reorder floating-point work, so the same seed across two runs gives ~17 dB PSNR, not
-   identity. Any parity claim about the decode has to be made in one process with fixed
-   latents, which is what `scripts/decode_parity.py` does.
+7. **`git checkout .` / `git stash` / `git reset --hard` inside `vdn-minimax-h3`.** Harmless in the
+   current state (the 12 patches are commits, `box_check.sh` says `tree clean`), destructive in the
+   older one where they were file copies. `box_check.sh` tells you which state you are in.
+
+8. **`pkill -f 'sglang.*serve'` kills the ssh session that issues it.** `ssh box 'pkill -f
+   sglang.*serve; bash sglang_arm.sh serve 480'` matches its own command line, returns 255, and
+   starts nothing. `sglang_arm.sh stop` uses the `[s]glang` bracket trick, but the real rule is
+   that **stop and launch must be separate ssh invocations** — any command line genuinely
+   containing both words matches.
+
+9. **Multi-rank denoise is not bit-reproducible** — `index_add_` atomics plus `all_reduce` reorder
+   floating-point work, so the same seed across two runs gives ~17 dB PSNR, not identity. Any
+   parity claim about the decode has to be made in one process with fixed latents, which is what
+   `scripts/decode_parity.py` does. Same reason 1d verifies keyframes by PSNR *against a control*
+   (31.6 dB vs the right keyframe, 12.7 dB vs the wrong one) rather than by equality.
