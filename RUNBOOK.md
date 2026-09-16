@@ -66,7 +66,8 @@ The box has no GitHub credentials, so this private repo cannot be cloned there.
 
 ```bash
 cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
-for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py; do
+for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py \
+         scripts/sglang_parity.py; do
   bash scripts/p5.sh --put "$f" "/opt/dlami/nvme/vdn/$(basename "$f")"
 done
 ```
@@ -209,6 +210,32 @@ MiniMax-H3 has ref2va but no 8-step distill, i.e. a different and much slower mo
   caller's. The API is async: `POST /v1/videos` returns `queued`; poll `GET /v1/videos/{id}` for
   `completed`, which carries `inference_time_s` and `peak_memory_mb`.
 
+### 1e. Same prompt, same seed as the reference stack. **~1 min, server already up.**
+
+The quality question, asked at matched input. `prompts/example_2.pt` carries the prompt *text* next
+to its embeddings, so the same 5,720 characters go over HTTP and SGLang re-encodes them with the
+same conditioner the cache came from; `seed: 42` is `src/config/inference.py:167`.
+
+```bash
+cd /opt/dlami/nvme/vdn
+/opt/dlami/nvme/sglang/.venv/bin/python -u sglang_parity.py
+```
+
+Measured: **480p 8.55 s, 768p 19.10 s** — a real production prompt costs ~0.5 s more than vbench's
+short ones at 480p and nothing extra at 768p. Both stacks then render the prompt's eight shots at
+the prompt's timestamps with the same subject; the pixels differ (15.35 / 14.42 dB PSNR, *inside*
+the same-stack same-seed band — see trap 9). **Do not read PSNR as quality here.** Compare by
+watching:
+
+```bash
+# [on your Mac], after --get'ing both
+ffmpeg -i samples/n_480p_seg4.mp4 -i out/sglang/parity/parity_480p_345f_seed42.mp4 \
+  -filter_complex "[0:v][1:v]hstack" -map 1:a -c:v libx264 -crf 20 sidebyside.mp4
+```
+
+`output_path` in the request is treated as a **directory**, not a filename — the mp4 lands inside it
+under a UUID.
+
 ---
 
 ## 2. The reference stack — the control
@@ -330,9 +357,11 @@ Kept for the record; run one only if a specific question needs it.
 * **Pricing a conditioner in the request path** (`text_encoder_bench.py --transfer 6.1`) —
   **moot**. The conditioner is resident in the winning configuration and its cost is already
   inside the 8.02 s.
-* **cu130 in a second venv** — worth knowing, not worth mixing. cu129 is upstream VDN's own pin
-  and sm90 is not where cu130's work went. Note that SGLang resolves its own torch and already
-  runs nvidia cu13 / nvcc 13.4 in its venv, so the interesting half of this question is answered.
+* **cu130 in a second venv** — **effectively answered, and not by this arm.** SGLang resolves its
+  own torch and the winning configuration runs **torch 2.13.0+cu130** with nvcc 13.4
+  (`out/sglang/parity/sglang_env.txt`, a full freeze off the box). cu130 on sm90 is therefore not a
+  blocker and not a win by itself; cu129 remains the reference stack's pin because that is what
+  upstream VDN requires.
 
 ---
 
@@ -380,7 +409,19 @@ bash scripts/p5.sh --get '/opt/dlami/nvme/vdn/outputs/<name>.mp4'       out/sgla
 bash scripts/p5.sh --get '/opt/dlami/nvme/vdn/out/<tag>.mp4.inference.json' rescue/
 ```
 
-`out/` is gitignored — mp4s stay local.
+`out/` is gitignored — mp4s stay local. What was rescued off this instance before it was shut down,
+all under `out/sglang/`:
+
+| local | what |
+|---|---|
+| `sglang_{480,768}p_345f.mp4` | the t2va renders the 8.02 / 19.04 s numbers came from |
+| `parity/parity_{480,768}p_345f_seed42.mp4` | same prompt + seed 42 as the reference stack (§1e) |
+| `parity/sidebyside_{480,768}p_seed42.mp4` | reference left, SGLang right, labelled |
+| `parity/sheet_{480,768}p.png` | frames 0/110/220/344 matched, reference row above SGLang row |
+| `parity/cond_{480,768}p_{t2va,fl2va_first_last,fl2va_first_only}.mp4` | the six conditioning arms (§1d) |
+| `parity/{first,last}_{480,768}.png` | the keyframes those fl2va requests were given |
+| `parity/sglang_env.txt` | python 3.12.14, sglang `0.5.6.post3.dev10594+g3f8eb35ea`, torch 2.13.0+cu130, 237-package freeze |
+| `logs/`, `parity/{cond,parity,serve_480p}.log` | the bench, conditioning, parity and server logs |
 
 ---
 

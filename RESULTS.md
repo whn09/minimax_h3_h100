@@ -162,6 +162,58 @@ runtime one — no flag, patch or framework changes it. ref2va means the base Mi
 which have no 8-step distill, so it is a different and much slower model, not this one with an
 extra argument.
 
+### Same prompt, same seed, both stacks: the same film, different frames
+
+The obvious quality question — is SGLang faster *and worse*? — is answerable at matched input,
+because `prompts/example_2.pt` carries the prompt **text** next to its embeddings. So the 5,720
+characters the reference stack rendered (the Cologne Cathedral eight-shot script) go over HTTP to
+SGLang, which re-encodes them with the same Qwen3-VL conditioner the cache was built from, at the
+same canvas, the same 345 frames, and the reference stack's own default `seed: 42`
+(`src/config/inference.py:167`). `scripts/sglang_parity.py`.
+
+| 345 f, seed 42, same 5,720-char prompt | E2E | inference | peak/GPU |
+|---|---:|---:|---:|
+| 480p | 8.55 s | 7.60 s | 54,940 MB |
+| 768p | 19.10 s | 17.36 s | 62,282 MB |
+
+**First result, and it is about the latency, not the pixels: a real production prompt does not move
+the numbers.** 8.55 / 19.10 against the benchmark's 8.02 / 19.04 on vbench's short prompts. The
+extra ~0.5 s at 480p is the conditioner reading fourteen times more text, and it does not grow with
+canvas — which is what an encoder folded across ranks should look like.
+
+**Second result: the two stacks render the same film and not the same frames.** Both outputs are
+864×480 / 1344×768, 345 frames, 14.375 s, 32 kHz stereo, 451 audio frames — identical containers.
+Frame-matched against the reference renders (`samples/n_480p_seg4.mp4`, `samples/p_768p_free.mp4`),
+both follow the prompt's eight shots at the prompt's own timestamps, with the same woman, the same
+cathedral, the same interior beats and the same sunset close. At 768p the composition tracks so
+closely that shot 2 has her arm raised to the facade at nearly the same angle in both. What differs
+is grade and framing detail: SGLang's stained-glass close-up is more saturated (the prompt asks for
+"patches of red, blue and gold" and SGLang takes it more literally), and its final pedestal-up
+keeps her silhouette on the steps, which the prompt asks for and the reference render drops.
+Contact sheets: `out/sglang/parity/sheet_{480,768}p.png`, side-by-side clips
+`out/sglang/parity/sidebyside_{480,768}p_seed42.mp4`.
+
+**And the PSNR between them is meaningless, which was predictable and is worth stating anyway:**
+
+| pair | PSNR (Y / average) |
+|---|---:|
+| 480p reference vs SGLang, same seed | 13.78 / **15.35 dB** |
+| 768p reference vs SGLang, same seed | 12.80 / **14.42 dB** |
+
+That is *inside* the band this repo already measured for two runs of the **same** stack at the
+**same** seed (~17 dB, "The same seed does not give the same video" below). Three reasons, none
+fixable: seed 42 fixes the RNG stream but the two stacks place the generator and shape the initial
+latent differently; the reference stack assembles per-tensor fp8 on the host while SGLang quantizes
+per-channel online; and multi-rank denoise is not bit-reproducible against itself, because
+`index_add_` atomics plus `all_reduce` reorder float work. So 15 dB here measures reordered
+arithmetic, not quality — the 768p pair looks *more* alike than the 480p pair and scores *lower*.
+The comparison that means something is the one you watch.
+
+One caveat stated rather than hidden: the reference renders were produced on the **previous**
+instance, and this box is a rebuild. That is the strongest form available in the time left, and it
+is not weak — the rebuilt reference stack reproduced 11.447 ± 0.040 s to 0.06 %, so it is the same
+code at the same seed, just not the same boot.
+
 The single change that made 768p fit was not an offload flag — it was
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The first 480p attempt OOM'd during warmup
 with **51.89 GiB allocated and 18.70 GiB reserved-but-unallocated**: online fp8 quantization frees
