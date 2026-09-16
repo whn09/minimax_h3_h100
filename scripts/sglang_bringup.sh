@@ -36,6 +36,16 @@ export SGLANG_DIFFUSION_CACHE_ROOT=${SGLANG_DIFFUSION_CACHE_ROOT:-$ROOT/cache}
 mkdir -p "$ROOT" "$SGLANG_DIFFUSION_CACHE_ROOT" "$HF_HOME"
 step() { echo "=== [$(date -u +%H:%M:%S)] $*"; }
 
+# Refuse to run inside an activated environment. Installing into the DLAMI's /opt/pytorch
+# fails, and the error blames the wrong thing: sglang pins an outlines_core 0.1.x, whose
+# newest wheel is cp312, so python 3.13 has to build it from source and dies on
+# "can't find Rust compiler". Installing Rust makes that one line pass and leaves you on
+# 3.13 for the next gap -- and it would also overwrite /opt/pytorch's torch for everyone.
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+  echo "deactivate first: \$VIRTUAL_ENV=$VIRTUAL_ENV. This script builds its own python 3.12."
+  exit 2
+fi
+
 step "uv"
 command -v uv >/dev/null 2>&1 || \
   curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=$HOME/.local/bin sh
@@ -49,6 +59,7 @@ source "$ROOT/.venv/bin/activate"
 # --prerelease=allow is the cookbook's own instruction (flash-attn-4 / cutlass-dsl again).
 # No --index-url here: unlike the reference stack, sglang resolves its own torch build,
 # and forcing cu129 on it is how you get a wheel mismatch it never asked for.
+python -V | grep -q '3\.12' || { echo "venv is not python 3.12; see the 3.13 note above"; exit 2; }
 uv pip install -q "sglang[diffusion]" --prerelease=allow
 uv pip install -q 'huggingface_hub[hf_transfer]'
 

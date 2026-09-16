@@ -499,7 +499,15 @@ bash scripts/p5.sh --get '/opt/dlami/nvme/vdn/out/<tag>.mp4' samples/
    by hand, set it by hand.
 
 3. **Do not use the DLAMI's `/opt/pytorch`.** Python 3.13 + cu130; the repo requires
-   `>=3.12,<3.13` and the cu129 wheels.
+   `>=3.12,<3.13` and the cu129 wheels. **SGLang fails there too, and the error names the
+   wrong culprit:** `sglang[diffusion]` pins an `outlines_core` 0.1.x whose newest wheel is
+   **cp312** (checked on PyPI: every 0.1.x stops at cp312; cp313 first appears in 0.2.9), so
+   under 3.13 pip has no wheel, falls back to the sdist, and dies on
+   `error: can't find Rust compiler`. Installing Rust is the wrong fix — it makes that one
+   package build, leaves you on 3.13 for the next gap, and installing into `/opt/pytorch` at
+   all would overwrite the shared DLAMI torch. Build a private 3.12 instead, which is what
+   `sglang_bringup.sh` does; it now refuses to run with `$VIRTUAL_ENV` set and asserts the
+   venv is 3.12 before installing anything.
 
 4. **Everything on `/opt/dlami/nvme`.** `/` is 484 GB, the checkpoint is 82 GB, and the NVMe
    is 27 TB — but it is an instance store and a stop/start wipes it.
