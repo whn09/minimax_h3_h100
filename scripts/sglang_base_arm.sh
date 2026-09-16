@@ -35,6 +35,9 @@
 #         is named for the *diffusers* layout (transformer_blocks.N.attn.to_{q,k,v} /
 #         ff.net.0.proj), and only FL2VA/ and Ref2VA/ ship native names. That is why g7e merged
 #         against FL2VA/transformer and hit 259/259, and why the same script hits 0/259 here.
+#         This blocks *this* LoRA on a *t2va* tree and nothing more: lightx2v's H3 Turbo LoRAs are
+#         diffusers-named, and MiniMaxAI/MiniMax-H3 ships transformer_ref/ diffusers-named as well,
+#         so the ref2va merge needs no translation at all. See REF2VA.md and sglang_ref2va_arm.sh.
 # Everything else -- CUDA_HOME discovery, the lib64/-lcudart symlinks, NCCL_NET_PLUGIN=none,
 # expandable_segments, the ffmpeg gate -- is identical and carries the same reasons as
 # sglang_arm.sh. Read that file for them.

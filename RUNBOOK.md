@@ -68,7 +68,8 @@ The box has no GitHub credentials, so this private repo cannot be cloned there.
 cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
 for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py \
          scripts/sglang_parity.py scripts/sglang_base_arm.sh scripts/sglang_base_steps.py \
-         scripts/lora_merge_h3.py; do
+         scripts/lora_merge_h3.py scripts/sglang_ref2va_arm.sh scripts/sglang_ref2va.py \
+         scripts/melt_metrics.py; do
   bash scripts/p5.sh --put "$f" "/opt/dlami/nvme/vdn/$(basename "$f")"
 done
 ```
@@ -287,6 +288,89 @@ cd /opt/dlami/nvme/vdn && QUANT= LOGTAG=turbo setsid nohup bash sglang_base_arm.
 The fp8 Turbo *latency* needs no run at all: merging an adapter changes weight values, not shapes and
 not the graph, so it is the 8-step row already measured — 9.02 s at 480p, 31.57 s at 768p.
 
+### 1g. ref2va + lightx2v Turbo, the "melting" question. **~15 min startup, ~3 min for all seven arms.**
+
+Read `REF2VA.md` first — it names the three causes each arm tests, and the arms are cheap enough
+(every one under a minute of GPU) that running them in the wrong order is the only way to waste time.
+**ref2va means base MiniMax-H3, not VDN**: upstream never trained ref2va for VDN and the server says
+so. That is why this is its own server on its own port (30012), and why it starts slower — it wants
+the `Ref2VA` partition, ~134 GiB, and it is bf16 because `--lora-path` does not survive fp8.
+
+```bash
+cd /opt/dlami/nvme/vdn && mkdir -p lora ref pull/ref2va
+# The two ref2v LoRAs, 1.3 GB each. bf16 diffusers-named PEFT; both declare alpha 8, rank 128.
+for n in minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16 minimax_h3_ref2v_turbo_4step_v0.1_bf16; do
+  .venv/bin/hf download lightx2v/Minimax-h3-Turbo "$n.safetensors" --local-dir lora
+done
+# One reference image, cut from an existing render so nothing measures a resize of unknown origin.
+ffmpeg -y -v error -i pull/base/base_480p_8step.mp4 -vf 'select=eq(n\,0)' -vframes 1 ref/subject.png
+```
+
+Arm A first, because it is the control and every other number is unattributable without it:
+
+```bash
+cd /opt/dlami/nvme/vdn && LOGTAG=A setsid nohup bash sglang_ref2va_arm.sh serve 480 \
+    > /opt/dlami/nvme/sglang/ref2va_A.log 2>&1 < /dev/null &
+# wait for "Uvicorn running", then:
+python3 sglang_ref2va.py ref=ref/subject.png tag=A 480:50
+```
+
+Then B and C — **the pair that answers the customer's question** — back to back, one seed apart from
+nothing:
+
+```bash
+L=/opt/dlami/nvme/vdn/lora/minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors
+bash sglang_ref2va_arm.sh stop
+LORA=$L LOGTAG=B setsid nohup bash sglang_ref2va_arm.sh serve 480 \
+    > /opt/dlami/nvme/sglang/ref2va_B.log 2>&1 < /dev/null &
+python3 sglang_ref2va.py ref=ref/subject.png tag=B 480:8      # alpha 8 from the file = scale 0.0625
+
+bash sglang_ref2va_arm.sh stop
+LORA=$L LORA_ALPHA=128 LOGTAG=C setsid nohup bash sglang_ref2va_arm.sh serve 480 \
+    > /opt/dlami/nvme/sglang/ref2va_C.log 2>&1 < /dev/null &
+python3 sglang_ref2va.py ref=ref/subject.png tag=C 480:8      # 16x overdrive, on purpose
+```
+
+**Check the server log for the scale it resolved before trusting either arm.** Arm B must not show
+alpha 128 anywhere: SGLang reads `alpha: 8` out of the safetensors metadata by itself, and
+`--lora-alpha 128` — which is what lightx2v's own 768p README command line contains — overrides it
+to 16x. That single flag is the leading explanation for "melting" and arm C exists to confirm it.
+
+D, E, F, G are the same shape; F is the one code change:
+
+```bash
+bash sglang_ref2va_arm.sh refedge 1024      # then restart; `refedge restore` puts 2048 back
+bash sglang_ref2va_arm.sh refedge restore
+```
+
+Score them, do not watch them first:
+
+```bash
+python3 melt_metrics.py --csv /opt/dlami/nvme/vdn/pull/ref2va/curves.csv \
+    /opt/dlami/nvme/vdn/pull/ref2va/*.mp4
+# `decay` < 1 is melting: detail present at the start of the clip and gone by the end.
+# Compare `sat` and `clip%` between B and C -- a 16x scale shows up there before it shows up in sharp.
+```
+
+**Pull the mp4s and the csv before you stop the box.** `/opt/dlami/nvme` is instance store; this is
+how the four base-H3 renders were lost.
+
+```bash
+cd /opt/dlami/nvme/vdn/pull/ref2va && for f in *.mp4 curves.csv; do echo "$f"; done
+# [on your Mac]
+bash scripts/p5.sh --get /opt/dlami/nvme/vdn/pull/ref2va/curves.csv out/ref2va/
+```
+
+For a *latency* number rather than a picture, merge and go back to fp8 — the merge needs no key
+translation because `transformer_ref/` and lightx2v's LoRA are both diffusers-named:
+
+```bash
+SRC=$HF_HOME/hub/models--MiniMaxAI--MiniMax-H3/snapshots/*/transformer_ref \
+LORA=$L DST=/opt/dlami/nvme/vdn/ref2v_turbo_bf16 \
+  /opt/dlami/nvme/sglang/.venv/bin/python lora_merge_h3.py     # prints the resolved SCALE; check it
+QUANT=fp8 MERGED=/opt/dlami/nvme/vdn/ref2v_turbo_bf16 bash sglang_ref2va_arm.sh serve 480
+```
+
 ---
 
 ## 2. The reference stack — the control
@@ -427,6 +511,15 @@ Kept for the record; run one only if a specific question needs it.
   in `scripts/lora_merge_h3.py`, or wait for SGLang to make its dynamic-LoRA wrapper
   quantization-aware, which is the smaller upstream fix and would make `--lora-path --quantization
   fp8` work directly.
+* **ref2va melting: seven arms, all measured, none run.** `REF2VA.md` plus §1g. The pair that
+  matters is **B vs C** — lightx2v's ref2v LoRA at the alpha its own file declares (8, scale 0.0625)
+  against the alpha their README's command line passes (128, scale 1.0). If C melts and B does not,
+  the customer's problem is one flag and the answer is "delete it". **Arm A, the 50-step control,
+  runs first** or nothing else is attributable.
+* **Whether bf16 ref2va fits at all.** Every LoRA arm above is bf16 because `--lora-path` dies at
+  fp8, and bf16 is ~62 GiB of DiT per rank under Ulysses on top of a 9.7 GiB video VAE. 480p with
+  one reference should fit; 768p may not. First fallback is `--tp-size 2 --ulysses-degree 4`, which
+  shards the DiT weights instead of only the sequence. Unknown until it is tried.
 * **The non-inference tail.** SGLang's E2E minus `inference_time_s` is ~1 s at 480p and ~2 s at
   768p: mux plus disk write. This repo's finding that libx264 does not parallelise itself and needs
   segmented encoding points straight at it — but that is upstream code now, so it is a PR, not a

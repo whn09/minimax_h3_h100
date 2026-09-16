@@ -502,6 +502,27 @@ configuring. `Ref2VADenoiseStep` is one forward per step (no CFG doubling), so t
 arithmetic per row is t2va's and the reference rows tabulated above are the whole story —
 they are the dominant term, not the sampler.
 
+> **ref2va does run — on SGLang, on base weights, and there is a Turbo LoRA for it.**
+> `MiniMaxAI/MiniMax-H3 --model-variant ref2va` is fully implemented upstream (its own
+> `reference_encoding.py` stage, four reference kinds, duration derivable from a reference audio
+> probe). What is missing is the *distill*: VDN never trained ref2va, so ref2va means 50 steps
+> unless [`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo) supplies a
+> shorter schedule — which is what its ref2v Turbo LoRA is for, and which comes with a widely
+> reported quality complaint the community calls **"melting"**: blurred hands, body distortion in
+> fast motion, ghosting in 9:16.
+>
+> **[`REF2VA.md`](REF2VA.md)** is that investigation: what melting is in the reporters' own words,
+> the three causes worth testing (a **16x** LoRA-scale error the published command line invites, a
+> 4-step schedule that needs 6–8, and a reference-resize policy SGLang hardcodes to the one lightx2v
+> did *not* train with), why the merge that was blocked for t2va is trivial here, and seven arms of
+> under a minute each. Extrapolated, not measured: **8 steps at 480p should land near 11–12 s E2E**
+> against ~52 s for the 50-step control. Run it with `RUNBOOK.md` §1g.
+>
+> Note the reference-resize finding sharpens the 2048-vs-1024 table above: SGLang implements exactly
+> the forced-2048-with-upscale policy, which is right for the base checkpoint and out of
+> distribution for lightx2v's LoRA. So the biggest cost lever and a live quality hypothesis point
+> the same way for once.
+
 ## Layout
 
 | path | what |
@@ -523,7 +544,12 @@ they are the dominant term, not the sampler.
 | `configs/8nfe_768p_345f_ulysses_h100.yaml` | the control: upstream's published 768p shape, so the H100↔H200 gap is measured. Also the only config that cycles anything per request (`vae_after_decode: free`) |
 | `configs/8nfe_2k_ulysses_h100.yaml` | 2560x1440 — a lower bound on H3-Regenerate-2K, which is not open-sourced |
 | `patches/` | the twelve patches above + `BASE.txt` (the upstream commit they apply to) |
+| `scripts/sglang_base_arm.sh` + `scripts/sglang_base_steps.py` | base MiniMax-H3 on the same cards, and the step ladder that separates "fewer steps" from "cheaper step" |
+| `scripts/sglang_ref2va_arm.sh` + `scripts/sglang_ref2va.py` | ref2va on base weights, with or without lightx2v's Turbo LoRA. `refedge` patches the hardcoded 2048 reference short edge; `LORA_ALPHA` reproduces the 16x overdrive on purpose |
+| `scripts/lora_merge_h3.py` | merge a Turbo LoRA into a bf16 transformer offline, so fp8 comes back. Refuses across naming layouts and prints the alpha/rank scale it resolved |
+| `scripts/melt_metrics.py` | per-frame detail, colour and half-frame asymmetry — "melting" as a number instead of an impression |
 | `RESULTS.md` | the measured numbers |
+| `REF2VA.md` | ref2va + lightx2v Turbo: what "melting" is, the three causes worth testing, and seven arms of under a minute each. **Research only — nothing in it is measured yet** |
 | `RUNBOOK.md` | how to run this on the box. **Section 1 is SGLang** — a wiped box to the 8.02 s / 19.04 s numbers, plus fl2va. Section 2 rebuilds the patched reference stack as the *control* that makes those a measured ratio rather than a claim |
 | `samples/` | the renders the numbers came from, video+audio muxed, all t2va from `prompts/example_2.pt`. The current best config, with all ten patches: **`n_480p_seg4.mp4`** (864x480, 345 f), **`n_480p_362f_seg4.mp4`** (the literal 15 s, 362 f) and **`p_768p_free.mp4`** (1344x768, 345 f) — all `clipinfo.py`-checked. The patch-11/12 renders (`r2_768p_keep_yuv`, `s2_480p_rep10`, `s5_480p_362f_rep10`, `s4_768p_rep10`) are **not** in the repo — they are the same prompt at the same canvas as the clips above and the patches change no pixels, which `scripts/decode_parity.py` asserts bit-exactly, so the mp4s carry no information the tracked ones do not. Earlier renders kept for comparison: `vdn_*` (pre-patch-7 swscale mux), `z_*` (patches 1–6), `n_768p_seg4` (768p with patch 3's host offload, before patch 10), `y_768p_345f_r5` (the 768p split winner), `f_*` (fl2va) |
 

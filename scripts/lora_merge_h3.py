@@ -1,68 +1,62 @@
 #!/usr/bin/env python3
 """Merge an H3 Turbo LoRA into a bf16 transformer offline, writing a plain bf16 checkpoint.
 
-    SRC=<hf-snapshot>/FL2VA/transformer \
-    LORA=/opt/dlami/nvme/vdn/lora/minimax_h3_turbo_v4_step600_ema.safetensors \
-    DST=/opt/dlami/nvme/vdn/turbo_bf16 \
+    SRC=<hf-snapshot>/transformer_ref \
+    LORA=<hf-snapshot>/minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors \
+    DST=/opt/dlami/nvme/vdn/ref2v_turbo_bf16 \
     /opt/dlami/nvme/sglang/.venv/bin/python lora_merge_h3.py
 
-STATUS: WORKS ONLY ON A NATIVE-NAMED TREE, WHICH MEANS NOT ON t2va. Read this before using it.
-
-This LoRA is named for the *native* MiniMax checkpoint layout:
-
-    blocks.N.attn.qkv_proj   blocks.N.attn.out_proj   blocks.N.mlp.fc{1,2}
-    blocks.N.adaln_proj.linear   token_refiner.blocks.N.*   final_layer.adaln_proj.linear
-
-Every t2va transformer on disk is named for the *diffusers* layout instead -- both
-`MiniMaxAI/MiniMax-H3/transformer` and `OpenVDN/vdn-minimax-h3/h3-base/transformer`, 638 tensors
-each, `diffusion_pytorch_model-*.safetensors`:
-
-    transformer_blocks.N.attn.to_{q,k,v}   transformer_blocks.N.attn.to_out.0
-    transformer_blocks.N.ff.net.0.proj (fc1)   transformer_blocks.N.ff.net.2 (fc2)   norm_out.linear
-
-Only `FL2VA/` and `Ref2VA/` ship native names (535 tensors, `model-*.safetensors`). That is why
-the g7e project merged against `FL2VA/transformer` and hit 259/259, and why pointing this script
-at a t2va tree hits **0/259** and exits 1 rather than writing a silently unmerged 62 GB copy.
-
-Making it work for t2va needs three translations, and all three are readable in SGLang's own
-loader (`runtime/models/dits/minimax_h3.py:_diffusers_h3_checkpoint`) rather than guessed:
-  1. names, via `get_param_names_mapping(MiniMaxH3DiTArchConfig.param_names_mapping)`, which
-     returns `(native_name, merge_index, merge_count)` -- so to_q/to_k/to_v are indices 0/1/2 of
-     the fused `qkv_proj`, i.e. the reverse direction is a row-slice of `lora_B`.
-  2. SwiGLU half order: diffusers `ff.net.0.proj` is `[value, gate]`, native `mlp.fc1` is
-     `[gate, value]` (minimax_h3.py:128). The swap is its own inverse.
-  3. qkv row order: the native checkpoint interleaves each head's q,k,v rows and SGLang undoes
-     that with `_reorder_grouped_qkv_to_qkv` at load. A native-named LoRA carries the same
-     interleave, so a merge into split diffusers tensors has to un-interleave first.
-Each of those fails silently in a way shapes alone will not catch, which is why this is not
-written speculatively.
-
-WHY OFFLINE AT ALL, i.e. why not just --lora-path. SGLang accepts `--lora-path` on this model and
-no longer dies the way g7e recorded (a runtime "merge" doing an in-place add on [out, in] against
-an fp8 weight stored transposed, their fc1 reporting 21504 vs 5376): upstream's
-`_should_merge_lora_for_layers` now sees `can_merge_base_weight == False` on a quantized layer and
-falls back to dynamic LoRA by itself. It fails one layer later instead --
+WHY MERGE AT ALL, i.e. why not just --lora-path. Only because of fp8. SGLang accepts `--lora-path`
+on this model and does its own key mapping (see LAYOUTS below), but the dynamic-LoRA wrapper is not
+quantization-aware on this build:
 
     AttributeError: 'RowParallelLinearWithLoRA' object has no attribute 'quant_method'
 
--- because the dynamic-LoRA wrapper is not quantization-aware. So `--quantization fp8
---lora-path ...` aborts during server warmup. The bf16 route (`QUANT= bash sglang_base_arm.sh`)
-does run `--lora-path` with zero mapping work, and is the right way to get a *picture* out of
-base+Turbo; it is the wrong way to get a *latency*, because bf16 is not the precision every other
-arm here is measured at. For latency no merge is needed at all: a merged LoRA changes weight
-values, not tensor shapes or the graph, so fp8 base H3 at 8 steps already IS fp8 Turbo at 8 steps.
+-- repeated across ranks, ending in "Server warmup failed; aborting startup". So `--quantization
+fp8 --lora-path ...` does not start. A *merged* checkpoint is plain bf16 with no LoRA wrapper
+anywhere, so SGLang quantizes it online exactly like base weights and the fp8 speed comes back.
+Serve DST with `--model-variant hybrid --component-weights-paths.transformer $DST`, which is the
+flag pair SGLang documents for merged weights (`runtime/pipelines/minimax_h3_pipeline.py:97`).
 
-SGLang documents this same offline-merge shape itself: `--model-variant hybrid` refuses to start
-without "explicit merged weights via --component-weights-paths.transformer"
-(`runtime/pipelines/minimax_h3_pipeline.py:97`), which is also the flag to serve DST with.
+For *pictures only*, skip this script: bf16 `--lora-path` works today with zero mapping work. Its
+latency is not comparable to any fp8 number in this repo.
 
-`W_eff = W + strength * (B @ A)`, with NO alpha/rank scaling: the file's own safetensors metadata
-says `application: W_eff = W + lora_B @ lora_A`, and its ranks are mixed (16 for adaln_proj, 64
-elsewhere) so there is no single global alpha to apply anyway. strength defaults to 1.0, which is
-what the adapter was tuned at. The delta is computed in fp32 and cast back to the weight dtype.
+LAYOUTS. There are two naming conventions in play and a merge is only trivial when both sides use
+the same one. This script requires that and refuses otherwise, because each mismatch fails silently
+in a way shapes alone do not catch.
 
-This differs from the g7e original only in not hardcoding the index filename, since the two trees
-disagree on it (`model.safetensors.index.json` vs `diffusion_pytorch_model.safetensors.index.json`).
+    diffusers   transformer_blocks.N.attn.to_{q,k,v}   attn.to_out.0
+                ff.net.0.proj (fc1, halves [value, gate])   ff.net.2 (fc2)   norm_out.linear
+                index file: diffusion_pytorch_model.safetensors.index.json   638 tensors
+    native      blocks.N.attn.qkv_proj (per-head q,k,v row interleave)   attn.out_proj
+                mlp.fc1 (halves [gate, value])   mlp.fc2   adaln_proj.linear   final_layer
+                index file: model.safetensors.index.json                       535 tensors
+
+`MiniMaxAI/MiniMax-H3` ships **both** for ref2va -- `transformer_ref/` is diffusers-named,
+`Ref2VA/transformer` is native-named, same weights. So point SRC at whichever matches the LoRA:
+
+    lightx2v/Minimax-h3-Turbo   diffusers PEFT  ->  SRC=transformer_ref
+    g7e's minimax_h3_turbo_v4   native          ->  SRC=FL2VA/transformer   (259/259, proven)
+
+The remaining hard case is a *native* LoRA into a *diffusers* tree (which is every t2va tree,
+including `OpenVDN/.../h3-base/transformer`). That needs three translations, all readable in
+SGLang's own loader rather than guessed, and none of them written here:
+  1. names + fusion, via `get_param_names_mapping(MiniMaxH3DiTArchConfig.param_names_mapping)`,
+     which returns `(native_name, merge_index, merge_count)` -- to_q/to_k/to_v are indices 0/1/2 of
+     the fused `qkv_proj`, so the reverse direction is a row-slice of `lora_B`.
+  2. SwiGLU half order, `[value, gate]` vs `[gate, value]` (`runtime/models/dits/minimax_h3.py:128`;
+     lightx2v's own ComfyUI conversions record the same swap in their metadata).
+  3. the per-head qkv row interleave, which SGLang undoes at load with
+     `_reorder_grouped_qkv_to_qkv`; a native-named LoRA carries the same interleave.
+
+SCALE. `W_eff = W + scale * (B @ A)` in fp32, cast back to the weight dtype.
+`scale = STRENGTH * alpha / rank` when the file declares an alpha, else `STRENGTH` alone. This
+matters more than anything else in the file: lightx2v's LoRAs are all rank 128 but declare
+alpha **8** (scale 0.0625) or **128** (scale 1.0) depending on the file, and their README's
+`--lora-alpha 128` is correct for exactly two of them. See REF2VA.md, cause 1. The resolved scale is
+printed; check it before trusting the output. Mixed-rank files (g7e's: 16 for adaln_proj, 64
+elsewhere) have no single global alpha, and that one declares
+`application: W_eff = W + lora_B @ lora_A` outright, so STRENGTH=1.0 with no alpha is right there.
 """
 import json
 import os
@@ -76,45 +70,98 @@ src = os.environ["SRC"]
 lora_path = os.environ["LORA"]
 dst = os.environ["DST"]
 strength = float(os.environ.get("STRENGTH", "1.0"))
+# ALPHA= forces a value; ALPHA=none ignores the file's own. Unset reads the metadata.
+alpha_env = os.environ.get("ALPHA")
+
+_ALPHA_KEYS = ("lora_alpha", "network_alpha", "alpha")
+# PEFT writes the adapter name into the key ("...lora_A.default.weight"); plain exports do not.
+_SLOTS = (".lora_A.weight", ".lora_B.weight", ".lora_A.default.weight", ".lora_B.default.weight")
+
+
+def layout_of(keys) -> str:
+    """diffusers | native, decided on markers that cannot coexist."""
+    ks = list(keys)
+    if any(".attn.to_q" in k or ".ff.net.0.proj" in k or k.startswith("transformer_blocks.") for k in ks):
+        return "diffusers"
+    if any(".attn.qkv_proj" in k or ".mlp.fc1" in k for k in ks):
+        return "native"
+    return "unknown"
+
 
 os.makedirs(dst, exist_ok=True)
-index_name = next(
-    (n for n in os.listdir(src) if n.endswith(".safetensors.index.json")), None
-)
+index_name = next((n for n in os.listdir(src) if n.endswith(".safetensors.index.json")), None)
 if index_name is None:
     print(f"no *.safetensors.index.json in {src}", file=sys.stderr)
     sys.exit(1)
 with open(os.path.join(src, index_name)) as f:
     index = json.load(f)
 shards = sorted(set(index["weight_map"].values()))
-print(f"index: {index_name}  shards: {len(shards)}")
+src_layout = layout_of(index["weight_map"])
+print(f"index: {index_name}  shards: {len(shards)}  tree layout: {src_layout}")
 
-# Refuse before reading 62 GB. A diffusers-named tree would match nothing and exit 1 at the end
-# anyway, only after a full read/write pass -- see the layout note in the module docstring.
-if any(k.startswith("transformer_blocks.") for k in index["weight_map"]):
-    print(
-        f"{src} is a diffusers-named tree (transformer_blocks.* / attn.to_q / ff.net.0.proj); "
-        "this LoRA is named for the native layout (blocks.* / attn.qkv_proj / mlp.fc1) and would "
-        "match 0/259 modules. Point SRC at FL2VA/transformer or Ref2VA/transformer, or implement "
-        "the three translations listed in the docstring.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-# The whole LoRA fits in memory (bf16, ~780 MB); group it by target weight name.
-lora = {}
+# The whole LoRA fits in memory (bf16, ~1.3 GB); group it by target weight name.
+lora, ranks = {}, set()
 with safe_open(lora_path, framework="pt") as f:
+    meta = f.metadata() or {}
     for k in f.keys():
-        if not (k.endswith(".lora_A.weight") or k.endswith(".lora_B.weight")):
-            print(f"UNEXPECTED lora key {k}", file=sys.stderr)
+        slot = next((s for s in _SLOTS if k.endswith(s)), None)
+        if slot is None:
+            print(f"UNEXPECTED lora key {k} (expected one of {_SLOTS})", file=sys.stderr)
             sys.exit(1)
-        base, side = k.rsplit(".lora_", 1)
-        lora.setdefault(base + ".weight", {})[side[0]] = f.get_tensor(k)
+        base = k[: -len(slot)]
+        # Diffusers PEFT exports sometimes carry a "transformer." component prefix; the checkpoint
+        # shard keys never do.
+        if base.startswith("transformer."):
+            base = base[len("transformer.") :]
+        side = "A" if ".lora_A" in slot else "B"
+        t = f.get_tensor(k)
+        if side == "A" and t.ndim == 2:
+            ranks.add(t.shape[0])
+        lora.setdefault(base + ".weight", {})[side] = t
 one_sided = [k for k, v in lora.items() if set(v) != {"A", "B"}]
 if one_sided:
     print(f"LoRA modules missing a side: {one_sided[:5]}", file=sys.stderr)
     sys.exit(1)
-print(f"lora modules: {len(lora)}  strength={strength}", flush=True)
+
+lora_layout = layout_of(lora)
+if lora_layout != src_layout or lora_layout == "unknown":
+    print(
+        f"LAYOUT MISMATCH: tree is {src_layout!r}, LoRA is {lora_layout!r}. Merging across layouts "
+        "needs the three translations in the docstring and would otherwise match 0 modules or, "
+        "worse, match by name and be numerically wrong. For a diffusers LoRA point SRC at "
+        "transformer_ref/ (ref2va) or transformer/ (t2va); for a native LoRA point it at "
+        "Ref2VA/transformer or FL2VA/transformer.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+# scale = strength * alpha / rank, and every part of that is worth printing.
+declared = {k: meta[k] for k in _ALPHA_KEYS if k in meta}
+if len(set(declared.values())) > 1:
+    print(f"conflicting alpha metadata: {declared}", file=sys.stderr)
+    sys.exit(1)
+alpha = None
+if alpha_env is not None and alpha_env.lower() != "none":
+    alpha = float(alpha_env)
+elif alpha_env is None and declared:
+    alpha = float(next(iter(declared.values())))
+if alpha is not None:
+    if len(ranks) != 1:
+        print(
+            f"alpha={alpha:g} given but ranks are mixed {sorted(ranks)}; alpha/rank has no single "
+            "value. Re-run with ALPHA=none and set STRENGTH to the scale you want.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    rank = next(iter(ranks))
+    scale = strength * alpha / rank
+    print(f"lora modules: {len(lora)}  layout: {lora_layout}  rank {rank}  alpha {alpha:g}  "
+          f"strength {strength:g}  ->  SCALE {scale:.6g}")
+else:
+    scale = strength
+    print(f"lora modules: {len(lora)}  layout: {lora_layout}  ranks {sorted(ranks)}  no alpha "
+          f"declared  ->  SCALE {scale:.6g} (= STRENGTH)")
+print(f"lora metadata: {meta if meta else '(none)'}", flush=True)
 
 applied, worst = set(), 0.0
 for sh in shards:
@@ -133,11 +180,12 @@ for sh in shards:
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                delta = (b @ a) * strength
+                delta = (b @ a) * scale
                 w32 = w.float()
                 # |delta|/|W| is the one cheap sanity number: a distill LoRA should move the
                 # weights a few percent, so a value near 0 means nothing merged and a value
-                # near 1 means the adapter does not belong to these weights.
+                # near 1 means the adapter does not belong to these weights. At scale 0.0625
+                # expect it small -- that is the point of cause 1 in REF2VA.md, not a bug.
                 worst = max(worst, (delta.norm() / w32.norm()).item())
                 w = (w32 + delta).to(w.dtype)
                 applied.add(k)
