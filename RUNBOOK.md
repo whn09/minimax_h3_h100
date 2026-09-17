@@ -128,6 +128,24 @@ the build instead of the docs and it is false:
 A nightly is therefore already diffusion-capable, already VDN-capable, and already pinned. `probe`
 is the step that proves it on the box; if every line says `have`, stop there.
 
+**Measured, on a fresh `p5.48xlarge` in us-west-1 (2026-09-17).** `probe` took ~6 min, almost all of
+it the pull — the image is **51.8 GB** — and **every line came back `have`**: python 3.12.3,
+torch 2.13.0+cu130, `minimax_h3` + `minimax_h3_vdn` + `minimax_h3_pipeline`, all eight diffusion
+packages (`diffusers av cv2 cache_dit st_attn vsa moviepy imageio_ffmpeg`), `ffmpeg ffprobe nvcc
+cargo git`, `CUDA_HOME=/usr/local/cuda`. Nothing needed installing. For the record:
+
+```
+sglang 0.0.0.dev1+g408d2334c   torch 2.13.0+cu130   python 3.12.3
+bundled source: 408d2334c34d387a36a26398dff9a8f004328344  Wed Sep 16 17:11:55 2026 -0700
+BASE=lmsysorg/sglang@sha256:6bcaa47db52f78ce0d67863b8b2431221b79bc23204a80cad757fa819d00e921
+```
+
+That box also had docker 29.8.0, the `nvidia` runtime registered, `ubuntu` in the `docker` group and
+27 T on `/opt/dlami/nvme` — nothing to install there either. **Note the bundled sha is not the one
+this runbook predicted** (`46ae84df`, main's head at 23:54 UTC): the scheduled build actually ran at
+00:11 UTC and picked up a later commit. That is the argument for pinning by digest rather than by
+reconstructing a `nightly-dev-{date}-{sha}` tag from commit timestamps.
+
 **Pin it by digest anyway.** `:dev` is rebuilt every night, and "measured on the nightly" is not a
 reproducible statement. The last line `probe` prints is the pin:
 
@@ -141,12 +159,28 @@ commit on 2026-09-16 that sits between the `20260916` and `20260917` nightlies. 
 matters — bisecting, or reproducing a number against the commit it came from:
 
 ```bash
-SGLANG_REV=3f8eb35eadfb29ad98d7900910f19fafcbac5ccb bash h3.sh build   # ~2 min
+SGLANG_REV=3f8eb35eadfb29ad98d7900910f19fafcbac5ccb bash h3.sh build   # ~7 min, measured
 IMAGE=minimax-h3:local bash h3.sh serve vdn 480                        # nothing picks it up implicitly
 ```
 
-Otherwise leave it alone. Either way the build asserts the H3, VDN and pipeline imports, so a bad
-pin fails in `docker build` and not 20 minutes into an 8-GPU launch.
+**This has been run.** It works and costs ~7 min and 6 GB (57.8 GB image against the base's 51.8):
+5.5 min of it is the editable rebuild, 30 s the import assertion, 77 s the layer export. The result
+reports `sglang 0.0.0.dev1+g3f8eb35ea`, `source: 3f8eb35eadfb… Wed Sep 16 12:44:49 2026 +0800`,
+`torch 2.13.0+cu130 cuda True 8`, with `sglang hf ffmpeg ffprobe nvcc` all on PATH and the bind
+mount visible at the same path — i.e. the arms can run on it unchanged. Either way the build asserts
+the H3, VDN and pipeline imports, so a bad pin fails in `docker build` and not 20 minutes into an
+8-GPU launch.
+
+> **Trap: the image's `.git` cannot fetch as shipped, and the error blames the wrong thing.**
+> `SGLANG_REV=…` first failed with
+> `fatal: could not read Username for 'https://github.com': No such device or address`. sglang is a
+> public repo, so nothing here needs a credential — what happened is that `actions/checkout` left
+> `http.https://github.com/.extraheader=AUTHORIZATION: basic <token>` in `.git/config`, the token is
+> dead outside that runner, GitHub answers 401, and git falls back to prompting for a username. The
+> Dockerfile now unsets that key and sets `GIT_TERMINAL_PROMPT=0`. The clone is also **depth 1**
+> (`git rev-list --count HEAD` == 1), so the target commit really is absent and must be fetched;
+> `git fetch --depth 1 origin <sha>` works against GitHub, and `--unshallow` is the fallback because
+> a plain `git fetch` on a shallow clone brings the new tip and still not the wanted commit.
 
 `h3.sh` bind-mounts `/opt/dlami/nvme` **at the same path inside the container**, so every absolute
 path in this runbook — the HF cache, the fused overlay, reference images, output mp4s, LoRA files —

@@ -34,7 +34,20 @@ ARG SGLANG_REV=keep
 WORKDIR /sgl-workspace/sglang
 RUN set -eux; \
     if [ "$SGLANG_REV" != keep ]; then \
-      git fetch --depth 1 origin "$SGLANG_REV" || git fetch origin; \
+      # THE IMAGE'S .git CANNOT FETCH AS SHIPPED, and the error names the wrong cause:
+      #   fatal: could not read Username for 'https://github.com': No such device or address
+      # sglang is public, so this is not an auth requirement -- it is actions/checkout's
+      # persisted credential, `http.https://github.com/.extraheader=AUTHORIZATION: basic <tok>`,
+      # left in .git/config by the CI build. The token is dead outside that runner, GitHub
+      # answers 401, and git falls back to asking for a username. Drop the header and the
+      # anonymous fetch works. GIT_TERMINAL_PROMPT=0 keeps any future variant of this a fast
+      # error instead of a build that hangs on a prompt nothing can answer.
+      git config --local --unset-all 'http.https://github.com/.extraheader' || true; \
+      export GIT_TERMINAL_PROMPT=0; \
+      # The clone is depth 1 (`git rev-list --count HEAD` == 1), so the target sha is genuinely
+      # not present and has to come over the wire. --unshallow is the fallback because a plain
+      # `git fetch` on a shallow clone brings the new tip and still not this commit.
+      git fetch --depth 1 origin "$SGLANG_REV" || git fetch --unshallow origin; \
       git checkout --detach "$SGLANG_REV"; \
       # --no-deps is upstream's own form for this install (Dockerfile:584) and it matters: the
       # dependency set is already resolved and frozen into /sgl-workspace/constraints.txt, so a
