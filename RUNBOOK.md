@@ -208,6 +208,11 @@ because the scripts and every path are the same either way:
 | `LORA=… bash sglang_ref2va_arm.sh serve 768` | `LORA=… bash h3.sh serve ref2va 768` |
 | `python sglang_ref2va.py 768:8 ref=…` | `bash h3.sh exec sglang_ref2va.py 768:8 ref=…` |
 | `bash sglang_ref2va_arm.sh refedge 1024` then serve | `REFEDGE=1024 bash h3.sh serve ref2va 768` |
+
+**`REFEDGE=1024` is a melting arm, not a production setting.** It is what makes the ref2v Turbo LoRA
+collapse hands and faces — see REF2VA.md, "Correction: what actually melts". Serve with the constant
+left alone (2048); the patch is here to reproduce the fault, like `LORA_ALPHA=128`.
+
 | `… stop` | `bash h3.sh stop` |
 
 `h3.sh` forwards `QUANT LORA LORA_ALPHA MERGED REFEDGE GPUS FRAMES SEED PORT LOGTAG MODEL OUTDIR
@@ -530,6 +535,8 @@ to 16x. That single flag is the leading explanation for "melting" and arm C exis
 D, E, F, G are the same shape; F is the one code change:
 
 ```bash
+# This arm REPRODUCES the customer's melting; do not carry it into production. See REF2VA.md,
+# "Correction: what actually melts": the LoRA is clean at 2048 and melts at 1024.
 bash sglang_ref2va_arm.sh refedge 1024      # then restart; `refedge restore` puts 2048 back
 bash sglang_ref2va_arm.sh refedge restore
 # in a container, where a patched module dies with the container that patched it:
