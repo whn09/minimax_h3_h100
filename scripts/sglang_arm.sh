@@ -27,68 +27,8 @@ export HF_HOME=${HF_HOME:-$VDNROOT/hf}
 export SGLANG_DIFFUSION_CACHE_ROOT=${SGLANG_DIFFUSION_CACHE_ROOT:-$ROOT/cache}
 
 mode=${1:?serve|bench|stop}
-# shellcheck disable=SC1091
-source "$ROOT/.venv/bin/activate"
-# This box has no /usr/local/cuda and deep_gemm's find_cuda_home asserts rather than falling
-# back, which kills `import sglang.multimodal_gen` before any of the above matters. The venv
-# carries a full pip CUDA (the VDN delta-factors kernel JITs against nvcc through
-# apache-tvm-ffi), so point at that -- and find it by looking for bin/nvcc rather than by
-# guessing the directory, because it is nvidia/cu13/, not the per-component nvidia/cuda_nvcc/
-# layout the older wheels used, and a CUDA_HOME that merely exists satisfies deep_gemm's
-# assert while leaving the JIT to fail later with something far less obvious.
-export CUDA_HOME=${CUDA_HOME:-$(python - <<'PY'
-import pathlib, sysconfig
-nv = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia"
-print(next((str(p.parent.parent) for p in sorted(nv.glob("*/bin/nvcc"))), ""))
-PY
-)}
-[ -x "$CUDA_HOME/bin/nvcc" ] || echo "warning: no nvcc under CUDA_HOME=$CUDA_HOME; the VDN delta-factors JIT will fail"
-
-# H3's pipeline hard-requires both binaries and raises before it touches a GPU -- every rank
-# dies with "missing executables: ffmpeg, ffprobe" and the parent shows only an EOFError from
-# the pipe, which reads like a crash rather than a missing package. Checked here so the message
-# is the message. `apt-get install ffmpeg`; on this box that first needed the broken
-# developer.download.nvidia.com cuda-ubuntu2604 source moved out of sources.list.d.
-for b in ffmpeg ffprobe; do
-  command -v "$b" >/dev/null 2>&1 || { echo "missing $b -- sglang H3 refuses to start without it"; exit 2; }
-done
-
-# The JIT link line is `c++ ... -L$CUDA_HOME/lib64 -lcudart`, which assumes a system CUDA
-# install. The pip wheel ships neither: the directory is lib/, not lib64/, and it carries
-# only the runtime soname libcudart.so.13, not the libcudart.so a -l flag resolves. nvcc
-# compiles fine and then ld says "cannot find -lcudart", every rank dies, and the parent
-# reports EOFError. Two symlinks inside the venv close it -- cheaper than a system CUDA
-# install, and scoped to this venv so the reference stack is untouched.
-if [ -d "$CUDA_HOME/lib" ]; then
-  [ -e "$CUDA_HOME/lib64" ] || ln -sfn lib "$CUDA_HOME/lib64"
-  for so in "$CUDA_HOME"/lib/lib*.so.[0-9]*; do
-    base=${so%%.so.*}.so
-    [ -e "$base" ] || ln -sfn "$(basename "$so")" "$base"
-  done
-fi
-
-# NCCL_NET_PLUGIN=none, on an AWS box specifically. The DLAMI puts the EFA/OFI plugin on the
-# system loader path (/etc/ld.so.conf.d/100_ofinccl.conf), so NCCL dlopens
-# /opt/amazon/ofi-nccl/lib/libnccl-net.so during comm init. deep_ep's check_nccl_so() then
-# scans /proc/self/maps for anything matching "libnccl", sees that plugin next to the venv's
-# libnccl.so.2, and asserts "Duplicate NCCL runtime found" -- it is a plugin, not a second
-# runtime, so the check is simply wrong here. It is fatal because sglang guards the deep_ep
-# import with `except ImportError` and this is an AssertionError, so the MoE token dispatcher
-# takes down a diffusion worker: the visible symptom is
-# "Model architectures ['MiniMaxH3Qwen3VLEncoder'] failed to be inspected", two import layers
-# away from the cause. Nothing here is multi-node; the plugin buys nothing on eight NVLinked
-# cards in one box. Drop this line before running anything across nodes.
-export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
-
-# expandable_segments, because --quantization fp8 here is ONLINE quantization: the loader
-# reads the 65.65 GiB bf16 checkpoint (measured from the safetensors headers: 1426 BF16
-# tensors + 13 F32) onto the card and casts afterwards, so every bf16 block it frees leaves a
-# hole the fp8 weights cannot reuse. First 480p attempt died with 51.89 GiB allocated and
-# 18.70 GiB reserved-but-unallocated -- the fit was never 12 GiB short, it was fragmented by
-# that much. Expandable segments let the allocator give the holes back instead of hoarding
-# them. This is the cheapest of the memory levers and the only one that costs no latency, so
-# it goes before --performance-mode auto and before any offload.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# shellcheck source=_env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
 if [ "$mode" = stop ]; then
   # The [s] is not decoration. `pkill -f 'sglang.*serve'` matches any shell whose command line

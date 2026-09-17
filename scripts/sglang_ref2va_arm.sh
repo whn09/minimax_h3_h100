@@ -29,7 +29,8 @@
 # LoRA is a 16x overdrive. LORA_ALPHA is here to reproduce that error on purpose (arm C).
 #
 # Everything else -- CUDA_HOME discovery, the lib64/-lcudart symlinks, NCCL_NET_PLUGIN=none,
-# expandable_segments -- is identical to sglang_arm.sh and carries the same reasons.
+# expandable_segments -- lives in _env.sh, which every arm sources and which reads the same in the
+# venv and in the container.
 set -uo pipefail
 
 ROOT=${ROOT:-/opt/dlami/nvme/sglang}
@@ -45,8 +46,8 @@ export HF_HOME=${HF_HOME:-$VDNROOT/hf}
 export SGLANG_DIFFUSION_CACHE_ROOT=${SGLANG_DIFFUSION_CACHE_ROOT:-$ROOT/cache}
 
 mode=${1:?serve|stop|refedge}
-# shellcheck disable=SC1091
-source "$ROOT/.venv/bin/activate"
+# shellcheck source=_env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
 # The reference-image short edge is a module constant, not a flag: reference_encoding.py:47
 #   MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
@@ -56,11 +57,11 @@ source "$ROOT/.venv/bin/activate"
 # ref2va (one 16:9 reference is 7,296 rows at 2048 and 1,824 at 1024; rows go as the square).
 # Editing the installed file is deliberate: workers are separate processes, so a monkeypatch in
 # the client would not reach them.
-if [ "$mode" = refedge ]; then
+refedge() {
   # Python rather than sed: it locates the installed module by import, keeps one .orig, and
   # re-reads the file to prove the constant actually changed. A silent no-match here would send
   # a whole arm to the wrong conclusion.
-  WANT=${2:?a short edge, or the word restore} python - <<'PY'
+  WANT=${1:?a short edge, or the word restore} python - <<'PY'
 import os, re, shutil
 import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding as m
 
@@ -84,25 +85,14 @@ else:
     open(f, "w").write(new)
 print(f, [l for l in open(f) if l.startswith("MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE")])
 PY
+}
+
+if [ "$mode" = refedge ]; then
+  refedge "${2:?a short edge, or the word restore}"
   echo "restart the server for this to take effect"
   exit 0
 fi
 
-export CUDA_HOME=${CUDA_HOME:-$(python - <<'PY'
-import pathlib, sysconfig
-nv = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia"
-print(next((str(p.parent.parent) for p in sorted(nv.glob("*/bin/nvcc"))), ""))
-PY
-)}
-if [ -d "$CUDA_HOME/lib" ]; then
-  [ -e "$CUDA_HOME/lib64" ] || ln -sfn lib "$CUDA_HOME/lib64"
-  for so in "$CUDA_HOME"/lib/lib*.so.[0-9]*; do
-    base=${so%%.so.*}.so
-    [ -e "$base" ] || ln -sfn "$(basename "$so")" "$base"
-  done
-fi
-export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 if [ "$mode" = stop ]; then
   pkill -f '[s]glang.*serve'
@@ -130,6 +120,13 @@ if [ -n "$MERGED" ]; then
   extra+=(--model-variant hybrid --component-weights-paths.transformer "$MERGED")
 else
   extra+=(--model-variant ref2va)
+fi
+# REFEDGE=1024 patches the reference short edge in *this* process tree before the server starts,
+# which is the only form that works in a container: the patch rewrites an installed module, and a
+# `refedge` run in a throwaway container is discarded with that container's writable layer. In a
+# venv either form works and `refedge` alone is the same thing. Arm F is REFEDGE=1024.
+if [ -n "${REFEDGE-}" ]; then
+  refedge "$REFEDGE"
 fi
 log="$ROOT/logs/serve_ref2va_${edge}p${LOGTAG:+_$LOGTAG}.log"
 mkdir -p "$ROOT/logs"

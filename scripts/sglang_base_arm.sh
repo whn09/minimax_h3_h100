@@ -39,8 +39,8 @@
 #         diffusers-named, and MiniMaxAI/MiniMax-H3 ships transformer_ref/ diffusers-named as well,
 #         so the ref2va merge needs no translation at all. See REF2VA.md and sglang_ref2va_arm.sh.
 # Everything else -- CUDA_HOME discovery, the lib64/-lcudart symlinks, NCCL_NET_PLUGIN=none,
-# expandable_segments, the ffmpeg gate -- is identical and carries the same reasons as
-# sglang_arm.sh. Read that file for them.
+# expandable_segments, the ffmpeg gate -- lives in _env.sh, which every arm sources. Read that
+# file for the reasons.
 set -uo pipefail
 
 ROOT=${ROOT:-/opt/dlami/nvme/sglang}
@@ -55,23 +55,8 @@ export HF_HOME=${HF_HOME:-$VDNROOT/hf}
 export SGLANG_DIFFUSION_CACHE_ROOT=${SGLANG_DIFFUSION_CACHE_ROOT:-$ROOT/cache}
 
 mode=${1:?serve|stop}
-# shellcheck disable=SC1091
-source "$ROOT/.venv/bin/activate"
-export CUDA_HOME=${CUDA_HOME:-$(python - <<'PY'
-import pathlib, sysconfig
-nv = pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia"
-print(next((str(p.parent.parent) for p in sorted(nv.glob("*/bin/nvcc"))), ""))
-PY
-)}
-if [ -d "$CUDA_HOME/lib" ]; then
-  [ -e "$CUDA_HOME/lib64" ] || ln -sfn lib "$CUDA_HOME/lib64"
-  for so in "$CUDA_HOME"/lib/lib*.so.[0-9]*; do
-    base=${so%%.so.*}.so
-    [ -e "$base" ] || ln -sfn "$(basename "$so")" "$base"
-  done
-fi
-export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# shellcheck source=_env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
 if [ "$mode" = stop ]; then
   pkill -f '[s]glang.*serve'

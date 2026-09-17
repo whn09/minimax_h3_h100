@@ -71,18 +71,90 @@ The box has no GitHub credentials, so this private repo cannot be cloned there.
 ```bash
 cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
 export HOST=ubuntu@$P5                            # p5.sh has no default; see section 0
-bash scripts/p5.sh 'mkdir -p /opt/dlami/nvme/vdn /opt/dlami/nvme/sglang'
-for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py \
-         scripts/sglang_parity.py scripts/sglang_base_arm.sh scripts/sglang_base_steps.py \
-         scripts/lora_merge_h3.py scripts/sglang_ref2va_arm.sh scripts/sglang_ref2va.py \
-         scripts/melt_metrics.py; do
+bash scripts/p5.sh 'mkdir -p /opt/dlami/nvme/vdn/docker /opt/dlami/nvme/sglang'
+for f in scripts/_env.sh scripts/fetch_weights.sh scripts/sglang_bringup.sh scripts/sglang_arm.sh \
+         scripts/sglang_cond.py scripts/sglang_parity.py scripts/sglang_base_arm.sh \
+         scripts/sglang_base_steps.py scripts/lora_merge_h3.py scripts/sglang_ref2va_arm.sh \
+         scripts/sglang_ref2va.py scripts/melt_metrics.py; do
   bash scripts/p5.sh --put "$f" "/opt/dlami/nvme/vdn/$(basename "$f")"
+done
+for f in docker/Dockerfile docker/h3.sh; do
+  bash scripts/p5.sh --put "$f" "/opt/dlami/nvme/vdn/docker/$(basename "$f")"
 done
 ```
 
-### 1b. Install. **~10 min for the environment, then the download you asked for.**
+`_env.sh` is not optional — the three arm scripts source it for `CUDA_HOME`, the `-lcudart`
+symlinks, `NCCL_NET_PLUGIN`, the allocator flag and the ffmpeg gate, and it is what makes them run
+unchanged both in a venv and inside the container.
 
-`WEIGHTS` is a comma list and it is the only thing to decide here. **`hf download
+### 1b. Install, the container route. **~6 min build, then the download you asked for.**
+
+**This is the recommended route, and it exists because almost every trap in this runbook is a
+consequence of installing into a bare DLAMI, not of the model.** `lmsysorg/sglang` is built from
+sglang's own 795-line `docker/Dockerfile` on `nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04`, and it
+already carries python 3.12, torch, `sglang-kernel`, the flashinfer cubin cache, a Rust toolchain,
+a real `/usr/local/cuda` and `ffmpeg`. That deletes four of them outright: the
+`can't find Rust compiler` build failure, `deep_gemm`'s `find_cuda_home` assert plus the
+`lib64`/`-lcudart` symlinks, the broken apt source that blocks `ffmpeg`, and python 3.13 vs the
+cp312-only `outlines_core` wheel.
+
+```bash
+cd /opt/dlami/nvme/vdn/docker
+bash h3.sh probe            # ~3 min. What does the published image already have?
+bash h3.sh build            # ~6 min. Bakes the diffusion extra + the pinned revision
+bash h3.sh weights t2va,ref2va
+bash h3.sh serve ref2va 768 ; bash h3.sh logs ref2va
+```
+
+Two things the published image does **not** have, which is the whole content of our 11-line
+`docker/Dockerfile`:
+
+* **the diffusion extra.** The image bundles the sglang *source* at `/sgl-workspace/sglang` but
+  installs the LLM extras only — which is why upstream's own generated H3 command
+  (`docs/src/snippets/configs/MiniMaxAI/minimax-h3.jsx`, `dockerRunCommand`) is literally
+  `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"'`.
+  Upstream pays that install on **every container start**; we pay it once at build.
+* **a revision new enough for VDN.** A tag's bundled source is as old as the tag. The image pins
+  `SGLANG_REV=3f8eb35eadfb…`, the revision RESULTS.md was measured at. `SGLANG_REV=keep` uses the
+  image's own tree instead — use that only when deliberately testing a newer `main`.
+
+`h3.sh` bind-mounts `/opt/dlami/nvme` **at the same path inside the container**, so every absolute
+path in this runbook — the HF cache, the fused overlay, reference images, output mp4s, LoRA files —
+means the same thing in both worlds and no request needs a rewritten URI. It also sets
+`--ipc=host --shm-size 32g --network host` (upstream's own H3 numbers; the 64 MB docker default is
+where a multi-rank diffusion worker dies with a bare `Bus error`).
+
+> **`h3.sh stop`, never `sglang_arm.sh stop`, when serving in a container.** That stop path is a
+> `pkill`, and without `--pid=host` a second container has its own PID namespace: the pkill matches
+> nothing, reports success, and the server keeps all eight cards.
+
+The image does **not** contain weights, and that is deliberate: a ~200 GiB image is slower to move
+than the weights are to download, and `/opt/dlami/nvme` is instance store, so a fresh box pays the
+download either way. What Docker buys is the ~10 minutes of pip and the four traps — plus a pinned
+revision, which matters more: `git+main` unpinned means two boxes disagree and no number is
+comparable with the last one.
+
+**Sections 1c–1g below are written for the venv route.** The container equivalents are mechanical,
+because the scripts and every path are the same either way:
+
+| §1c–1g says | in the container |
+|---|---|
+| `bash sglang_arm.sh serve 480` | `bash h3.sh serve vdn 480` |
+| `bash sglang_base_arm.sh serve 480` | `bash h3.sh serve t2va 480` |
+| `LORA=… bash sglang_ref2va_arm.sh serve 768` | `LORA=… bash h3.sh serve ref2va 768` |
+| `python sglang_ref2va.py 768:8 ref=…` | `bash h3.sh exec sglang_ref2va.py 768:8 ref=…` |
+| `bash sglang_ref2va_arm.sh refedge 1024` then serve | `REFEDGE=1024 bash h3.sh serve ref2va 768` |
+| `… stop` | `bash h3.sh stop` |
+
+`h3.sh` forwards `QUANT LORA LORA_ALPHA MERGED REFEDGE GPUS FRAMES SEED PORT LOGTAG MODEL OUTDIR
+PROMPT` when they are set, so an arm reads the same either way. **`REFEDGE=` is the container form
+of arm F and not just a shorthand:** the patch rewrites an installed module, so applying it in a
+throwaway container discards it with that container's writable layer. `REFEDGE=` applies it inside
+the serving process tree, immediately before `sglang serve` starts.
+
+### 1b-weights. Which checkpoints — the same selector in either route.
+
+`WEIGHTS` is a comma list and it is the only thing to decide in either route. **`hf download
 MiniMaxAI/MiniMax-H3` with no filter is 464 GiB**, because the repo ships the same 62 GiB DiT under
 four names — `transformer/` (t2va, diffusers-named), `transformer_ref/` (ref2va, diffusers-named),
 and the self-contained `FL2VA/` and `Ref2VA/` partitions (134 GiB each, native-named, each carrying
@@ -102,13 +174,6 @@ its own copy of the 62 GiB Qwen3-VL text encoder). No arm needs more than two of
 on disk, not 268** — the two 134 GiB figures double-count the encoder. Budget ~25 min at the ~2 Gb/s
 this box gets from the hub.
 
-```bash
-# what the two queued jobs need, and nothing else
-WEIGHTS=t2va,ref2va setsid nohup bash /opt/dlami/nvme/vdn/sglang_bringup.sh \
-    > /opt/dlami/nvme/sglang/bringup.log 2>&1 < /dev/null &
-tail -f /opt/dlami/nvme/sglang/bringup.log        # ends with "=== [..] done"
-```
-
 VDN is **not** in that list on purpose: §1c–1e are finished and in RESULTS.md, and re-measuring them
 costs 82 GB of download to reproduce a number to ±0.05 s. Add `vdn` only to re-baseline a new
 driver or a new sglang.
@@ -116,6 +181,19 @@ driver or a new sglang.
 > `hf`'s `--include` takes **one pattern per occurrence** as of huggingface_hub 1.x (the CLI is
 > click-based now, not argparse). A second bare pattern is silently read as a *filename* and 404s as
 > `resolve/main/tokenizer/%2A`. The script repeats the flag; don't "simplify" it back.
+
+### 1b-venv. Install without Docker. **~10 min for the environment, then the same download.**
+
+Same result, more moving parts; keep it for a box where Docker is unavailable, or to reproduce the
+environment RESULTS.md was measured in exactly.
+
+```bash
+# what the two queued jobs need, and nothing else
+WEIGHTS=t2va,ref2va setsid nohup bash /opt/dlami/nvme/vdn/sglang_bringup.sh \
+    > /opt/dlami/nvme/sglang/bringup.log 2>&1 < /dev/null &
+tail -f /opt/dlami/nvme/sglang/bringup.log        # ends with "=== [..] done"
+```
+
 
 The script asserts what matters instead of hoping: python is 3.12, `$VIRTUAL_ENV` is unset,
 `ffmpeg`/`ffprobe` exist, and `import sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn`
@@ -390,6 +468,8 @@ D, E, F, G are the same shape; F is the one code change:
 ```bash
 bash sglang_ref2va_arm.sh refedge 1024      # then restart; `refedge restore` puts 2048 back
 bash sglang_ref2va_arm.sh refedge restore
+# in a container, where a patched module dies with the container that patched it:
+REFEDGE=1024 LOGTAG=F bash docker/h3.sh serve ref2va 480
 ```
 
 Score them, do not watch them first:
