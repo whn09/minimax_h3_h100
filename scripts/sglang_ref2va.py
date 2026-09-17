@@ -4,11 +4,17 @@
     python3 sglang_ref2va.py ref=/opt/dlami/nvme/vdn/ref/subject.png tag=B 480:8
     python3 sglang_ref2va.py ref=... tag=A 480:50            # the control
     python3 sglang_ref2va.py ref=... tag=F1024 480:8 shift=12
+    python3 sglang_ref2va.py ref=... tag=DUR 480:8:121 480:8:241 480:8:345   # duration sweep
 
-Positional arguments are `<short_edge>:<num_inference_steps>`. Server-side settings (which LoRA,
-which alpha, which reference short edge) are NOT here -- they are `sglang_ref2va_arm.sh` flags and
-need a restart. That split is the whole reason this script is small: one arm per server, one tag
-per arm, and the mp4s land side by side for `melt_metrics.py`.
+Positional arguments are `<short_edge>:<num_inference_steps>[:<frames>]`, frames defaulting to 345.
+Server-side settings (which LoRA, which alpha, which reference short edge) are NOT here -- they are
+`sglang_ref2va_arm.sh` flags and need a restart. That split is the whole reason this script is
+small: one arm per server, one tag per arm, and the mp4s land side by side for `melt_metrics.py`.
+
+FRAME COUNTS ARE NOT FREE-FORM. The server validates `target.duration_seconds must be in [4, 15]`,
+and the model wants frames = 1 mod 8 (345 = 8*43+1). So "5 s" is 121 f, "10 s" is 241 f, and "15 s"
+is 345 f (14.375 s) -- 361 f would be 15.04 s and is rejected. The tag gets the frame count
+appended so a sweep does not overwrite itself.
 
 WHY THE PROMPT IS THIS PROMPT. The claim under test is "融化 / melting": a subject losing
 structural integrity while it moves. Every community report of it names the same three triggers --
@@ -32,8 +38,7 @@ import urllib.request
 from pathlib import Path
 
 HOST = "http://127.0.0.1:30012"     # 30012 = ref2va; 30011 base t2va; 30010 VDN
-FRAMES = 345
-DURATION = FRAMES / 24
+FRAMES = 345                        # default; override per arm as <edge>:<steps>:<frames>
 SEED = 42
 OUTDIR = Path("/opt/dlami/nvme/vdn/pull/ref2va")
 
@@ -59,15 +64,16 @@ def post(body: dict) -> dict:
         return {"__error__": e.read().decode()[:800]}
 
 
-def go(edge: int, steps: int, ref: str, tag: str, prompt: str, shift: float | None) -> None:
+def go(edge: int, steps: int, ref: str, tag: str, prompt: str, shift: float | None,
+       frames: int = FRAMES) -> None:
     body = {
         "prompt": prompt,
         "task": "ref2va",
         "conditions": [{"role": "reference", "type": "image", "uri": ref}],
-        "target": {"short_edge": edge, "aspect_ratio": "16:9", "duration_seconds": DURATION},
+        "target": {"short_edge": edge, "aspect_ratio": "16:9", "duration_seconds": frames / 24},
         "num_inference_steps": steps,
         "seed": SEED,
-        "output_path": str(OUTDIR / f"ref2va_{tag}_{edge}p_{steps}step"),
+        "output_path": str(OUTDIR / f"ref2va_{tag}_{edge}p_{steps}step_{frames}f"),
     }
     # Unset means the server's own ref2va default, which is already lightx2v's recommendation for
     # the ref2v LoRAs: video 12.0 / audio 3.0 (task_profiles.py, and lightx2v discussion #51).
@@ -91,9 +97,10 @@ def go(edge: int, steps: int, ref: str, tag: str, prompt: str, shift: float | No
         print(f"{tag} {edge}p {steps} steps FAILED: {str(d.get('error'))[:500]}", flush=True)
         return
     inf = d["inference_time_s"]
-    print(f"{tag:>8s} {edge}p {steps:>2} steps: E2E {dt:7.2f} s  inference {inf:7.2f} s  "
-          f"{inf / steps:5.2f} s/step  peak {d['peak_memory_mb']:.0f} MB  -> {d.get('file_path')}",
-          flush=True)
+    print(f"{tag:>8s} {edge}p {steps:>2} steps {frames:>4} f ({frames / 24:5.2f} s): "
+          f"E2E {dt:7.2f} s  inference {inf:7.2f} s  {inf / steps:5.2f} s/step  "
+          f"{inf / (frames / 24):5.2f} s per video-second  peak {d['peak_memory_mb']:.0f} MB  "
+          f"-> {d.get('file_path')}", flush=True)
 
 
 if __name__ == "__main__":
@@ -117,8 +124,11 @@ if __name__ == "__main__":
     if not tag:
         raise SystemExit("tag=<arm name> is required; it is what tells two mp4s apart afterwards")
     OUTDIR.mkdir(parents=True, exist_ok=True)
-    print(f"ref2va, {FRAMES} f, seed {SEED}, ref {ref}, prompt {len(prompt)} chars, "
+    print(f"ref2va, seed {SEED}, ref {ref}, prompt {len(prompt)} chars, "
           f"shift {'server default (12/3)' if shift is None else shift}", flush=True)
     for a in arms or ["480:8"]:
-        edge, steps = a.split(":")
-        go(int(edge), int(steps), ref, tag, prompt, shift)
+        edge, steps, *rest = a.split(":")
+        frames = int(rest[0]) if rest else FRAMES
+        if frames % 8 != 1:
+            raise SystemExit(f"{frames} frames is {frames % 8} mod 8; the model wants 1 mod 8")
+        go(int(edge), int(steps), ref, tag, prompt, shift, frames)

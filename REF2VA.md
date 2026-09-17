@@ -328,7 +328,13 @@ steps either way) but the *colour and contrast calibration* of the short schedul
 since it never upscales — and takes **29 % off the inference time** (12.81 → 9.11 s, 1.60 → 1.14
 s/step) while scoring *better* on two of the three temporal columns: decay 1.055 vs 0.954 and the
 lowest flicker of any arm, 0.118. Fewer reference rows, no quality cost, and the 2048 constant was
-upscaling a 768p reference to begin with. **This is the recommended production setting.**
+upscaling a 768p reference to begin with. ~~**This is the recommended production setting.**~~
+
+> **RETRACTED — see "Correction: what actually melts" below.** "No quality cost" was read off
+> `melt_metrics.py`, and that metric cannot see this artifact: the melt *raises* Laplacian energy
+> (a melted hand scores 97 where the correctly-rendered hand scores 44), so every sharpness/decay
+> column ranks the melted frames as among the *sharpest* in the clip. Refedge 1024 is in fact the
+> trigger that makes the LoRA melt. It is not free and it is not recommended.
 
 **768p is where a real degradation shows, and it is not melting.** Arm G is visually clean — hands,
 fingers, identity all intact — but it is the only correctly-scaled arm whose **decay falls to
@@ -349,12 +355,96 @@ Scoring fidelity numerically is the open item this section does not close.
 
 1. **Use `ref2v_turbo_8step_v1.0_768p` at 8 steps and pass no alpha.** 12.81 s for a 14.4-second
    480p clip on 8× H100, sharper than the 50-step base model.
-2. **Patch the reference short edge to 1024** (arm F): **9.11 s**, better temporal stability, no
-   downside found. Together with (1) that is 8.1× faster than the base 50-step control.
+2. ~~**Patch the reference short edge to 1024** (arm F): **9.11 s**, better temporal stability, no
+   downside found.~~ **RETRACTED** — this is what causes the melting. Leave it at the 2048 default;
+   see "Correction: what actually melts".
 3. **If they are seeing melting, they are passing an alpha.** Reproduced exactly, arm C.
 4. `ref2v_turbo_4step_v0.1` at 4 steps (**7.02 s**) is a genuine option and does not melt — the #30
    "4-step LoRAs need 6–8 steps" claim does not reproduce here.
-5. 768p costs 4.2× arm F and loses detail across the clip (decay 0.804). Prefer 480p + upscale.
+5. ~~768p costs 4.2× arm F and loses detail across the clip (decay 0.804). Prefer 480p + upscale.~~
+   **REVISED** — prefer **768p**: it is the LoRA's training resolution, and 480p is where the hands
+   are destroyed. See "Revised recommendation".
 
 Not measured, and therefore not claimed: 9:16 (#44's aspect-specific ghosting), fp8 with a merged
 adapter (a latency arm, not a quality one), multi-reference, and a numeric reference-fidelity score.
+
+---
+
+## Correction: what actually melts
+
+The customer named the two frames the metrics missed, and they were right. In the two clips actually
+delivered — `P1024_480p_8step.mp4` and `P1024_768p_8step.mp4`, both the LoRA at 8 steps with the
+reference short edge patched to 1024:
+
+| clip | frames | time | what collapses |
+|---|---|---|---|
+| 480p | f108–f113 | **t4.50–4.71 s** | both hands become pink lumps with one finger-like protrusion and worm-like squiggles |
+| 768p | f43–f47 | **t1.79–1.96 s** | the face smears into a distorted mask — eye sockets, merged brows, twisted mouth |
+
+Both recover within ~6 frames, which is what "melts and comes back" means.
+
+**Why four successive detectors missed it, and the one methodological lesson.** Melting is
+*structural collapse with more high-frequency energy, not less*. The melted hand's tile scores
+sharpness **97** against 56–62 in the surrounding frames and **44** for the anatomically correct
+hand; the 768p melted face holds 66–77. So the entire detail-loss family — `melt_metrics.py`'s
+sharp/decay/flick, and every rolling-baseline variant of `melt_frames.py` — is *structurally blind*
+to it, and can rank the melted frames as the sharpest in the clip. `melt_frames.py` is kept as a
+candidate *nominator* only; `vframes.py` (contact sheets, fraction crops, nearest-neighbour zoom) is
+what actually found the artifact. **The detector nominates, the eye decides.**
+
+### The attribution matrix
+
+768p, seed 42, 345 f, identical prompt, one variable per cell. Base cells are the ref2va partition at
+fp8; LoRA cells are the dynamic bf16 adapter at scale 0.0625 (no alpha).
+
+| cell | model | steps | refedge | inference | the face at the spin |
+|---|---|---|---|---|---|
+| `B50_2048` | base | 50 | 2048 | 228.71 s | clean |
+| `B50_1024` | base | 50 | 1024 | 192.06 s | clean |
+| `B08_2048` | base | **8** | 2048 | 35.63 s | clean (softer, not melted) |
+| `B08_1024` | base | **8** | 1024 | 29.52 s | clean (softer, not melted) |
+| `G768` | **LoRA** | 8 | 2048 | 38.62 s | **clean** — 16 consecutive frontal frames intact |
+| `P768` *(delivered)* | **LoRA** | 8 | **1024** | — | **MELTS**, f43–f47 |
+
+Read down the refedge columns and across the model rows: **only the cell with the LoRA *and* refedge
+1024 melts.** So there are two necessary causes, not one.
+
+1. **The LoRA is the cause, not the step count.** The base model at the *same* 8 steps is clean at
+   both refedges. Confirmed independently at 480p on the hands (`hand_arms.png`, f106–f118): base at
+   8 steps renders ten fingers, knuckles and a ring; the LoRA at 8 steps renders two pink stumps.
+2. **Refedge 1024 is the trigger that exposes it.** The same LoRA at the 2048 default is clean.
+   Restoring 2048 costs +20 % inference (35.63 s vs 29.52 s at 8 steps) — that is the real price of
+   the "free money" retracted above.
+3. **8 steps on the base model is soft, not melted.** Structure is correct; sharpness runs 30–40
+   against 50–65 at 50 steps. Undistilled short-schedule output loses detail; it does not deform.
+4. **The 8-step checkpoint is `..._v1.0_768p_bf16.safetensors` — a 768p-trained LoRA.** Running it at
+   480p is off-distribution and is where the damage is worst, which is consistent with the delivered
+   480p clip being the one with destroyed hands.
+5. **At 480p, `ref2v_turbo_4step_v0.1` does not melt the hands** — verified visually this time, not
+   from the blind metric: at f120–f135 it renders five fingers, knuckles and a ring, matching the
+   base model, where the 8-step 768p LoRA renders stumps.
+
+### Two things that were wrong in the record
+
+**The "FP8M" arms were never the merged checkpoint.** Both `serve_ref2va_480p_fp8m_480.log` and
+`serve_ref2va_768p_fp8m_768.log` show `model_variant: ref2va` with `component_weights_paths: {}` —
+they were the *base* model at fp8, mislabelled. Every "merged fp8" latency number attributed to the
+LoRA is therefore a base-model number.
+
+**The merged fp8 checkpoint produces pure noise.** Served properly
+(`--model-variant hybrid --component-weights-paths.transformer …/ref2v_turbo_bf16`, `QUANT=fp8`), all
+345 frames are colour noise at *both* refedges — 15.7 MB of incompressible mp4 where a real 768p
+render is 2.3 MB, frame sharpness 650–880 against 30–60. Base fp8 at refedge 2048 renders fine, so
+this is specific to the merged `hybrid` transformer, not to fp8 or to the long reference sequence.
+**The merged fp8 serving path is unvalidated and currently broken.** Until it is fixed, the dynamic
+bf16 adapter (TP=2, ULYSSES=4) is the only working LoRA path.
+
+### Revised recommendation
+
+- **Serve at 768p with the reference short edge left at SGLang's 2048 default.** That is the only
+  configuration in which the 8-step LoRA is both fast and structurally clean: 38.62 s for 14.4 s of
+  768p video, versus 228.71 s for the 50-step base model — **5.9×**.
+- **Do not patch `MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE` to 1024.** It buys ~20 % and causes the
+  melting the customer reported.
+- **Do not use the merged fp8 checkpoint** until the noise above is diagnosed.
+- The two delivered clips should be regenerated at refedge 2048 before any further review.
