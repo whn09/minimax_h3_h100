@@ -37,12 +37,12 @@ The question: **how long does one 480P 15-second clip take on a `p5.48xlarge` (8
 > So the conclusion the correction was reaching for is the right one: the twelve patches below
 > were the right way to learn *where the time goes* and the wrong way to *serve* it.
 >
-> **Which is why the way in is now a container**, `docker/Dockerfile` + `docker/h3.sh` — four
-> commands from a wiped box (`probe`, `build`, `weights`, `serve`), and four of those five
+> **Which is why the way in is now upstream's nightly container**, `docker/h3.sh` — three commands
+> from a wiped box (`probe`, `weights`, `serve`), **no image build at all**, and four of those five
 > unrelated errors stop existing, because they are all artifacts of installing into a bare DLAMI
-> rather than into an image upstream already builds. `RUNBOOK.md` §1b. It does **not** shorten the
-> ~200 GiB weight download, which is the real cost on a fresh box and which no image can carry
-> cheaper than the CDN can.
+> rather than into an image upstream already builds nightly with `BUILD_TYPE=all`. `RUNBOOK.md` §1b.
+> It does **not** shorten the ~200 GiB weight download, which is the real cost on a fresh box and
+> which no image can carry cheaper than the CDN can.
 
 The stack measured in the rest of this document is **not** the SGLang path used in
 `../minimax_h3_h200/` and `../minimax_h3_g7e/`. Those serve **stock MiniMax-H3** plus the
@@ -542,8 +542,8 @@ they are the dominant term, not the sampler.
 | `scripts/reload_bench.py` | how long the DiT takes to come **back** after patch 10 frees it — the question a long-lived API has and a one-shot render does not |
 | `scripts/decode_parity.py` | asserts patch 11's two memory changes are **bit-identical** to `vae.decode`, at both canvases, with fixed latents in one process — multi-rank denoise is not reproducible, so a whole-render A-B could not have shown this |
 | `scripts/box_check.sh` | run **on the box**: is it in the state these numbers were measured in? Every line is something that has silently been wrong once — the two `+cu129` suffixes most of all |
-| `docker/Dockerfile` | **the recommended way in.** Eleven lines on top of `lmsysorg/sglang`, because upstream's own 795-line Dockerfile already carries python 3.12, torch, ffmpeg, cargo and a real `/usr/local/cuda` — four of the five bringup traps below exist only when installing into a bare DLAMI. It adds the two things the published image lacks: `pip install -e "python[diffusion]"` and a **pinned** sglang revision, with the H3+VDN import asserted at build time so a bad pin fails in `docker build` and not 20 minutes into an 8-GPU launch |
-| `docker/h3.sh` | `probe` / `build` / `weights` / `serve` / `exec` / `sh` / `logs` / `stop` for that image. Bind-mounts `/opt/dlami/nvme` at the **same path** inside, so every absolute path in this repo — HF cache, reference URIs, log files, RUNBOOK's copy-paste — means the same thing in both worlds |
+| `docker/h3.sh` | **the recommended way in, and it builds nothing.** `probe` / `weights` / `serve` / `exec` / `sh` / `logs` / `stop` against `lmsysorg/sglang:dev` — upstream's x86 nightly, which is built `BUILD_TYPE=all` (so the whole `[diffusion]` dependency set is already installed) from a `BRANCH_TYPE=local` checkout (so the source *and its `.git`* are already there at the sha in the tag). Four of the five bringup traps below exist only when installing into a bare DLAMI. Bind-mounts `/opt/dlami/nvme` at the **same path** inside, so every absolute path in this repo — HF cache, reference URIs, log files, RUNBOOK's copy-paste — means the same thing in both worlds. `probe` prints the image digest, which is the pin worth recording |
+| `docker/Dockerfile` | the escape hatch, for the one case the nightly cannot cover: a revision that is not a midnight one. Nightlies pin main's head at 00:00 UTC; RESULTS.md was measured at `3f8eb35e`, a mid-day commit. `SGLANG_REV=<sha>` checks it out and reinstalls the way upstream does (`--no-deps`, because the pins are already frozen in the image's `constraints.txt` and a plain `pip install -e` re-resolves ~60 of them). Default is `keep`, i.e. add nothing but the H3+VDN import assertion |
 | `scripts/_env.sh` | the arm preamble all three arm scripts source: CUDA_HOME discovery, the `lib64`/`-lcudart` symlinks, `NCCL_NET_PLUGIN=none`, `expandable_segments`. Written to be a **no-op in the container** (it activates a venv only if there is one), which is what lets one set of scripts serve both routes |
 | `scripts/fetch_weights.sh` | the `WEIGHTS=` selector, called by both routes so they fetch identically. Why a selector and not `hf download MiniMaxAI/MiniMax-H3`: unfiltered that is 464 GiB of the same 62 GiB DiT under four names |
 | `scripts/sglang_bringup.sh` | the venv fallback: the alternative runtime in its own venv beside the reference stack, gated on whether the installed build actually has `hybrid_window_attn_h3`. Only needed where Docker is not an option |

@@ -87,36 +87,66 @@ done
 symlinks, `NCCL_NET_PLUGIN`, the allocator flag and the ffmpeg gate, and it is what makes them run
 unchanged both in a venv and inside the container.
 
-### 1b. Install, the container route. **~6 min build, then the download you asked for.**
+### 1b. Install, the container route. **No install and no build. ~3 min pull, then the download you asked for.**
 
 **This is the recommended route, and it exists because almost every trap in this runbook is a
-consequence of installing into a bare DLAMI, not of the model.** `lmsysorg/sglang` is built from
-sglang's own 795-line `docker/Dockerfile` on `nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04`, and it
-already carries python 3.12, torch, `sglang-kernel`, the flashinfer cubin cache, a Rust toolchain,
-a real `/usr/local/cuda` and `ffmpeg`. That deletes four of them outright: the
+consequence of installing into a bare DLAMI, not of the model.** `lmsysorg/sglang:dev` is
+upstream's **x86 nightly** — `.github/workflows/release-docker-dev.yml` runs on
+`cron: "0 0 * * *"`, builds `docker/Dockerfile` on `nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04` for
+amd64+arm64, and publishes `dev` plus the immutable dated aliases
+`nightly-dev-{date}-{short_sha}`. (`nightly-cu134` is a different image: arm64-only Rubin, useless
+here.) Four traps in this runbook are gone because the image has python 3.12, torch,
+`sglang-kernel`, the flashinfer cubin cache, cargo, a real `/usr/local/cuda` and `ffmpeg`: the
 `can't find Rust compiler` build failure, `deep_gemm`'s `find_cuda_home` assert plus the
 `lib64`/`-lcudart` symlinks, the broken apt source that blocks `ffmpeg`, and python 3.13 vs the
 cp312-only `outlines_core` wheel.
 
 ```bash
 cd /opt/dlami/nvme/vdn/docker
-bash h3.sh probe            # ~3 min. What does the published image already have?
-bash h3.sh build            # ~6 min. Bakes the diffusion extra + the pinned revision
+bash h3.sh probe            # ~3 min. Pull the nightly and ask it what it has
 bash h3.sh weights t2va,ref2va
 bash h3.sh serve ref2va 768 ; bash h3.sh logs ref2va
 ```
 
-Two things the published image does **not** have, which is the whole content of our 11-line
-`docker/Dockerfile`:
+**There is no build step, and the reason is worth writing down, because this runbook said the
+opposite for one commit.** The claim was that the image installs the LLM extras only — the way
+upstream's own generated H3 command
+(`docs/src/snippets/configs/MiniMaxAI/minimax-h3.jsx`, `dockerRunCommand`) still implies, since it
+runs `pip install -e "/sgl-workspace/sglang/python[diffusion]"` at **every container start**. Read
+the build instead of the docs and it is false:
 
-* **the diffusion extra.** The image bundles the sglang *source* at `/sgl-workspace/sglang` but
-  installs the LLM extras only — which is why upstream's own generated H3 command
-  (`docs/src/snippets/configs/MiniMaxAI/minimax-h3.jsx`, `dockerRunCommand`) is literally
-  `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"'`.
-  Upstream pays that install on **every container start**; we pay it once at build.
-* **a revision new enough for VDN.** A tag's bundled source is as old as the tag. The image pins
-  `SGLANG_REV=3f8eb35eadfb…`, the revision RESULTS.md was measured at. `SGLANG_REV=keep` uses the
-  image's own tree instead — use that only when deliberately testing a newer `main`.
+* both docker workflows pass **`--build-arg BUILD_TYPE=all`**, `python/pyproject.toml` has
+  `all = ["sglang[diffusion]", "sglang[http2]", "sglang[tracing]"]`, and stage `torch_deps`
+  installs `".[all]"` **with** dependencies (`docker/Dockerfile:216`) — so `diffusers==0.37.0`,
+  `av`, `cache-dit`, `st_attn`, `vsa`, `opencv-python-headless`, `moviepy`, `nvidia-modelopt` are
+  already installed;
+* `--build-arg BRANCH_TYPE=local` makes `framework_final` `COPY . /src` into
+  `/sgl-workspace/sglang`, and `.dockerignore` excludes only `.gitignore` — so the image carries
+  the **whole checkout including `.git`**, at exactly the sha in its tag, editable-installed with
+  `pip install --no-deps -e "python[all]"` (`docker/Dockerfile:584`).
+
+A nightly is therefore already diffusion-capable, already VDN-capable, and already pinned. `probe`
+is the step that proves it on the box; if every line says `have`, stop there.
+
+**Pin it by digest anyway.** `:dev` is rebuilt every night, and "measured on the nightly" is not a
+reproducible statement. The last line `probe` prints is the pin:
+
+```bash
+BASE=lmsysorg/sglang@sha256:… bash h3.sh serve vdn 480     # record this in RESULTS.md
+```
+
+`docker/Dockerfile` survives as an **escape hatch for one case only**: a revision no nightly names.
+Nightlies pin main's head at 00:00 UTC; RESULTS.md's numbers were measured at `3f8eb35e`, a mid-day
+commit on 2026-09-16 that sits between the `20260916` and `20260917` nightlies. If an exact sha
+matters — bisecting, or reproducing a number against the commit it came from:
+
+```bash
+SGLANG_REV=3f8eb35eadfb29ad98d7900910f19fafcbac5ccb bash h3.sh build   # ~2 min
+IMAGE=minimax-h3:local bash h3.sh serve vdn 480                        # nothing picks it up implicitly
+```
+
+Otherwise leave it alone. Either way the build asserts the H3, VDN and pipeline imports, so a bad
+pin fails in `docker build` and not 20 minutes into an 8-GPU launch.
 
 `h3.sh` bind-mounts `/opt/dlami/nvme` **at the same path inside the container**, so every absolute
 path in this runbook — the HF cache, the fused overlay, reference images, output mp4s, LoRA files —
@@ -128,11 +158,11 @@ where a multi-rank diffusion worker dies with a bare `Bus error`).
 > `pkill`, and without `--pid=host` a second container has its own PID namespace: the pkill matches
 > nothing, reports success, and the server keeps all eight cards.
 
-The image does **not** contain weights, and that is deliberate: a ~200 GiB image is slower to move
-than the weights are to download, and `/opt/dlami/nvme` is instance store, so a fresh box pays the
-download either way. What Docker buys is the ~10 minutes of pip and the four traps — plus a pinned
-revision, which matters more: `git+main` unpinned means two boxes disagree and no number is
-comparable with the last one.
+Nothing here contains weights, and that is deliberate: a ~200 GiB image is slower to move than the
+weights are to download, and `/opt/dlami/nvme` is instance store, so a fresh box pays the download
+either way. **What the container buys is the ~10 minutes of pip, the four traps, and a revision
+that is a digest instead of a date — not the ~25-minute download, which is the real cost on a fresh
+box and which no image can carry more cheaply than the CDN.**
 
 **Sections 1c–1g below are written for the venv route.** The container equivalents are mechanical,
 because the scripts and every path are the same either way:

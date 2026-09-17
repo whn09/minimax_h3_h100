@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
-# One wrapper for the container route. Run it on the box, from anywhere.
+# One wrapper for the container route. Run it on the box, from anywhere. THERE IS NO BUILD STEP:
 #
-#   bash h3.sh probe            # what does the published image already have? ~3 min, pulls it
-#   bash h3.sh build            # bake the diffusion extra + the pinned revision.   ~6 min
-#   bash h3.sh weights t2va,ref2va                                                 # ~25 min
+#   bash h3.sh probe                   # pull upstream's nightly and ask it what it has.   ~3 min
+#   bash h3.sh weights t2va,ref2va                                                        # ~25 min
 #   bash h3.sh serve ref2va 768        # runs sglang_ref2va_arm.sh inside, detached
 #   LORA=$L/ref2v_8step.safetensors REFEDGE=1024 bash h3.sh serve ref2va 768   # env passes through
 #   bash h3.sh logs                    # follow it
 #   bash h3.sh exec sglang_ref2va.py 768:8 ref=/opt/dlami/nvme/vdn/keyframes/ref.png
 #   bash h3.sh sh                      # interactive shell, same mounts
 #   bash h3.sh stop
+#   bash h3.sh build                   # ONLY to pin a non-midnight revision -- see Dockerfile
+#
+# WHY NO BUILD. `lmsysorg/sglang:dev` is upstream's x86 nightly (release-docker-dev.yml, cron
+# "0 0 * * *"), built with BUILD_TYPE=all, and pyproject's `all` includes `sglang[diffusion]` with
+# its dependencies -- so diffusers, av, st_attn, vsa and the rest are already there, main's VDN
+# subsystem is already there, and the tree is already editable-installed at the sha in the tag.
+# The nightly also publishes immutable aliases, `nightly-dev-{date}-{short_sha}`. An overlay that
+# pip-installs `[diffusion]` on top of that -- which is what upstream's own generated H3 run
+# command still does, at every container start -- adds minutes and changes nothing.
+#
+# PIN IT ANYWAY. `:dev` moves every night, and "the numbers came from the nightly" is not a
+# reproducible statement. `probe` prints the image digest and the bundled source sha; put the
+# digest in BASE and it cannot move under you:
+#   BASE=lmsysorg/sglang@sha256:<...> bash h3.sh serve vdn 480
 #
 # THE ONE DESIGN DECISION: /opt/dlami/nvme is bind-mounted at the SAME PATH inside the container.
 # Not /workspace, not /data. Every path in this repo -- the HF cache, the fused overlay cache, the
@@ -25,8 +38,12 @@
 # The image is worth ~10 minutes and four traps, not the 25-minute download -- see the Dockerfile.
 set -euo pipefail
 
-IMAGE=${IMAGE:-minimax-h3:local}
 BASE=${BASE:-lmsysorg/sglang:dev}
+# Default to running the base image itself, so the common path never builds. `build` produces
+# minimax-h3:local and tells you to select it with IMAGE=; nothing selects it implicitly, because
+# a stale local overlay silently shadowing the nightly is exactly the kind of "which revision was
+# that number measured on" question this repo already answered the hard way once.
+IMAGE=${IMAGE:-$BASE}
 NVME=${NVME:-/opt/dlami/nvme}
 NAME=${NAME:-h3}
 DOCKER=${DOCKER:-docker}
@@ -69,10 +86,11 @@ shift || true
 case "$cmd" in
 
 probe)
-  # Ask the published image what it has before building anything on top of it. If VDN and the
-  # diffusion pipeline both import here, the overlay is unnecessary and `serve` can run $BASE
-  # directly (IMAGE=$BASE bash h3.sh serve ...). Expect them NOT to: the image installs the LLM
-  # extras only and bundles a source tree whose revision is as old as the tag.
+  # THE FIRST THING TO RUN ON A FRESH BOX, and the only verification step that matters: it decides
+  # whether anything needs building at all. If every line below says `have`, stop here -- `serve`
+  # already runs this image and the Dockerfile is not needed. The last two lines are the ones to
+  # copy into RESULTS.md: the digest is the reproducible pin, the bundled sha is what the numbers
+  # were actually measured on.
   img=${1:-$BASE}
   $DOCKER pull "$img"
   $DOCKER run --rm --entrypoint bash "$img" -lc '
@@ -80,23 +98,38 @@ probe)
     python -c "import sys; print(\"python\", sys.version.split()[0])"
     for m in sglang.multimodal_gen \
              sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 \
-             sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn; do
+             sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn \
+             sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline; do
       python -c "import $m" 2>/dev/null && echo "have  $m" || echo "MISSING $m"
     done
+    # The diffusion extras themselves, not just the sglang modules that import them: these are
+    # what `[diffusion]` brings and what a BUILD_TYPE-less image would be missing.
+    python - <<"PYPROBE"
+import importlib.util as u
+for m in ("diffusers", "av", "cv2", "cache_dit", "st_attn", "vsa", "moviepy", "imageio_ffmpeg"):
+    print(("have  " if u.find_spec(m) else "MISSING ") + m)
+PYPROBE
     for b in ffmpeg ffprobe nvcc cargo git; do
       command -v $b >/dev/null && echo "have  $b" || echo "MISSING $b"
     done
     echo "CUDA_HOME=${CUDA_HOME:-unset}; /usr/local/cuda $( [ -d /usr/local/cuda ] && echo present || echo absent)"
-    ls -d /sgl-workspace/sglang 2>/dev/null && git -C /sgl-workspace/sglang log -1 --format="bundled source: %H %cd"
+    git -C /sgl-workspace/sglang log -1 --format="bundled source: %H %cd" 2>/dev/null \
+      || echo "bundled source: no .git -- this image was not built with BRANCH_TYPE=local"
   '
+  # Pin by digest, not by tag: `:dev` is rebuilt every night and `nightly-dev-{date}-{short_sha}`
+  # depends on tag naming that can change, while a digest cannot.
+  echo "--- pin this: BASE=$($DOCKER inspect --format '{{index .RepoDigests 0}}' "$img" 2>/dev/null || echo '<no digest: locally built image>')"
   ;;
 
 build)
+  # ONLY for a revision no nightly names -- read the Dockerfile's header first. Default
+  # SGLANG_REV=keep, so a bare `build` just re-asserts the imports on top of $BASE.
   # The build context is just docker/, because the Dockerfile has no COPY at all: the scripts
   # arrive through the bind mount, so editing one does not invalidate a layer or need a rebuild.
   $DOCKER build --build-arg "BASE=$BASE" ${SGLANG_REV:+--build-arg "SGLANG_REV=$SGLANG_REV"} \
-    -t "$IMAGE" -f "$HERE/Dockerfile" "$HERE"
-  echo "built $IMAGE"
+    -t minimax-h3:local -f "$HERE/Dockerfile" "$HERE"
+  echo "built minimax-h3:local -- nothing uses it until you ask for it:"
+  echo "  IMAGE=minimax-h3:local bash h3.sh serve vdn 480"
   ;;
 
 weights)

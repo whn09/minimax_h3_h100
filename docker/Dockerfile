@@ -1,56 +1,50 @@
-# MiniMax-H3 on 8x H100, as an image. Eleven lines of real content, because upstream already
-# ships the hard parts -- see docker/h3.sh for the wrapper and RUNBOOK section 1 for the flow.
+# MiniMax-H3 on 8x H100. THIS FILE IS AN ESCAPE HATCH, NOT THE WAY IN: the default route builds
+# nothing and runs upstream's nightly image directly. `bash h3.sh probe` first, then serve.
 #
-# WHY THIS IS A THIN OVERLAY AND NOT A Dockerfile OF OUR OWN.
-# sglang's own docker/Dockerfile is 795 lines and builds CUDA 13.0.3 + python 3.12 + torch +
-# sglang-kernel + flashinfer cubin caches + a Rust toolchain + ffmpeg, and `lmsysorg/sglang`
-# publishes the result. Every trap sglang_bringup.sh works around is a trap that only exists
-# because it installs into a bare DLAMI:
-#   * "can't find Rust compiler" / SGLANG_BUILD_RUST_EXTS=none  -> the image has cargo
-#   * deep_gemm's find_cuda_home assert, the lib64/-lcudart symlinks
-#                                                              -> the image has real /usr/local/cuda
-#   * apt is broken, so ffmpeg/ffprobe cannot be installed      -> the image has ffmpeg
-#   * python 3.13 vs the cp312-only outlines_core wheel         -> the image is 3.12
-# So the only thing left for us to do is the one thing the published image does NOT have.
+# WHY THERE IS ALMOST NOTHING HERE. This started as an overlay that pip-installed the diffusion
+# extra, on the belief that the published image carries the LLM extras only. That belief was
+# wrong, and checking it is what deleted the layer:
+#   * .github/workflows/release-docker-dev.yml runs on `cron: "0 0 * * *"` -- the `dev` tag IS
+#     the x86 nightly, rebuilt daily from main, and it also publishes the immutable dated aliases
+#     `nightly-dev-{date}-{short_sha}`. (`nightly-cu134` is a different thing: arm64-only Rubin.)
+#   * both docker workflows pass `--build-arg BUILD_TYPE=all`, python/pyproject.toml's
+#     `all = ["sglang[diffusion]", "sglang[http2]", "sglang[tracing]"]`, and stage `torch_deps`
+#     installs `".[all]"` *with* dependencies (Dockerfile:216). So diffusers==0.37.0, av,
+#     cache-dit, st_attn, vsa, opencv-python-headless, moviepy, nvidia-modelopt are all in there.
+#   * `--build-arg BRANCH_TYPE=local` makes framework_final `COPY . /src` into
+#     /sgl-workspace/sglang, and .dockerignore excludes only .gitignore -- so the image carries
+#     the full checkout *including .git*, at exactly the sha in its tag, editable-installed with
+#     `pip install --no-deps -e "python[all]"` (Dockerfile:584).
+# A nightly is therefore already a pinned, diffusion-capable, VDN-capable image. Upstream's own
+# H3 recipe still pip-installs `[diffusion]` at every container start
+# (docs/src/snippets/configs/MiniMaxAI/minimax-h3.jsx) -- against a nightly that is redundant.
 #
-# WHAT THE PUBLISHED IMAGE DOES NOT HAVE: this model. The image bundles the sglang *source* at
-# /sgl-workspace/sglang but installs the LLM extras only, which is why upstream's own generated
-# H3 command (docs/src/snippets/configs/MiniMaxAI/minimax-h3.jsx, `dockerRunCommand`) is
-#     bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"' --
-# i.e. it pip-installs the diffusion extra at *every container start*. That is a couple of
-# minutes per launch and a different resolution each time. This image does exactly that, once,
-# at build time -- plus the checkout below, because a published tag's bundled revision is
-# whatever it was when the tag was built, and VDN is younger than that.
-#
-# WHY WE STILL PIN A SHA. Release 0.5.19 on PyPI has base MiniMax-H3 but zero occurrences of
-# `vdn` or `hybrid_window_attn_h3`; on main VDN is a whole subsystem. RESULTS.md's numbers were
-# measured against main at 3f8eb35e, and main moves dozens of commits a day, so an unpinned
-# `git+main` means two boxes disagree and no number is comparable to the last one. The image is
-# where that pin belongs.
+# SO WHAT IS THIS FOR. Exactly one thing the nightly cannot give you: a revision that is not a
+# midnight one. The nightlies pin main's head at 00:00 UTC; RESULTS.md was measured at 3f8eb35e,
+# a mid-day commit on 2026-09-16, which no tag names. Build this only when an exact sha matters
+# (bisecting a regression, or reproducing a number against the commit it was measured at).
+# Otherwise pin the base by digest and skip the build -- `h3.sh probe` prints the digest.
 
 ARG BASE=lmsysorg/sglang:dev
 FROM ${BASE}
 
-# The revision RESULTS.md was measured at. SGLANG_REV=keep uses the image's bundled tree
-# instead, which is the right choice only when you are deliberately testing a newer main.
-ARG SGLANG_REV=3f8eb35eadfb29ad98d7900910f19fafcbac5ccb
+# `keep` = use the image's own tree, i.e. add only the assertion below. Pass a sha to move:
+#   SGLANG_REV=3f8eb35eadfb29ad98d7900910f19fafcbac5ccb bash h3.sh build
+ARG SGLANG_REV=keep
 WORKDIR /sgl-workspace/sglang
 RUN set -eux; \
     if [ "$SGLANG_REV" != keep ]; then \
       git fetch --depth 1 origin "$SGLANG_REV" || git fetch origin; \
       git checkout --detach "$SGLANG_REV"; \
+      # --no-deps is upstream's own form for this install (Dockerfile:584) and it matters: the
+      # dependency set is already resolved and frozen into /sgl-workspace/constraints.txt, so a
+      # plain `pip install -e` re-resolves ~60 pins against PyPI and can quietly swap torch or
+      # diffusers under a checkpoint that was measured on the old ones. If the checked-out
+      # revision *added* a dependency, the import assertion below is what tells you -- rerun
+      # with `python -m pip install -e "python[all]"` then, deliberately.
+      python -m pip install --no-deps -e "python[all]"; \
     fi; \
     git log -1 --format='sglang source: %H %cd'
-
-# `|| SGLANG_BUILD_RUST_EXTS=none`: setup.py shells out to cargo just to *discover* the Rust
-# router extensions, so on an image whose final stage dropped the toolchain the install dies in
-# get_requires_for_build_wheel before any Python compiles. Nothing in the diffusion path uses
-# those modules. Upstream's own command omits the variable, so try it their way first and only
-# fall back -- if the fallback is what runs, the build log says so.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install -e "python[diffusion]" \
-    || { echo "retrying without the Rust extensions"; \
-         SGLANG_BUILD_RUST_EXTS=none python -m pip install -e "python[diffusion]"; }
 
 # Fail the BUILD, not the 8-GPU launch 20 minutes later. The import is the fact: `sglang serve
 # --help` adds the diffusion flags only after it has resolved --model-path, so grepping its help
