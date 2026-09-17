@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # SGLang Diffusion as an alternative to the patched reference stack, on the same box.
 #
-#   setsid nohup bash sglang_bringup.sh > /opt/dlami/nvme/sglang/bringup.log 2>&1 < /dev/null &
+#   WEIGHTS=t2va,ref2va setsid nohup bash sglang_bringup.sh \
+#       > /opt/dlami/nvme/sglang/bringup.log 2>&1 < /dev/null &
+#
+# WEIGHTS is a comma list picking which checkpoints to fetch; see the `weights` step for the
+# sizes and what each arm needs. It defaults to what this repo's headline numbers were
+# measured with (vdn,t2va). WEIGHTS=none installs the environment and downloads nothing.
 #
 # WHY: sglang's cookbook (docs/cookbook/diffusion/MiniMax/MiniMax-H3.mdx, section 7) now
 # serves OpenVDN/vdn-minimax-h3 directly, and on 8x B200 it measures 0.88 s/NFE against
@@ -26,6 +31,7 @@ set -euo pipefail
 
 ROOT=${ROOT:-/opt/dlami/nvme/sglang}
 VDNROOT=${VDNROOT:-/opt/dlami/nvme/vdn}
+WEIGHTS=${WEIGHTS:-vdn,t2va}
 export HF_HOME=${HF_HOME:-$VDNROOT/hf}
 export UV_CACHE_DIR=${UV_CACHE_DIR:-$VDNROOT/uvcache}
 export UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR:-$VDNROOT/uvpython}
@@ -92,7 +98,11 @@ python -V | grep -q '3\.12' || { echo "venv is not python 3.12; see the 3.13 not
 export SGLANG_BUILD_RUST_EXTS=none
 uv pip install -q --prerelease=allow \
   "sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git#subdirectory=python"
-uv pip install -q 'huggingface_hub[hf_transfer]'
+# NOT 'huggingface_hub[hf_transfer]'. As of huggingface_hub 1.x that extra no longer exists
+# ("does not provide the extra 'hf-transfer'") and hf_transfer is gone from the codebase: the
+# fast path is hf-xet, a default dependency, and the knob is HF_XET_HIGH_PERFORMANCE. Asking
+# for the old extra installs plain hub and silently leaves the download on the slow path.
+uv pip install -q huggingface_hub
 
 step "does this build actually have VDN?"
 # Import the module, do not grep --help. `sglang serve --help` adds the diffusion flags
@@ -118,25 +128,74 @@ hit = next((p.parent.parent for p in sorted(nv.glob("*/bin/nvcc"))), None)
 print(f"CUDA_HOME={hit}" if hit else "CUDA_HOME: no pip nvcc found, set it by hand")
 PY
 
-step "weights"
-export HF_HUB_ENABLE_HF_TRANSFER=1
+step "weights: $WEIGHTS"
+# Which accelerated-download knob exists depends on the hub version sglang pinned, and setting
+# the wrong one costs real minutes on 268 GiB. hub 1.x: hf_transfer is deleted, hf-xet is the
+# backend, HF_HUB_ENABLE_HF_TRANSFER=1 only earns a FutureWarning telling you to use
+# HF_XET_HIGH_PERFORMANCE. hub 0.x: the reverse. Ask the installed package rather than guess.
+if python -c "import hf_transfer" 2>/dev/null; then
+  export HF_HUB_ENABLE_HF_TRANSFER=1
+  echo "  fast download: hf_transfer"
+elif python -c "import hf_xet" 2>/dev/null; then
+  export HF_XET_HIGH_PERFORMANCE=1
+  echo "  fast download: hf-xet (HF_XET_HIGH_PERFORMANCE)"
+else
+  echo "  fast download: NEITHER hf_transfer nor hf_xet -- expect this to take much longer"
+fi
 # sglang owns the checkpoint-directory mapping (cookbook section 2: "do not point
 # --model-path at a manually downloaded subdirectory"), so it is given the repo ID and
 # fetches into HF_HOME itself -- it cannot reuse $VDNROOT/ckpts, which was pulled with
 # --local-dir and has no cache layout.
 #
-# MiniMaxAI/MiniMax-H3 is NOT optional, and not just because of the hard-linking. Checked
-# on this box: $VDNROOT/ckpts/h3-base holds transformer/, vae/, audio_vae/ and the two
-# schedulers, and NO text_encoder/ or processor/ -- the Qwen3-VL conditioner has never been
-# on this machine. The reference stack does not need it (it torch.loads offline prompt
-# caches, which is the whole "text encoding is not in any of these numbers" section of
-# RESULTS.md); an sglang server that takes a text prompt over HTTP does. So the base repo
-# comes down too: ~110 GB on top of the 82 GB re-fetch, plus the 62 GB fused overlay that
-# the first launch writes. ~250 GB, against 27 TB free.
-hf download OpenVDN/vdn-minimax-h3 > /dev/null
-hf download MiniMaxAI/MiniMax-H3 > /dev/null
+# WHY THIS IS A SELECTOR AND NOT `hf download <repo>`. `hf download MiniMaxAI/MiniMax-H3`
+# is 464 GiB, because the repo ships the same DiT under four names: transformer/ (61.73,
+# t2va, diffusers-named), transformer_ref/ (61.73, ref2va, diffusers-named), and the
+# self-contained FL2VA/ and Ref2VA/ partitions (134.16 each, native-named, each carrying
+# its own 62 GiB copy of the Qwen3-VL text encoder). No arm needs more than two of those.
+# Download time is the only cost that matters on a fresh box -- /opt/dlami/nvme is instance
+# store, so this is paid again after every stop.
+#
+# The text encoder is NOT optional for any sglang arm, which is the one trap here: the
+# reference stack torch.loads offline prompt caches (the whole "text encoding is not in any
+# of these numbers" section of RESULTS.md), so a checkpoint tree that worked for it can be
+# missing text_encoder/ and processor/ entirely. A server that takes a prompt over HTTP
+# needs both.
+# EVERY PATTERN NEEDS ITS OWN --include. `hf` is click-based from huggingface_hub 1.x and
+# --include takes exactly one value per occurrence, so `--include 'a/*' 'b/*'` sends b/* to the
+# FILENAMES positional and dies on "File not found in repository: .../b/%2A". Verified, not
+# assumed. The patterns are fnmatch against the full relative path and `*` crosses `/`, which is
+# why '*.json' is enough to bring every config and index file in the repo (all tiny).
+base() {  # base <pattern>...  -- the small shared files plus whatever this arm needs
+  local inc=(--include '*.json' --include 'tokenizer/*' --include 'processor/*'
+             --include 'scheduler/*' --include 'audio_scheduler/*')
+  local p; for p in "$@"; do inc+=(--include "$p"); done
+  hf download MiniMaxAI/MiniMax-H3 "${inc[@]}" > /dev/null
+}
+for w in ${WEIGHTS//,/ }; do
+  case "$w" in
+    none) ;;
+    # VDN's 8-step distill. t2va + fl2va only; it has no ref2va partition.       82 GB
+    vdn)  hf download OpenVDN/vdn-minimax-h3 > /dev/null ;;
+    # base H3 t2va/fl2va-over-t2va: the 50-step denominator and the 8-step probe. 134 GiB
+    t2va) base 'transformer/*' 'text_encoder/*' 'vae/*' 'audio_vae/*' ;;
+    # the ref2va partition, native-named, self-contained. --model-variant ref2va. 134 GiB
+    ref2va) base 'Ref2VA/*' ;;
+    # the fl2va partition, native-named. Only needed to merge a *native* LoRA.    134 GiB
+    fl2va) base 'FL2VA/*' ;;
+    # ref2va DiT under diffusers names -- the tree a lightx2v LoRA merges into
+    # with no key translation at all. Needs `ref2va` too, for everything else.    62 GiB
+    transformer_ref) base 'transformer_ref/*' ;;
+    all)  hf download MiniMaxAI/MiniMax-H3 > /dev/null ;;
+    *) echo "unknown WEIGHTS entry '$w'; pick from vdn,t2va,ref2va,fl2va,transformer_ref,all,none"
+       exit 2 ;;
+  esac
+  echo "  $w: done"
+done
 
 step "done"
 df -h --output=avail "$ROOT" | tail -1
 du -sh "$HF_HOME" "$SGLANG_DIFFUSION_CACHE_ROOT" 2>/dev/null
-echo "next: bash $ROOT/../vdn/sglang_arm.sh serve 480   (see RUNBOOK section 1c)"
+echo "next, whichever matches WEIGHTS=$WEIGHTS:"
+echo "  vdn    -> bash $VDNROOT/sglang_arm.sh serve 480          (RUNBOOK 1c)"
+echo "  t2va   -> bash $VDNROOT/sglang_base_arm.sh serve 480     (RUNBOOK 1f)"
+echo "  ref2va -> bash $VDNROOT/sglang_ref2va_arm.sh serve 768   (RUNBOOK 1g)"

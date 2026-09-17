@@ -22,13 +22,15 @@ Sections: **0** get in · **1** SGLang, the path · **2** the reference stack, t
 ## 0. Getting in **[on your Mac]**
 
 ```bash
-ssh -i /Users/henanwan/Documents/account/579019700964/henanwan/henanwan-us-east-2.pem \
-    -o StrictHostKeyChecking=no ubuntu@18.189.225.222
+export P5=<the new instance's public IP>          # 18.189.225.222 was the previous box
+export KEY=/Users/henanwan/Documents/account/579019700964/henanwan/henanwan-us-east-2.pem
+ssh -i "$KEY" -o StrictHostKeyChecking=no ubuntu@"$P5"
 ```
 
-**The IP, not `ec2-18-189-225-222.us-east-2.compute.amazonaws.com`.** After the stop/start the
-public DNS record stopped resolving while the address stayed put. If the instance is ever
-replaced, the address changes and `scripts/p5.sh` on the Mac needs its `HOST=` updated too.
+**The IP, not `ec2-<a-b-c-d>.us-east-2.compute.amazonaws.com`.** On the previous box the public
+DNS record stopped resolving after a stop/start while the address stayed put. A *replaced*
+instance gets a new address, so `scripts/p5.sh` needs it as well — it reads `HOST` from the
+environment: `HOST=ubuntu@$P5 bash scripts/p5.sh --put …`.
 
 Two independent trees, both on the **ephemeral** NVMe:
 
@@ -39,7 +41,7 @@ Two independent trees, both on the **ephemeral** NVMe:
 │   ├── cache/               the 62 GB fused overlay the first launch writes
 │   └── logs/                serve_*.log, sg_*_rep10.log, cond.log
 └── vdn/                     section 2 -- the control, plus the shared HF cache
-    ├── hf/                  HF_HOME, 407 GB. BOTH stacks read this. Do not wipe it casually.
+    ├── hf/                  HF_HOME. BOTH stacks read it; size is whatever WEIGHTS asked for (1b).
     ├── vdn-minimax-h3/      upstream at 2f740c9 + the 12 patches as commits, own .venv
     ├── outputs/             where the sglang server writes its mp4s (relative to its cwd)
     ├── keyframes/           first_{480,768}.png, last_{480,768}.png for the fl2va arm
@@ -48,7 +50,9 @@ Two independent trees, both on the **ephemeral** NVMe:
 ```
 
 `/opt/dlami/nvme` is an **instance store: a stop/start wipes it.** `/` is 484 GB and the HF cache
-alone is 407 GB, so nothing can move there. Assume all of the above is gone after a stop.
+alone was 407 GB on the last box, so nothing can move there. Assume all of the above is gone after a
+stop — the weights and both venvs are rebuilt every time, which is why §1b takes a `WEIGHTS=` list
+instead of pulling everything.
 
 Long steps take 6–15 minutes. Use `tmux` (installed) rather than hoping the ssh session holds:
 
@@ -66,6 +70,8 @@ The box has no GitHub credentials, so this private repo cannot be cloned there.
 
 ```bash
 cd /Users/henanwan/Documents/workspace/bytedance/minimax_h3_h100
+export HOST=ubuntu@$P5                            # p5.sh has no default; see section 0
+bash scripts/p5.sh 'mkdir -p /opt/dlami/nvme/vdn /opt/dlami/nvme/sglang'
 for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py \
          scripts/sglang_parity.py scripts/sglang_base_arm.sh scripts/sglang_base_steps.py \
          scripts/lora_merge_h3.py scripts/sglang_ref2va_arm.sh scripts/sglang_ref2va.py \
@@ -74,18 +80,46 @@ for f in scripts/sglang_bringup.sh scripts/sglang_arm.sh scripts/sglang_cond.py 
 done
 ```
 
-### 1b. Install. **~25 min, ~250 GB, all download.**
+### 1b. Install. **~10 min for the environment, then the download you asked for.**
+
+`WEIGHTS` is a comma list and it is the only thing to decide here. **`hf download
+MiniMaxAI/MiniMax-H3` with no filter is 464 GiB**, because the repo ships the same 62 GiB DiT under
+four names — `transformer/` (t2va, diffusers-named), `transformer_ref/` (ref2va, diffusers-named),
+and the self-contained `FL2VA/` and `Ref2VA/` partitions (134 GiB each, native-named, each carrying
+its own copy of the 62 GiB Qwen3-VL text encoder). No arm needs more than two of them.
+
+| `WEIGHTS=` | size | what it unlocks |
+|---|---|---|
+| `vdn` | 82 GB | §1c–1e. The 8-step distill, **already measured** — 480p 8.02 s, 768p 19.04 s |
+| `t2va` | 134 GiB | §1f. Base H3 at 50 and 8 steps, i.e. the denominator |
+| `ref2va` | 134 GiB | §1g. `--model-variant ref2va`, the customer's actual ask |
+| `fl2va` | 134 GiB | only to merge a *native*-named LoRA. Not needed for lightx2v's |
+| `transformer_ref` | 62 GiB | §1g merge route: lightx2v's diffusers LoRA folds in with no key translation |
+| `all` | 464 GiB | don't |
+| `none` | 0 | environment only |
+
+`t2va` and `ref2va` share every small file and the `text_encoder/`, so `t2va,ref2va` is **~200 GiB
+on disk, not 268** — the two 134 GiB figures double-count the encoder. Budget ~25 min at the ~2 Gb/s
+this box gets from the hub.
 
 ```bash
-mkdir -p /opt/dlami/nvme/sglang
-setsid nohup bash /opt/dlami/nvme/vdn/sglang_bringup.sh \
+# what the two queued jobs need, and nothing else
+WEIGHTS=t2va,ref2va setsid nohup bash /opt/dlami/nvme/vdn/sglang_bringup.sh \
     > /opt/dlami/nvme/sglang/bringup.log 2>&1 < /dev/null &
 tail -f /opt/dlami/nvme/sglang/bringup.log        # ends with "=== [..] done"
 ```
 
+VDN is **not** in that list on purpose: §1c–1e are finished and in RESULTS.md, and re-measuring them
+costs 82 GB of download to reproduce a number to ±0.05 s. Add `vdn` only to re-baseline a new
+driver or a new sglang.
+
+> `hf`'s `--include` takes **one pattern per occurrence** as of huggingface_hub 1.x (the CLI is
+> click-based now, not argparse). A second bare pattern is silently read as a *filename* and 404s as
+> `resolve/main/tokenizer/%2A`. The script repeats the flag; don't "simplify" it back.
+
 The script asserts what matters instead of hoping: python is 3.12, `$VIRTUAL_ENV` is unset,
 `ffmpeg`/`ffprobe` exist, and `import sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn`
-succeeds. Four things it handles that are easy to get wrong on a fresh box:
+succeeds. Five things it handles that are easy to get wrong on a fresh box:
 
 * **sglang from git, not PyPI.** Checked here: release 0.5.19 has base MiniMax-H3 but zero
   occurrences of `vdn` or `hybrid_window_attn_h3`. On main VDN is a whole subsystem. Retry PyPI
@@ -96,17 +130,32 @@ succeeds. Four things it handles that are easy to get wrong on a fresh box:
   them; installing rustup instead works and wastes ten minutes.
 * **`ffmpeg` before the download, not after.** H3's pipeline raises at startup without it, on every
   rank, and the parent shows only an `EOFError` from the pipe — which reads like a crash.
-* **`MiniMaxAI/MiniMax-H3` comes down too.** The OpenVDN checkpoint has no `text_encoder/` or
-  `processor/` — the Qwen3-VL conditioner has never been on this machine, because the reference
-  stack `torch.load`s offline prompt caches. A server that takes a text prompt over HTTP needs it.
+* **The text encoder is not optional, for any arm.** The OpenVDN checkpoint has no `text_encoder/`
+  or `processor/` — the Qwen3-VL conditioner was never on the old machine either, because the
+  reference stack `torch.load`s offline prompt caches (see the "text encoding is not in any of these
+  numbers" note in RESULTS.md). A server that takes a prompt over **HTTP** needs it, so every
+  `WEIGHTS` entry except `vdn` pulls it.
+* **`huggingface_hub[hf_transfer]` no longer exists.** hub 1.x prints "does not provide the extra
+  'hf-transfer'", installs plain hub, and leaves you on the slow path; `HF_HUB_ENABLE_HF_TRANSFER=1`
+  now only earns a `FutureWarning` pointing at `HF_XET_HIGH_PERFORMANCE`. The fast backend is
+  `hf-xet`, a default dependency. The script imports each one and exports whichever knob matches,
+  and prints which — check that line in the log before walking away from a 200 GiB download.
 
-> **apt is currently patched by hand on this box.**
-> `/etc/apt/sources.list.d/cuda-ubuntu2604-x86_64.list` serves a malformed `Packages` file
-> ("Encountered a section with no Package: header") and clearing `/var/lib/apt/lists` does not help,
-> because apt re-fetches the same bad file. It is moved to
-> `/root/cuda-ubuntu2604-x86_64.list.disabled-by-claude`. Nothing here installs CUDA from apt (the
-> venv carries its own), so leaving it disabled is fine — but **know that it is disabled** before
-> blaming apt for something else.
+> **On a fresh DLAMI, apt is broken and the ffmpeg step is the first thing to hit it.** `/` is not
+> instance store, so a stop/start keeps the fix — a **replaced** instance does not, and this comes
+> back. `/etc/apt/sources.list.d/cuda-ubuntu2604-x86_64.list` serves a malformed `Packages` file
+> ("Encountered a section with no Package: header"); clearing `/var/lib/apt/lists` does not help,
+> because apt re-fetches the same bad file. Move that one source aside and re-run:
+>
+> ```bash
+> sudo mv /etc/apt/sources.list.d/cuda-ubuntu2604-x86_64.list /root/cuda.list.disabled
+> sudo apt-get update -qq && sudo apt-get install -y ffmpeg && ffprobe -version | head -1
+> ```
+>
+> Nothing here installs CUDA from apt (each venv carries its own), so leaving it disabled is fine —
+> but **know that it is disabled** before blaming apt for something else. Do this *before*
+> `sglang_bringup.sh` if you want to be sure, or just let the script fail on the ffmpeg step, fix it,
+> and re-run — every step in it is idempotent.
 
 ### 1c. Serve and measure. **~6 min startup, ~2 min per bench.**
 

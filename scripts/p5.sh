@@ -3,8 +3,10 @@
 # `p5.sh --put <local> [remote]` / `--get <remote> [local]` copy.
 KEY=${KEY:-/Users/henanwan/Documents/account/579019700964/henanwan/henanwan-us-east-2.pem}
 # The IP, not the ec2-*.compute.amazonaws.com name: after the box was stopped and started
-# the public DNS record stopped resolving while the address itself stayed put.
-HOST=${HOST:-ubuntu@18.189.225.222}
+# the public DNS record stopped resolving while the address itself stayed put. No default --
+# the box gets replaced, and a stale default does not fail, it hangs in connect() for 30 s and
+# then blames the network. ubuntu@18.189.225.222 was the box RESULTS.md was measured on.
+HOST=${HOST:?set HOST=ubuntu@<p5 public ip>}
 OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 case ${1:-} in
   --put) shift; scp -q "${OPTS[@]}" "$1" "$HOST:${2:-/opt/dlami/nvme/vdn/}" ;;
