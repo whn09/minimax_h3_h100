@@ -73,7 +73,7 @@ mkdir -p "$NVME/vdn/hf" "$NVME/sglang/cache" "$NVME/sglang/logs"
 # variable* under `set -u` before bash 4.4 (this dies on macOS's bash 3.2, and the box's bash 5 only
 # hides it), and IN_H3_CONTAINER gives anything running inside a way to know which route it is on.
 ENVFLAGS=(-e IN_H3_CONTAINER=1)
-for v in QUANT LORA LORA_ALPHA MERGED REFEDGE GPUS FRAMES SEED PORT LOGTAG MODEL \
+for v in QUANT LORA LORA_ALPHA MERGED REFEDGE GPUS TP ULYSSES FRAMES SEED PORT LOGTAG MODEL \
          WEIGHTS OUTDIR PROMPT SGLANG_DISABLE_COSMOS3_GUARDRAILS; do
   # `if`, not `[ ] && ...`: a for loop's status is its last command's, so a final unset variable
   # would make the loop return 1 and `set -e` would exit the script right here.
