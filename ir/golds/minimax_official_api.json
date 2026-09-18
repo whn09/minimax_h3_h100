@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "title": "MiniMax official H3-Context-IR API worked example",
+  "source": "https://platform.minimax.io/docs/api-reference/video-generation-v2-h3-context-ir",
+  "source_spec": "platform.minimax.io/docs/api-reference/video/generation/api/v2-video-generation.json",
+  "retrieved": "2026-09-18",
+  "note": "The only sample of genuine H3-Context-IR output we have: MiniMax's own documented request/response pair for POST /v2/h3_context_ir. It is the ground truth the validator must never reject. Observed latency updated_at-created_at = 29 s; usage is metered and billed at $0.90/M in, $3.60/M out.",
+  "request": {
+    "model": "MiniMax-H3",
+    "content": [
+      {
+        "type": "text",
+        "text": "Epic space-opera theatrical teaser: a female captain stands alone before a massive observation window as the last fleet gathers and jumps away in a blinding flash, the bridge shaking, leaving her behind."
+      }
+    ],
+    "duration": 5,
+    "ratio": "16:9"
+  },
+  "task": "t2va",
+  "duration_seconds": 5,
+  "ratio": "16:9",
+  "usage": {
+    "total_tokens": 9090,
+    "prompt_tokens": 5664,
+    "completion_tokens": 3426
+  },
+  "observed_latency_seconds": 29,
+  "prompt": "integrated_multimodal_description: [Shot 1] Cinematic, wide shot with a slow push in on a female captain standing center frame with her back to the camera. She has a slender build and short, swept-back silver hair, wearing a crisp, dark navy-blue futuristic military uniform adorned with rigid silver epaulets. Before her stretches a colossal, curved glass observation window dominating the dimly lit starship bridge. The interior features sleek metallic consoles on the left and right emitting soft cyan light. Outside the window, a massive fleet of dark-grey, heavily armored dreadnoughts and cruisers is assembling against a backdrop of a swirling deep-purple and magenta nebula. The rear thrusters of the distant ships glow intensely with fiery orange light. [Shot 2] At 00:02.800, the camera cuts to a medium close-up of the captain from Shot 1 in profile facing right, while the camera shakes strongly. Her facial features are now visible, revealing a woman in her late forties with sharp cheekbones and a stoic expression. A sudden, blinding flash of brilliant cyan and white light bursts through the window as the fleet outside simultaneously jumps into warp, casting harsh, overexposed illumination across her face. The bridge vibrates violently, causing her shoulders to tense and her uniform collar to tremble. The intense light instantly fades into deep shadow, leaving her completely alone against the newly emptied, pitch-black void of space.\noverall_soundscape: Deep, resonant low-frequency thrumming of ship engines, overlaid with rhythmic, high-pitched electronic beeps from the consoles, followed by a sudden, deafening sub-bass boom and a loud, sizzling crackle as the warp drives engage. The immense acoustic impact causes a heavy, metallic clattering of the bridge panels, which instantly drops off into a stark, quiet mechanical hum.\nnon_diegetic_music: Symphonic orchestral score, beginning with a slow, rising brass and string crescendo that abruptly cuts off, instantly transitioning into a single, sustained, low-register solo cello note with no dynamic swell."
+}

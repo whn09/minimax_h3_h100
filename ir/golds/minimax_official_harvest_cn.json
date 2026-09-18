@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "title": "Live H3-Context-IR output harvested from MiniMax's CN API",
+  "endpoint": "POST https://api.minimaxi.com/v2/h3_context_ir",
+  "harvested": "2026-09-18",
+  "note": "Real output from the closed H3-Context-IR compiler, model MiniMax-H3. These are ground truth: a rule that fires here is a validator bug UNLESS the entry says otherwise in `expect_errors`. Note the host: a CN-console key returns 401 `invalid api key (2049)` against the documented api.minimax.io. FOUR CASES WERE HARVESTED FOR $0.05 AND TWO ARE NOT IN THIS FILE. They probed the compiler with a customer's shot -- their scene, their reference subject's appearance, and in one case their spoken script -- so the records were removed along with the rest of that material and cannot be restored here. What they showed is recorded in PROMPT_IR.md sec. 4 and in the E030 comment in h3ir/validate.py: asked to have a subject explain an equation aloud with NO script supplied, the official compiler invented a digit-letter token inside `<d>` on its own. That is the one measured rule this package adds over buying the API, and it is now a cited observation rather than a shipped fixture. To put live evidence back, re-harvest the same probe with a scene of your own: `python3 scripts/minimax_api.py ir --case case/demo_raw.txt --task t2va` with MINIMAX_API_KEY exported, then add the response here with `expect_errors` set to what it actually trips.",
+  "cases": [
+    {
+      "id": "three-shot-market",
+      "note": "Three timed shots, two speakers, on-screen price text, non-diegetic music. Expected CLEAN.",
+      "task": "t2va",
+      "duration_seconds": 10.0,
+      "request_text": "10秒，三个镜头：清晨的菜市场，摊主大声吆喝；切到买菜的老太太挑西红柿；最后切到远景，整个市场在晨光里。要有环境音和轻快的背景音乐。",
+      "expect_errors": [],
+      "usage": {
+        "total_tokens": 8683,
+        "prompt_tokens": 5690,
+        "completion_tokens": 2993
+      },
+      "cost_usd": 0.015896,
+      "server_seconds": 29,
+      "prompt": "integrated_multimodal_description: [Shot 1] Cinematic, medium shot, the camera pushes in slowly on a lively early morning wet market stall. A middle-aged male on-screen vendor (S1) with a thick canvas apron, a faded blue t-shirt, and short dark hair stands behind a wooden counter overflowing with dewy green cabbages and scallions. Warm golden sunlight filters through a translucent overhead awning, casting soft, diffused light on his sweaty face. The vendor (S1) looks up toward the bustling aisle, wipes his wet hands on his apron, leans forward slightly, and shouts enthusiastically, <d>[Chinese] 新鲜的蔬菜啊！来挑挑看！</d> [Shot 2] At 00:04.200, the camera cuts to a medium-close-up static shot of an elderly woman (silver hair pulled into a low bun, wearing a purple floral blouse and a green jade bracelet). She stands in front of a different stall, carefully picking through a large pile of glossy, bright red tomatoes. The warm morning light catches the smooth skin of the vegetables. The woman gently picks up a large tomato, rotates it in her wrinkled hands to inspect the bottom, and nods slightly in approval before placing it into a clear plastic bag resting on the counter. [Shot 3] At 00:07.500, the camera cuts to a wide shot where the camera pedestals up slowly to reveal the expansive layout of the entire wet market bathed in golden morning light. Dozens of vibrant stalls with colorful canvas umbrellas line the narrow alleyway. Sunbeams slice through the light mist and rising steam from a distant breakfast cart. Crowds of shoppers in varied casual clothing move through the aisles, completing the lively, sunlit market scene.\noverall_soundscape: A dense background ambiance of a bustling market dominates, featuring the distinct hum of overlapping crowd chatter and distant indistinct shouts. The foreground action in the first shot includes the crisp rustle of wet leafy greens and the dull thud of hands wiping against thick canvas. This is followed by the sharp crinkle of a plastic bag being handled and the subtle rubbing of fingers against smooth tomato skin. The clip concludes with an elevated mix of shuffling footsteps on wet pavement, clattering wooden crates, and a continuous audible sizzle from a distant hot food cart.\nnon_diegetic_music: Acoustic guitar and pizzicato strings playing a brisk, major-key melody at an allegro tempo, featuring a staccato rhythm that sustains evenly across the clip with no dynamic swell."
+    },
+    {
+      "id": "voiceover-product-nobody-on-camera",
+      "note": "A line split across a cut with paired <scenetrans> inside <d>, and an off-screen narrator. Exposed two validator bugs: E031 counted the marker's angle brackets as math operators, and E024 did not know the phrasing 'with her unseen mouth remaining completely still throughout'. Expected CLEAN after both fixes.",
+      "task": "t2va",
+      "duration_seconds": 10.0,
+      "request_text": "高端耳机产品广告，全程没有人出现在画面里，只有画外女声旁白说“真正的安静，是听见你想听的。”，最后一个镜头产品悬浮旋转，屏幕上出现 \"静界 Pro\" 字样。",
+      "expect_errors": [],
+      "usage": {
+        "total_tokens": 9891,
+        "prompt_tokens": 5686,
+        "completion_tokens": 4205
+      },
+      "cost_usd": 0.020255,
+      "server_seconds": 35,
+      "prompt": "integrated_multimodal_description: [Shot 1] Cinematic, extreme close-up, the camera pushes in slowly on the right earcup of a sleek, matte-black high-end over-ear headphone resting gracefully on a polished, dark obsidian surface. A soft cool-blue rim light catches the brushed aluminum hinges, while a deep, warm amber spotlight softly illuminates the plush leather texture of the ear cushion. The background is entirely engulfed in a pure, velvety black shadow, emphasizing the premium design. An adult female off-screen speaker with a warm, soothing, and highly resonant voice (S1) begins her voiceover narration, <d>[Chinese] 真正的安静，<scenetrans></d> with her unseen mouth remaining completely still throughout. [Shot 2] At 00:04.200, the camera cuts to a medium close-up of the upper headband curve, as the camera trucks right along the meticulously stitched premium black leather. The audio from the previous shot continues over the transition. The soothing off-screen female speaker (S1) seamlessly completes her sentence, <d>[Chinese] <scenetrans>是听见你想听的。</d> with her unseen mouth remaining completely still throughout. Subtle silver metallic joints and volume dials catch a sweeping white key light that glides rapidly across the dark, minimal studio space, highlighting the flawless craftsmanship of the headphone from Shot 1. [Shot 3] At 00:07.500, the shot transitions to a medium shot centered within a pure, infinite black void. The camera holds a static shot as the entire premium headphone from Shot 1 levitates gracefully in the direct center of the frame, slowly rotating clockwise on its vertical axis. A striking ring of soft, ethereal white light casts a divine halo over the device from directly above. As the headphone continuously turns in mid-air, crisp, glowing white text fades cleanly into the lower center of the screen, displaying exactly \"静界 Pro\".\noverall_soundscape: A distinct, ultra-low frequency synthesized sub-bass rumble establishes a premium atmosphere, quickly transitioning into a profound, vacuum-like silence that accentuates a pure, hushed room tone. As the sweeping key light glides across the metallic surfaces, a loud, crystalline swoosh and a pronounced, airy hiss ripple clearly through the soundscape. The final rotation of the product is accompanied by a pristine, clearly heard high-end chime that echoes softly, fading out with a gentle, oscillating metallic hum.\nnon_diegetic_music: Ambient electronic soundscape, extremely slow tempo, featuring sustained, rich synthesizer pads and a singular, resonant cello drone underneath, providing a continuous, luxurious bed of sound without any swell or percussion."
+    }
+  ]
+}
