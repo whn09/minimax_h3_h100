@@ -178,7 +178,7 @@ def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps
 
 
 def main(argv: list[str]) -> None:
-    case = task = tag = None
+    case = task = tag = label_filter = None
     quality = os.environ.get("QUALITY") or None
     refdir, arms = REFDIR, []
     for a in argv:
@@ -186,6 +186,11 @@ def main(argv: list[str]) -> None:
             case = Path(a[5:])
         elif a.startswith("task="):
             task = a[5:]
+        elif a.startswith("label="):
+            # Needed once a case file holds several arms of the SAME task: case_t2va_v2.txt has
+            # t2va@pose and t2va@wide, and `task=t2va` alone renders both. Selecting by label is the
+            # difference between one 86 s render and two.
+            label_filter = a[6:]
         elif a.startswith("tag="):
             tag = a[4:]
         elif a.startswith("quality="):
@@ -203,6 +208,10 @@ def main(argv: list[str]) -> None:
         cases = [c for c in cases if c[0] == task]
         if not cases:
             raise SystemExit(f"no {task} case in {case}")
+    if label_filter:
+        cases = [c for c in cases if c[1] == label_filter]
+        if not cases:
+            raise SystemExit(f"no @{label_filter} case in {case}")
     OUTDIR.mkdir(parents=True, exist_ok=True)
     for t, label, prompt, img in cases:
         ref = None

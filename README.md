@@ -3,6 +3,15 @@
 The question: **how long does one 480P 15-second clip take on a `p5.48xlarge` (8x H100
 80GB), using the VDN-tuned model** [`OpenVDN/vdn-minimax-h3`](https://huggingface.co/OpenVDN/vdn-minimax-h3)?
 
+> **The g7.48xlarge work now lives in its own repo:
+> [`minimax_h3_g7`](https://github.com/whn09/minimax_h3_g7).** That is a different machine and a
+> different question — eight RTX PRO 4500 Blackwell cards at **32 GB** each, `sm_120`, where the
+> constraint is that online fp8 quantization cannot even load and every arm is `TP=4 × ULYSSES=2`.
+> `G7.md`, `scripts/g7_sweep.sh` and `scripts/sage.sh` moved there. What stays here is everything
+> both machines share: the serving drivers (`scripts/sglang_*`, `scripts/_env.sh`), the customer's
+> prompts in `case/`, and the prompt-engineering work in `PROMPT_IR.md` and `REF2VA.md` — those
+> experiments ran on the g7 box, but they are about the prompt, not the hardware.
+
 ## Which stack this is — and the SGLang option, which has changed
 
 > **Correction, and it is a load-bearing one.** This section used to read "SGLang cannot load
