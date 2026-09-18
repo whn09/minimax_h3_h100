@@ -51,8 +51,16 @@ OUTDIR = Path(os.environ.get("OUTDIR") or "/opt/dlami/nvme/vdn/pull/case")
 REFDIR = Path(os.environ.get("REFDIR") or "/opt/dlami/nvme/vdn/ref")
 
 
-def parse(path: Path) -> list[tuple[str, str, str | None]]:
-    """-> [(task, prompt, image or None)] in file order."""
+def parse(path: Path) -> list[tuple[str, str, str, str | None]]:
+    """-> [(task, label, prompt, image or None)] in file order.
+
+    `task@label:` gives the case its own output directory. Needed the moment a case file holds
+    several variants of ONE prompt, which is what prompt A/B work looks like: output_path is
+    f"{task}_{tag}_{edge}p..." so four t2va lines under one tag would land four mp4s in one
+    directory under four uuids and nothing afterwards could say which was which. The label is
+    appended to the tag rather than replacing it, so `tag=aud` plus `t2va@aike:` reads as
+    `aud_aike` and both the serving arm and the prompt variant stay legible in the path.
+    """
     out = []
     for raw in path.read_text().splitlines():
         line = raw.replace(" ", " ").strip()
@@ -62,6 +70,9 @@ def parse(path: Path) -> list[tuple[str, str, str | None]]:
             raise SystemExit(f"case line has no `task:` label: {line[:60]!r}")
         task, rest = line.split(":", 1)
         task, rest = task.strip(), rest.strip()
+        label = ""
+        if "@" in task:
+            task, label = (p.strip() for p in task.split("@", 1))
         if task not in PORTS:
             raise SystemExit(f"unknown task {task!r}; known: {', '.join(PORTS)}")
         img = None
@@ -79,7 +90,7 @@ def parse(path: Path) -> list[tuple[str, str, str | None]]:
         # prompt cannot be written literally. Escapes are decoded here rather than the file switching
         # to a multi-line format, so case.txt (the customer's own text, single line) and case_ir.txt
         # (the rewritten form) stay the same format and the same parser.
-        out.append((task, rest.replace("\\n", "\n"), img))
+        out.append((task, label, rest.replace("\\n", "\n"), img))
     return out
 
 
@@ -167,19 +178,21 @@ def main(argv: list[str]) -> None:
         if not cases:
             raise SystemExit(f"no {task} case in {case}")
     OUTDIR.mkdir(parents=True, exist_ok=True)
-    for t, prompt, img in cases:
+    for t, label, prompt, img in cases:
         ref = None
         if img:
             ref = str(refdir / img)
             if not Path(ref).is_file():
                 raise SystemExit(f"reference {ref} does not exist; upload it next to the case file")
-        print(f"{t}: {len(prompt)} chars, ref {ref or 'none'}, seed {SEED}", flush=True)
+        ctag = f"{tag}_{label}" if label else tag
+        print(f"{t}{'@' + label if label else ''}: {len(prompt)} chars, "
+              f"ref {ref or 'none'}, seed {SEED}", flush=True)
         for a in arms or [f"768:25:{FRAMES}"]:
             edge, steps, *rest = a.split(":")
             frames = int(rest[0]) if rest else FRAMES
             if frames % 8 != 1:
                 raise SystemExit(f"{frames} frames is {frames % 8} mod 8; the model wants 1 mod 8")
-            request(PORTS[t], t, prompt, ref, int(edge), int(steps), frames, tag, quality)
+            request(PORTS[t], t, prompt, ref, int(edge), int(steps), frames, ctag, quality)
 
 
 if __name__ == "__main__":
