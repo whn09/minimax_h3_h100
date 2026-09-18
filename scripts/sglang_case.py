@@ -106,8 +106,25 @@ def parse(path: Path) -> list[tuple[str, str, str, str | None]]:
     return out
 
 
+def cache_spec(s: str) -> dict:
+    """`off` | `warmup:rdt:mc` -> the per-request Cache-DiT fields.
+
+    The tuple order is the vendor's own, so an audited preset transcribes with no translation:
+    constants.py MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG = (4, 0.04, 1) is `cache=4:0.04:1`.
+    Fn/Bn/taylorseer are left at the env defaults (1 / 0 / off), which are already that preset's.
+    """
+    if s in ("off", "none", "0"):
+        return {"enable_cache_dit": False}
+    w, rdt, mc = s.split(":")
+    return {"enable_cache_dit": True,
+            "cache_dit_params": {"max_warmup_steps": int(w),
+                                 "residual_diff_threshold": float(rdt),
+                                 "max_continuous_cached_steps": int(mc)}}
+
+
 def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps: int,
-            frames: int, tag: str, quality: str | None = None) -> None:
+            frames: int, tag: str, quality: str | None = None,
+            cache: dict | None = None) -> None:
     # The SAME image is a different condition in the two tasks, and this is the whole point of the
     # fl2va arm. ref2va sends role=reference / material_chain image.reference_preserve, which is
     # resized independently to a 2048 short edge and never binds the output geometry
@@ -131,12 +148,18 @@ def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps
         "seed": SEED,
         "output_path": str(OUTDIR / f"{task}_{tag}_{edge}p_{steps}step_{frames}f"),
     }
-    # quality=high is a PER-REQUEST field, not a server flag, and it is the only Cache-DiT switch
-    # that reaches H3. --cache-dit-config is read by diffusers_pipeline.py:592 and H3 runs the native
-    # pipeline, so that flag is silently ignored (measured: byte-identical mp4 and 105.40 s against
-    # the plain arm's 105.37 s). The native path asks MiniMaxH3DenoisingStage._cache_dit_requested(),
-    # which is true only for sampling_params.quality == "high" or the SGLANG_CACHE_DIT_ENABLED env.
-    # "high" then selects an AUDITED preset rather than whatever knobs an operator guessed --
+    # THERE ARE THREE Cache-DiT SWITCHES AND ONLY ONE OF THEM IS THE SERVER FLAG -- which is the one
+    # that does nothing here. --cache-dit-config's own help string says "Enables cache-dit for
+    # diffusers backend"; H3 runs the native pipeline, so it is silently ignored (measured:
+    # byte-identical mp4 and 105.40 s against the plain arm's 105.37 s). The native path asks
+    # MiniMaxH3DenoisingStage._cache_dit_requested(), which reads exactly three things: the
+    # SGLANG_CACHE_DIT_ENABLED env, sampling_params.quality == "high", and the per-request
+    # enable_cache_dit below. The env + per-request route is NOT audit-gated -- constants.py says so
+    # in as many words: "Process-wide SGLANG_CACHE_DIT_* environment controls remain available for
+    # manual experiments and are independent of this field."
+    #
+    # quality=high is a PER-REQUEST field, not a server flag. It selects an AUDITED preset rather
+    # than whatever knobs an operator guessed --
     # constants.py:64 MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG = (4, 0.04, 1), i.e. warmup 4 steps,
     # residual-diff threshold 0.04, at most 1 consecutive cached step, Fn_compute_blocks 1, with
     # "Measured SSIM 0.931 / PSNR 28.16 dB against quality=lossless" recorded next to it. It is sent
@@ -145,6 +168,13 @@ def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps
     # have swallowed it and left the request silently lossless.
     if quality:
         body["quality"] = quality
+    # `enable_cache_dit` / `cache_dit_params` are declared sampling params, so they go top-level like
+    # `quality`. Sending them EXPLICITLY is what makes the generic (unaudited, knob-driven) mode fire
+    # on H3: minimax_h3/stages/denoising.py gates generic mode on `"quality" not in explicit_fields`,
+    # so a request must carry cache-dit knobs and NOT carry quality. The two are mutually exclusive
+    # here by construction, hence no combined arm.
+    if cache:
+        body.update(cache)
     host = f"http://127.0.0.1:{port}"
     t0 = time.time()
     req = urllib.request.Request(f"{host}/v1/videos", data=json.dumps(body).encode(),
@@ -180,6 +210,7 @@ def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps
 def main(argv: list[str]) -> None:
     case = task = tag = label_filter = None
     quality = os.environ.get("QUALITY") or None
+    cache = cache_spec(os.environ["CACHE"]) if os.environ.get("CACHE") else None
     refdir, arms = REFDIR, []
     for a in argv:
         if a.startswith("case="):
@@ -195,6 +226,8 @@ def main(argv: list[str]) -> None:
             tag = a[4:]
         elif a.startswith("quality="):
             quality = a[8:]
+        elif a.startswith("cache="):
+            cache = cache_spec(a[6:])
         elif a.startswith("refdir="):
             refdir = Path(a[7:])
         else:
@@ -227,7 +260,7 @@ def main(argv: list[str]) -> None:
             frames = int(rest[0]) if rest else FRAMES
             if frames % 8 != 1:
                 raise SystemExit(f"{frames} frames is {frames % 8} mod 8; the model wants 1 mod 8")
-            request(PORTS[t], t, prompt, ref, int(edge), int(steps), frames, ctag, quality)
+            request(PORTS[t], t, prompt, ref, int(edge), int(steps), frames, ctag, quality, cache)
 
 
 if __name__ == "__main__":
