@@ -77,7 +77,13 @@ for v in QUANT LORA LORA_ALPHA MERGED REFEDGE GPUS TP ULYSSES FRAMES SEED PORT L
          WEIGHTS OUTDIR PROMPT SGLANG_DISABLE_COSMOS3_GUARDRAILS; do
   # `if`, not `[ ] && ...`: a for loop's status is its last command's, so a final unset variable
   # would make the loop return 1 and `set -e` would exit the script right here.
-  if [ -n "${!v-}" ]; then ENVFLAGS+=(-e "$v=${!v}"); fi
+  # `+x`, not `-n`: SET-BUT-EMPTY has to reach the container, because for QUANT that is the bf16
+  # request. The arm scripts read `QUANT=${QUANT-fp8}` / `${QUANT-}`, i.e. the default applies only
+  # when the variable is UNSET, so `QUANT= bash h3.sh serve t2va` means "serve bf16" -- and with a
+  # `-n` test it was silently dropped and sglang_base_arm.sh fell back to its fp8 default. The bug
+  # is invisible in the client output (an fp8 run succeeds and looks like a bf16 run) and only the
+  # server log's --quantization line gives it away.
+  if [ -n "${!v+x}" ]; then ENVFLAGS+=(-e "$v=${!v}"); fi
 done
 
 cmd=${1:?probe|build|weights|serve|exec|sh|logs|stop}

@@ -51,6 +51,17 @@ PORT=${PORT:-30011}                      # not 30010: leaves the VDN server's po
 # runs at all -- see the LoRA note below. A bf16 arm's latency is NOT comparable to the fp8 arms.
 QUANT=${QUANT-fp8}
 GPUS=${GPUS:-8}
+# TP/ULYSSES, defaulting to pure Ulysses -- which is what every number in RESULTS.md was measured
+# with, on 80 GB cards where the DiT fits whole on one card and replicating it costs nothing.
+# THEY ARE KNOBS BECAUSE 80 GB IS NOT THE ONLY CARD. Ulysses replicates the weights and splits the
+# tokens, so per-card weight memory is the WHOLE DiT no matter how many cards there are; TP shards
+# the linear layers instead, at one all-reduce per layer. On a 32 GB card (g7.48xlarge's RTX PRO
+# 4500) pure Ulysses cannot even load: --quantization fp8 is ONLINE quantization, so the loader
+# puts the 65.65 GiB bf16 checkpoint on the card before casting, and 65.65/TP has to fit alongside
+# the text encoder. TP=4 makes that 16.4 GB and the resident fp8 DiT 7.7 GB.
+# GPUS stays TP * ULYSSES either way; --num-gpus is GPUS.
+TP=${TP:-1}
+ULYSSES=${ULYSSES:-$((GPUS / TP))}
 export HF_HOME=${HF_HOME:-$VDNROOT/hf}
 export SGLANG_DIFFUSION_CACHE_ROOT=${SGLANG_DIFFUSION_CACHE_ROOT:-$ROOT/cache}
 
@@ -76,6 +87,9 @@ FRAMES=${FRAMES:-345}
 shift; [ $# -gt 0 ] && shift
 quant=()
 [ -n "$QUANT" ] && quant=(--quantization "$QUANT")
+# Only when sharding: --tp-size 1 is the default, and a --tp-size line in every log would invite
+# the question of whether the RESULTS.md arms were sharded. They were not.
+[ "$TP" -gt 1 ] && quant+=(--tp-size "$TP")
 # LOGTAG keeps a second arm at the same short edge from overwriting the first arm's server log --
 # the fp8 and bf16 480p runs both want serve_base_480p.log otherwise.
 log="$ROOT/logs/serve_base_${edge}p${LOGTAG:+_$LOGTAG}.log"
@@ -84,7 +98,7 @@ set -x
 sglang serve \
   --model-path "$MODEL" \
   --num-gpus "$GPUS" \
-  --ulysses-degree "$GPUS" \
+  --ulysses-degree "$ULYSSES" \
   "${quant[@]}" \
   --encoder-parallel auto \
   --performance-mode speed \
