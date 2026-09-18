@@ -39,9 +39,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-PORTS = {"t2va": 30011, "ref2va": 30012}
+# fl2va shares 30011 with t2va deliberately: MINIMAX_H3_TASK_PARTITIONS = {t2va: fl2va,
+# fl2va: fl2va, ref2va: ref2va}, so a base server started for t2va already holds the fl2va weight
+# partition and answers both tasks. That is what makes "use the reference as the LAST keyframe" a
+# free arm rather than another 90 s server start.
+PORTS = {"t2va": 30011, "fl2va": 30011, "ref2va": 30012}
+KEYFRAME_TASKS = ("fl2va",)                # tasks whose image is a keyframe, not a reference
 SEED = 42                                  # same seed as every other arm in this repo
 FRAMES = 121                               # 5.04 s; see the docstring
+# -1 is "the last frame", not "one before the end": request_validation.py:215 maps -1 to
+# aligned_frame_count - 1, and :265 says the only accepted keyframe sets are [0], [-1] and [0, -1].
+# Default -1 because the whole point of the fl2va arm is that ref2va.jpg is the END state (the phrase
+# is already complete and she has already turned to camera), so pinning it as frame 0 would ask for
+# the opposite video.
+FL2VA_FRAME_INDEX = int(os.environ.get("FL2VA_FRAME_INDEX") or "-1")
 # Both overridable by environment, because the p5/H100 route and the g7 route disagree about where
 # the big local disk is mounted: /opt/dlami/nvme on a DLAMI instance store, /data on the g7 pods
 # (hostPath to the node's NVMe RAID0). Getting this wrong on g7 is not a cosmetic error -- the pod's
@@ -76,13 +87,14 @@ def parse(path: Path) -> list[tuple[str, str, str, str | None]]:
         if task not in PORTS:
             raise SystemExit(f"unknown task {task!r}; known: {', '.join(PORTS)}")
         img = None
-        if task == "ref2va":
-            # The reference is the trailing token. Checked as a filename rather than assumed, so a
+        if task == "ref2va" or task in KEYFRAME_TASKS:
+            # The image is the trailing token. Checked as a filename rather than assumed, so a
             # case file that forgot the image fails here instead of sending a prompt that mentions
-            # a reference to a server that was not given one.
+            # a reference to a server that was not given one. Same syntax for both tasks; what the
+            # image *means* (reference vs keyframe) is decided by the task in request().
             head, _, last = rest.rpartition(" ")
             if not head or "." not in last:
-                raise SystemExit(f"ref2va case has no trailing image filename: {rest[-40:]!r}")
+                raise SystemExit(f"{task} case has no trailing image filename: {rest[-40:]!r}")
             rest, img = head.strip(), last
         # `\n` -> newline, AFTER the image token has been split off. H3's official prompt format is
         # three blank-line-separated fields (integrated_multimodal_description / overall_soundscape /
@@ -96,10 +108,24 @@ def parse(path: Path) -> list[tuple[str, str, str, str | None]]:
 
 def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps: int,
             frames: int, tag: str, quality: str | None = None) -> None:
+    # The SAME image is a different condition in the two tasks, and this is the whole point of the
+    # fl2va arm. ref2va sends role=reference / material_chain image.reference_preserve, which is
+    # resized independently to a 2048 short edge and never binds the output geometry
+    # (task_profiles.py:197-202, reference_encoding.py:47). fl2va sends role=keyframe /
+    # image.target_canvas with a frame_index, which pins that frame of the output
+    # (task_profiles.py:163-172). frame_index is *required* for keyframe roles and *rejected* for
+    # reference roles (request_validation.py:209, :235), so this branch is not cosmetic.
+    if ref and task in KEYFRAME_TASKS:
+        conditions = [{"role": "keyframe", "type": "image", "uri": ref,
+                       "frame_index": FL2VA_FRAME_INDEX}]
+    elif ref:
+        conditions = [{"role": "reference", "type": "image", "uri": ref}]
+    else:
+        conditions = []
     body = {
         "prompt": prompt,
         "task": task,
-        "conditions": ([{"role": "reference", "type": "image", "uri": ref}] if ref else []),
+        "conditions": conditions,
         "target": {"short_edge": edge, "aspect_ratio": "16:9", "duration_seconds": frames / 24},
         "num_inference_steps": steps,
         "seed": SEED,
