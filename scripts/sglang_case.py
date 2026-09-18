@@ -73,12 +73,18 @@ def parse(path: Path) -> list[tuple[str, str, str | None]]:
             if not head or "." not in last:
                 raise SystemExit(f"ref2va case has no trailing image filename: {rest[-40:]!r}")
             rest, img = head.strip(), last
-        out.append((task, rest, img))
+        # `\n` -> newline, AFTER the image token has been split off. H3's official prompt format is
+        # three blank-line-separated fields (integrated_multimodal_description / overall_soundscape /
+        # non_diegetic_music, see docs/h3official/), and the case file is one case per LINE, so an IR
+        # prompt cannot be written literally. Escapes are decoded here rather than the file switching
+        # to a multi-line format, so case.txt (the customer's own text, single line) and case_ir.txt
+        # (the rewritten form) stay the same format and the same parser.
+        out.append((task, rest.replace("\\n", "\n"), img))
     return out
 
 
 def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps: int,
-            frames: int, tag: str) -> None:
+            frames: int, tag: str, quality: str | None = None) -> None:
     body = {
         "prompt": prompt,
         "task": task,
@@ -88,6 +94,20 @@ def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps
         "seed": SEED,
         "output_path": str(OUTDIR / f"{task}_{tag}_{edge}p_{steps}step_{frames}f"),
     }
+    # quality=high is a PER-REQUEST field, not a server flag, and it is the only Cache-DiT switch
+    # that reaches H3. --cache-dit-config is read by diffusers_pipeline.py:592 and H3 runs the native
+    # pipeline, so that flag is silently ignored (measured: byte-identical mp4 and 105.40 s against
+    # the plain arm's 105.37 s). The native path asks MiniMaxH3DenoisingStage._cache_dit_requested(),
+    # which is true only for sampling_params.quality == "high" or the SGLANG_CACHE_DIT_ENABLED env.
+    # "high" then selects an AUDITED preset rather than whatever knobs an operator guessed --
+    # constants.py:64 MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG = (4, 0.04, 1), i.e. warmup 4 steps,
+    # residual-diff threshold 0.04, at most 1 consecutive cached step, Fn_compute_blocks 1, with
+    # "Measured SSIM 0.931 / PSNR 28.16 dB against quality=lossless" recorded next to it. It is sent
+    # top-level because VideoGenerationsRequest is ConfigDict(extra="allow") and does NOT declare
+    # `quality`, so it lands in model_extra where request_extra_value() looks; a declared field would
+    # have swallowed it and left the request silently lossless.
+    if quality:
+        body["quality"] = quality
     host = f"http://127.0.0.1:{port}"
     t0 = time.time()
     req = urllib.request.Request(f"{host}/v1/videos", data=json.dumps(body).encode(),
@@ -122,6 +142,7 @@ def request(port: int, task: str, prompt: str, ref: str | None, edge: int, steps
 
 def main(argv: list[str]) -> None:
     case = task = tag = None
+    quality = os.environ.get("QUALITY") or None
     refdir, arms = REFDIR, []
     for a in argv:
         if a.startswith("case="):
@@ -130,6 +151,8 @@ def main(argv: list[str]) -> None:
             task = a[5:]
         elif a.startswith("tag="):
             tag = a[4:]
+        elif a.startswith("quality="):
+            quality = a[8:]
         elif a.startswith("refdir="):
             refdir = Path(a[7:])
         else:
@@ -156,7 +179,7 @@ def main(argv: list[str]) -> None:
             frames = int(rest[0]) if rest else FRAMES
             if frames % 8 != 1:
                 raise SystemExit(f"{frames} frames is {frames % 8} mod 8; the model wants 1 mod 8")
-            request(PORTS[t], t, prompt, ref, int(edge), int(steps), frames, tag)
+            request(PORTS[t], t, prompt, ref, int(edge), int(steps), frames, tag, quality)
 
 
 if __name__ == "__main__":
