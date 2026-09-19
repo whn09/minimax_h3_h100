@@ -6,6 +6,9 @@
     python3 scripts/minimax_api.py gen --case case/demo_raw.txt --task ref2va --resolution 2K
     python3 scripts/minimax_api.py gen --prompt-file out/api/ir_ref2va.txt --image ref/demo_ref.jpg
 
+The measured runs used the customer's own case file and reference photo, which are untracked (see
+.gitignore); demo_raw.txt is the synthetic stand-in, and --image takes any path you supply.
+
 WHY THIS EXISTS. Everything else in this repo drives the open-source release through SGLang, where
 `prompt -> model` is the whole pipeline: presentation.py:109 `minimax_h3_text_only_ids()` is
 "verbatim prompt, no special tokens", there is no chat template under model_specific_stages/, and
@@ -27,8 +30,8 @@ TWO THINGS THE SCHEMA DOES *NOT* LET US DO, both load-bearing for this case:
 
 * `first_frame`/`last_frame` and `reference_image`/`reference_video`/`reference_audio` are MUTUALLY
   EXCLUSIVE inside one `content` array ("图生视频与多模态参考生视频互斥"). The local fl2va arm
-  (ref2va.jpg pinned as the last keyframe) and the local ref2va arm are therefore two separate
-  requests here, never one.
+  (the reference image pinned as the last keyframe) and the local ref2va arm are therefore two
+  separate requests here, never one.
 * There is no seed, no step count and no `short_edge`. The only geometry knob is
   `resolution: 768P | 2K` plus `ratio`, and for a reference request `ratio` defaults to `adaptive`.
   So an API render is NOT matched-config against a local one and must not be quoted as an ablation
@@ -42,8 +45,8 @@ and PROMPT_IR.md §3.4 pins the handwriting failure on precisely that grid: a ch
 
 THE IMAGE GOES IN AS A data: URI. Limits are >= 256 px on both sides, <= 5760 px, aspect (w/h) in
 [0.4, 2.5], <= 30 MB per file, <= 9 reference images, and <= 64 MB for the whole request body; the
-docs say to prefer public URLs for *large* files, and ref/demo_ref.jpg is 131 kB / 2752x1536, which is
-inside every one of those and needs no hosting. Note that the create call validates the *shape*
+docs say to prefer public URLs for *large* files, and the reference image we sent was 131 kB /
+2752x1536, which is inside every one of those and needs no hosting. Note that the create call validates the *shape*
 only: a 1x1 px probe image was accepted and returned a task_id, so a bad image surfaces later as a
 failed task, not as a 400.
 """
@@ -118,8 +121,9 @@ def wait(task_id: str) -> dict:
 def case_line(case: Path, task: str) -> tuple[str, str | None]:
     """(prompt, image filename or None) for the first `task:` line -- same format as sglang_case.py.
 
-    Deliberately the same parser contract as the local driver, including the NBSP strip (the real
-    case.txt has a U+00A0 after `t2va:`), so the API and the local box are fed byte-identical text.
+    Deliberately the same parser contract as the local driver, including the NBSP strip (the case
+    file we measured has a U+00A0 after `t2va:`), so the API and the local box are fed byte-identical
+    text.
     """
     for raw in case.read_text().splitlines():
         line = raw.replace("\u00a0", " ").strip()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render a customer case file verbatim -- the prompt is the input under test, not a knob.
 
-    python3 sglang_case.py case=/opt/dlami/nvme/vdn/case.txt task=ref2va tag=FP8 768:25:121
+    python3 sglang_case.py case=/opt/dlami/nvme/vdn/demo_ir.txt task=ref2va tag=FP8 768:25:121
     python3 sglang_case.py case=... task=t2va   tag=BF16 768:25:121
 
 WHY NOT sglang_ref2va.py / sglang_base_steps.py. Both of those own their prompt: the ref2va one
@@ -49,9 +49,8 @@ SEED = 42                                  # same seed as every other arm in thi
 FRAMES = 121                               # 5.04 s; see the docstring
 # -1 is "the last frame", not "one before the end": request_validation.py:215 maps -1 to
 # aligned_frame_count - 1, and :265 says the only accepted keyframe sets are [0], [-1] and [0, -1].
-# Default -1 because the whole point of the fl2va arm is that ref2va.jpg is the END state (the phrase
-# is already complete and she has already turned to camera), so pinning it as frame 0 would ask for
-# the opposite video.
+# Default -1 because the whole point of the fl2va arm is that the reference image is the END state of
+# the action being asked for, so pinning it as frame 0 would ask for the opposite video.
 FL2VA_FRAME_INDEX = int(os.environ.get("FL2VA_FRAME_INDEX") or "-1")
 # Both overridable by environment, because the p5/H100 route and the g7 route disagree about where
 # the big local disk is mounted: /opt/dlami/nvme on a DLAMI instance store, /data on the g7 pods
@@ -100,7 +99,7 @@ def parse(path: Path) -> list[tuple[str, str, str, str | None]]:
         # three blank-line-separated fields (integrated_multimodal_description / overall_soundscape /
         # non_diegetic_music, see docs/h3official/), and the case file is one case per LINE, so an IR
         # prompt cannot be written literally. Escapes are decoded here rather than the file switching
-        # to a multi-line format, so case.txt (the customer's own text, single line) and case_ir.txt
+        # to a multi-line format, so a raw case (one sentence, single line) and an IR case
         # (the rewritten form) stay the same format and the same parser.
         out.append((task, label, rest.replace("\\n", "\n"), img))
     return out

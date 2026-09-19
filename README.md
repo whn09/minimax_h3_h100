@@ -8,9 +8,17 @@ The question: **how long does one 480P 15-second clip take on a `p5.48xlarge` (8
 > different question — eight RTX PRO 4500 Blackwell cards at **32 GB** each, `sm_120`, where the
 > constraint is that online fp8 quantization cannot even load and every arm is `TP=4 × ULYSSES=2`.
 > `G7.md`, `scripts/g7_sweep.sh` and `scripts/sage.sh` moved there. What stays here is everything
-> both machines share: the serving drivers (`scripts/sglang_*`, `scripts/_env.sh`), the customer's
-> prompts in `case/`, and the prompt-engineering work in `PROMPT_IR.md` and `REF2VA.md` — those
+> both machines share: the serving drivers (`scripts/sglang_*`, `scripts/_env.sh`), the case files in
+> `case/`, and the prompt-engineering work in `PROMPT_IR.md`, `ir/` and `REF2VA.md` — those
 > experiments ran on the g7 box, but they are about the prompt, not the hardware.
+>
+> **The prompts those experiments measured are NOT in this repo.** They are a customer's shot
+> description plus a photograph of a real person, so they are untracked (`.gitignore`) and stay in the
+> working copy only; `scripts/sync.sh` ships whatever is in `case/` to the pod, so they still reach the
+> GPU without reaching a commit. What is tracked is the synthetic pair `case/demo_ir.txt` (documented
+> IR format) and `case/demo_raw.txt` (the one-sentence raw form), which is what the `ir/` test suite and
+> the documented commands run against. Every number in `PROMPT_IR.md` was measured on text you cannot
+> see here; the rules it derived are all here.
 
 ## Which stack this is — and the SGLang option, which has changed
 

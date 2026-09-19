@@ -15,8 +15,9 @@ Calibration (see ir/tests/test_validate.py):
   * NVlabs' 13 validated Sol-H3 showcase prompts separate fields with a SINGLE newline, not the
     blank line the base guide's section 2.2 shows. A blank-line rule would reject all 13. So the
     separator check accepts either and only rejects fields run together on one line.
-  * `non_diegetic_music: N/A` is legal (the guide says so, and ../case/demo_ir.txt used it and
-    rendered correctly) even though none of the 13 use it.
+  * `non_diegetic_music: N/A` is legal (the guide says so, and the prompts this repo measured used
+    it and rendered correctly) even though none of the 13 use it. ../case/demo_ir.txt keeps that
+    shape.
 """
 
 from __future__ import annotations
@@ -329,12 +330,12 @@ def _check_dialogue(body: str, duration_s: float | None, out: list[Violation]) -
                                  "`<d>` must follow an attribution ending in `:` or `,` "
                                  "(`... (S1) says: <d>`)", before[-60:]))
 
-        # PROMPT_IR.md 3.1.1 -- measured, and in neither guide. `2x` is voiced as "rx".
         # Measured in PROMPT_IR.md 3.1.1 and in NEITHER guide -- and, as of 2026-09-18, not
-        # implemented by MiniMax's own H3-Context-IR either: asked to have a teacher explain
-        # `2x+3=7` out loud with no script supplied, the official API invented
-        # `<d>[Chinese] ...得到2x等于4。</d>` unprompted (logs/harvest_cn.jsonl case 1). `2x` renders
-        # as "rx". This rule is the clearest thing this package adds over buying the API.
+        # implemented by MiniMax's own H3-Context-IR either: asked to have a subject explain an
+        # equation out loud with no script supplied, the official API invented a digit-letter token
+        # inside `<d>` unprompted. `2x` renders as "rx". This rule is the clearest thing this package
+        # adds over buying the API. The harvest record of that probe is not in the repo (it used a
+        # customer's shot) -- golds/minimax_official_harvest_cn.json's `note` says how to re-harvest it.
         for bad in re.finditer(r"\d[A-Za-z]|[A-Za-z]\d", spoken):
             out.append(Violation("E030-D-MIXED-SCRIPT-TOKEN", "error",
                                  f"`{bad.group(0)}` welds a digit to a letter: no grapheme-to-"

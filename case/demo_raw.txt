@@ -1,0 +1,20 @@
+# The SAME two cases as demo_ir.txt, written the way a caller naturally writes them: one sentence of
+# Chinese, no sections, no labels, no speaker IDs. This is the "before" side of every comparison in
+# PROMPT_IR.md -- feed this file and demo_ir.txt to the same server at the same seed, resolution,
+# frame count and step count, and the only variable is the prompt.
+#
+# THE POINT IS THAT THIS IS NOT MERELY A SHORT PROMPT, IT IS AN OUT-OF-DISTRIBUTION ONE. SGLang hands
+# whatever you send to Qwen3-VL verbatim (presentation.py:109 -- no chat template, no rewriter), while
+# MiniMax's product first expands the request through H3-Context-IR, a hosted multi-stage rewriter the
+# open release excludes. The model was trained on the expanded form. So a prompt like the lines below
+# is not a light request, it is the wrong shape, and what comes back is the model guessing at the 40-odd
+# decisions the IR would have made explicitly -- which is exactly how a static sign ends up being
+# written on camera and a spoken line ends up as babble.
+#
+# Synthetic, like demo_ir.txt: the prompts these were derived from were a customer's and are not in
+# this repo. Same filename convention, so `scripts/sglang_case.py case=... task=...` works unchanged.
+# `scripts/minimax_api.py ir --case case/demo_raw.txt --task t2va` sends one of these to the official
+# compiler and prints the IR it returns, which is the cheapest way to see the gap for yourself.
+
+t2va: 固定镜头，中景，一位穿深灰色T恤、戴棕色围裙的年轻男咖啡师站在咖啡馆吧台后面，他身后墙上的小黑板上已经写好了"TODAY: YUNNAN"，他指着黑板说：今天的豆子是云南的，牛奶用2L装的。
+ref2va: 参考图里的咖啡师站在同一个吧台后面，把奶泡从钢杯倒进面前那杯浓缩咖啡里，最后在表面拉出一片叶子的图案。固定镜头，中景，他全程不说话。 demo_ref.jpg

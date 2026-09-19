@@ -1,7 +1,19 @@
 # artifacts pulled off the box; the mp4s and logs live under runs/ when they are evidence
 out/
+pull/
 *.log
 .DS_Store
 __pycache__/
 ckpts/
 rescue/
+
+# CUSTOMER MATERIAL IS NEVER COMMITTED. The prompts every number in PROMPT_IR.md was measured on are
+# a customer's shot description, and case/ref2va.jpg is a photograph of a real person. They stay in
+# the working copy -- scripts/sync.sh ships whatever it finds in case/ to the pod, so the real files
+# reach the GPU without ever reaching a commit -- and only the synthetic case/demo_*.txt stand-ins
+# are tracked. Renders of that person, and contact sheets made from them, go to pull/ (ignored above).
+case/case.txt
+case/case_*.txt
+case/*.jpg
+case/*.png
+!case/demo_*.txt

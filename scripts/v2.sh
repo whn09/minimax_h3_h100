@@ -2,7 +2,7 @@
 # t2va production candidate: the settled dialogue plus the pose and framing fixes (case_t2va_v2.txt).
 #
 # The audio grid (aud.sh) answered the pronunciation question and, in doing so, produced a montage
-# showing the teacher holding chalk against the board in every frame of every arm -- a writing pose on
+# showing the subject holding chalk against the board in every frame of every arm -- a writing pose on
 # a static equation. Two arms here separate the pose fix from the framing fix; see the case file's
 # header for why both are needed and why "what is in frame" beats a shot-size noun.
 #

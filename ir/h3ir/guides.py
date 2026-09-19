@@ -68,15 +68,15 @@ one has a measured failure behind it.
    never leave a speaking subject with no `<d>`, because the model then generates
    prosodically-plausible babble instead of language.
 
-4. STATE THE STARTING STATE, NOT JUST THE ACTION. "the blackboard has 2x+3=7 written on it" is
-   ambiguous between "it is already there" and "she writes it", and the model chose to animate the
-   writing across the whole clip. Writing `Chalk handwriting reading "2x+3=7" is already on the
-   blackboard beside her` plus `The camera holds a static shot` fixed it. Say what is already true
-   at frame 0, and say explicitly when something does NOT change.
+4. STATE THE STARTING STATE, NOT JUST THE ACTION. "the board has `2x+3=7` written on it" is
+   ambiguous between "it is already there" and "someone writes it", and the model chose to animate
+   the writing across the whole clip. Writing `Chalk handwriting reading "2x+3=7" is already on the
+   board beside the subject` plus `The camera holds a static shot` fixed it. Say what is already
+   true at frame 0, and say explicitly when something does NOT change.
 
-5. DO NOT ASK FOR AN ACTION THAT CANNOT FINISH IN THE DURATION. Five chalk characters stroke by
-   stroke is not a five-second action; asked for it anyway, the model compresses time and smears.
-   Either narrow the action (start with part of it already done) or buy more frames.
+5. DO NOT ASK FOR AN ACTION THAT CANNOT FINISH IN THE DURATION. Writing five handwritten characters
+   stroke by stroke is not a five-second action; asked for it anyway, the model compresses time and
+   smears. Either narrow the action (start with part of it already done) or buy more frames.
 
 6. AN IMAGE OF THE FINISHED STATE IS A LAST KEYFRAME, NOT A REFERENCE. `ref2va` means "keep this
    subject and scene", not "arrive at this frame". If the caller's image shows the END of the
@@ -116,10 +116,10 @@ def golds(task: str) -> list[tuple[str, str]]:
     """-> [(label, prompt_text)] few-shots for `task`, all from prompts that actually rendered."""
     out: list[tuple[str, str]] = []
     if task in REF_TASKS:
-        for line in (ROOT / "case" / "case_ir.txt").read_text().splitlines():
+        for line in (ROOT / "case" / "demo_ir.txt").read_text().splitlines():
             if line.startswith("ref2va:"):
                 # the trailing asset filename is a harness argument, not part of the IR
-                out.append(("ref2va, 5.04 s, one static shot, Chinese on-screen text",
+                out.append(("ref2va, 5.04 s, one static shot, subject and scene both preserved",
                             line.split(":", 1)[1].strip().replace("\\n", "\n").rsplit(" ", 1)[0]))
         return out
 
@@ -134,12 +134,15 @@ def golds(task: str) -> list[tuple[str, str]]:
         if cid in by_id:
             out.append((label, by_id[cid]["prompt"]))
 
-    # The one gold that demonstrates measured rule 1 -- the `二x` arm, which transcribed cleanly.
-    for line in (ROOT / "case" / "case_ir.txt").read_text().splitlines():
+    # The one gold that demonstrates measured rule 1. demo_ir.txt's t2va line carries the defect on
+    # purpose -- it is also the validator's negative fixture -- so the few-shot is the REPAIRED form:
+    # a digit-letter token spelled the way it is spoken. Keep this in step with the test that asserts
+    # the raw line fails on exactly E030-D-MIXED-SCRIPT-TOKEN (tests/test_validate.py).
+    for line in (ROOT / "case" / "demo_ir.txt").read_text().splitlines():
         if line.startswith("t2va:"):
             text = line.split(":", 1)[1].strip().replace("\\n", "\n")
-            text = text.replace("2x等于4", "二x等于四").replace("x等于2", "x等于二")
-            out.append(("t2va, 5.04 s, one shot, spoken arithmetic written as it is said", text))
+            text = text.replace("2L", "两升")
+            out.append(("t2va, 5.04 s, one shot, a spoken unit written as it is said", text))
     return out
 
 
