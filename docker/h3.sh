@@ -73,7 +73,7 @@ mkdir -p "$NVME/vdn/hf" "$NVME/sglang/cache" "$NVME/sglang/logs"
 # variable* under `set -u` before bash 4.4 (this dies on macOS's bash 3.2, and the box's bash 5 only
 # hides it), and IN_H3_CONTAINER gives anything running inside a way to know which route it is on.
 ENVFLAGS=(-e IN_H3_CONTAINER=1)
-for v in QUANT LORA LORA_ALPHA MERGED REFEDGE GPUS TP ULYSSES FRAMES SEED PORT LOGTAG MODEL \
+for v in QUANT LORA LORA_ALPHA MERGED REFEDGE GPUS TP ULYSSES FRAMES CANVAS SEED PORT LOGTAG MODEL \
          WEIGHTS OUTDIR PROMPT SGLANG_DISABLE_COSMOS3_GUARDRAILS; do
   # `if`, not `[ ] && ...`: a for loop's status is its last command's, so a final unset variable
   # would make the loop return 1 and `set -e` would exit the script right here.
@@ -150,12 +150,16 @@ serve)
   # `serve <arm> [edge] [extra sglang flags...]` -- arm is vdn|t2va|ref2va, i.e. which of the three
   # arm scripts to run. Detached, with the server log going to the same $NVME/sglang/logs the venv
   # route writes to, so RUNBOOK's tail commands are unchanged.
-  arm=${1:?vdn|t2va|ref2va}; shift || true
+  arm=${1:?vdn|t2va|ref2va|game}; shift || true
   case "$arm" in
     vdn)    script=sglang_arm.sh        ;;
     t2va)   script=sglang_base_arm.sh   ;;
     ref2va) script=sglang_ref2va_arm.sh ;;
-    *) echo "arm must be vdn, t2va or ref2va"; exit 2 ;;
+    # The game replica (GAME.md). Unlike the three measurement arms it takes NO edge argument --
+    # its shape comes from FRAMES and CANVAS, because a game picks a length, not a benchmark row:
+    #   FRAMES=345 bash h3.sh serve game
+    game)   script=game_serve.sh        ;;
+    *) echo "arm must be vdn, t2va, ref2va or game"; exit 2 ;;
   esac
   $DOCKER rm -f "$NAME-$arm" >/dev/null 2>&1 || true
   $DOCKER run -d --name "$NAME-$arm" "${RUNFLAGS[@]}" "${ENVFLAGS[@]}" --entrypoint bash "$IMAGE" \
