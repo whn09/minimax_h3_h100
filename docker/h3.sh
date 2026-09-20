@@ -196,7 +196,13 @@ stop)
   # Remove the containers. NOT `sglang_*_arm.sh stop`: that is a pkill, and without --pid=host a
   # second container has its own PID namespace, so the pkill matches nothing and reports success
   # while the server keeps holding all eight cards.
-  for a in vdn t2va ref2va; do $DOCKER rm -f "$NAME-$a" >/dev/null 2>&1 && echo "removed $NAME-$a"; done
+  # The list must include EVERY arm `serve` can start. It did not include `game` when that arm was
+  # added, so `stop` cheerfully removed three containers that were not running, said nothing about
+  # the one that was, exited 0 -- and left eight H100s held at 56 GB each. Derive it from the case
+  # in `serve` if you add another arm.
+  for a in vdn t2va ref2va game; do
+    $DOCKER rm -f "$NAME-$a" >/dev/null 2>&1 && echo "removed $NAME-$a"
+  done
   exit 0
   ;;
 
