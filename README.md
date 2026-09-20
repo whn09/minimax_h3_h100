@@ -20,6 +20,89 @@ The question: **how long does one 480P 15-second clip take on a `p5.48xlarge` (8
 > the documented commands run against. Every number in `PROMPT_IR.md` was measured on text you cannot
 > see here; the rules it derived are all here.
 
+## Quick start: an fl2va server, from a bare p5.48xlarge
+
+**There is no separate fl2va service.** The same server answers `t2va` and `fl2va` — one checkpoint,
+one process, no flag, no restart. fl2va is a *request shape*: you add a `keyframe` condition and the
+server takes the fast path anyway (measured **+8.8 %**: 7.29 s against 6.70 s of server time at
+480p/345f). So "start the fl2va service" means "start the server", and the fl2va part is four lines of
+JSON. If you go looking for an `--fl2va` flag or a second model path, that is why you will not find one.
+
+**ref2va is the exception and it is not a shape problem:** `OpenVDN/vdn-minimax-h3` ships only the
+`fl2va` conditioning partition, so a `reference` condition is *refused* by this checkpoint. That is a
+training limit; no flag changes it. Use the base `MiniMaxAI/MiniMax-H3` for ref2va.
+
+```bash
+# --- on the Mac, once per box (ssh aliases, not hostnames) ---
+bash scripts/game_push.sh P5-1 P5-2
+
+# --- on each box ---
+cd /opt/dlami/nvme/vdn/docker
+bash h3.sh probe                      # ~3 min: pulls the image, checks all 17 imports
+bash h3.sh weights vdn                # ~10 min: 78 GiB, the VDN repo only
+BASE=lmsysorg/sglang@sha256:d46a59f4b98658f728a1e006c003ad5ee0628e999fd8b2bef71ac1bb61b814da \
+  FRAMES=345 bash h3.sh serve game    # 3 min 19 s to "Application startup complete" + 55 s warmup
+bash h3.sh logs game
+
+# --- back on the Mac ---
+bash scripts/game_tunnel.sh P5-1 P5-2          # -> 127.0.0.1:30010, :30011
+python3 scripts/game_client.py --warm          # see the warmup note below; do this once
+python3 scripts/game_client.py --keyframe last_frame.png "she turns and runs, gravel underfoot"
+```
+
+That renders **864×480, 345 frames = 14.375 s, h264 + aac**, continuing from `last_frame.png`, and
+drops the mp4 in `out/game/`. Measured on this deployment: **7.29 s** server, **~11 s** end to end from
+a laptop in another region (**8.3 s** if the caller is in-region), and frame 0 of the continuation
+matches the keyframe at **33.2 dB PSNR** against **8.5 dB** for an unrelated frame — the seam holds.
+
+**The request, if you are not using the client:**
+
+```jsonc
+POST /v1/videos
+{
+  "prompt": "she turns and runs, gravel underfoot",
+  "task": "fl2va",
+  "conditions": [{"role": "keyframe", "type": "image",
+                  "uri": "data:image/png;base64,iVBORw0…",   // or a path ON THE SERVER, or http(s)://
+                  "frame_index": 0}],                        // 0 = opening frame, -1 = closing
+  "target": {"short_edge": 480, "aspect_ratio": "16:9", "duration_seconds": 14.375},
+  "flow_shift": 12.0, "audio_flow_shift": 3.0,
+  "output_path": "/opt/dlami/nvme/vdn/outputs/beat_17"        // a DIRECTORY: you get <it>/<uuid>.mp4
+}
+```
+Then poll `GET /v1/videos/{id}` until `status` is `completed`, and fetch the clip with
+`GET /v1/videos/{id}/content`. Drop `conditions` and set `"task": "t2va"` and it is the same server,
+same process, same latency class.
+
+**Five things that will cost you an hour each if you learn them the hard way:**
+
+1. **The keyframe is resolved on the SERVING BOX, in the worker** — not by your client. A path that
+   exists on your laptop fails with `FileNotFoundError: MiniMax H3 material source does not exist`
+   naming a file you can plainly see. And with more than one replica, each box has its own filesystem,
+   so a keyframe staged on P5-1 is simply *absent* on P5-2 and the request 500s. Three fixes, all
+   verified: inline it as a **`data:image/png;base64,…` URI** (what `game_client.py` now does by
+   default — 381 KB png → 509 KB body), upload it **per replica** (`--keyframe-mode scp`), or put it on
+   shared storage. An `http(s)://` URI the box can reach also works. With the inline route a clip
+   rendered on P5-1 chains into a clip rendered on P5-2 — **35.0 dB at the seam**, measured — which is
+   what makes a two-box pool usable for a continuous shot at all.
+2. **An oversized keyframe is fine.** A 1920×1080 png against a 480p target is *downscaled*, not
+   rejected: 7.27 s server (no penalty) and 33.6 dB at frame 0 — marginally better than a
+   pre-matched keyframe. You do not need to resize before sending.
+3. **`frame_index` is mandatory for a `keyframe` role and rejected for a `reference` role.** The
+   asymmetry is not documented anywhere; the 400 it produces does not explain itself.
+4. **`--warmup-resolutions` does not warm the resolution.** Upstream's `_synthetic_warmup_target()`
+   uses that string only to pick the nearest *aspect ratio*; the short edge is
+   `MINIMAX_H3_RECOMMENDED_SHORT_EDGE = 768`, hardcoded. A 480p server therefore warms at 768p and the
+   first real request pays ~0.9 s extra — which lands on the very first clip a user waits for. Warm it
+   from the client (`--warm`), which sends one throwaway clip per replica at the real shape.
+5. **`seconds` must not be sent** (it is typed `int`, so 14.375 → 400; send `duration_seconds`), and
+   **the frame count is a lattice**: `5 + 17k` only. 245 frames is off it and the server does **not**
+   reject — it rounds silently and you get a length you did not ask for, with no log line.
+   345 = 14.375 s, 362 = 15.083 s, and there is nothing in between.
+
+`GAME.md` has the rest: throughput across two boxes, the memory arithmetic if you have fewer than 8
+cards, cost per finished video-second, and why ~8 s per clip is not "real-time" under any configuration.
+
 ## Which stack this is — and the SGLang option, which has changed
 
 > **Correction, and it is a load-bearing one.** This section used to read "SGLang cannot load

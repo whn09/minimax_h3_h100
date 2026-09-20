@@ -51,9 +51,9 @@ fut = r.submit("the gate grinds open, dust falls from the lintel")
 path = fut.result()            # local mp4
 
 # continue from where the last clip ended -- fl2va, keyframe pinned to frame 0.
-# The path is on the SERVER: the worker resolves URIs, so a local path fails with
-# "file not found" naming a file that plainly exists on your Mac.
-fut = r.submit("she turns and runs", keyframe="/opt/dlami/nvme/vdn/outputs/prev_last.png")
+# A LOCAL path is inlined as a data: URI, because the worker resolves URIs on the SERVING box and
+# each replica has its own filesystem. A path that only exists on the boxes is passed through.
+fut = r.submit("she turns and runs", keyframe="last_frame.png")
 ```
 
 One worker per replica pulls from one queue, so `submit()` never blocks and both boxes stay busy.
@@ -65,7 +65,7 @@ throughput, not latency:** 2 clips in flight, one clip still costs ~8 s.
 refuses: it ships only the `fl2va` partition — a training limit no flag changes); an OOM means the
 memory arithmetic below. Retrying any of the three just makes a configuration error slower.
 
-## Three things this deployment found that the runbook did not predict
+## Five things this deployment found that the runbook did not predict
 
 **1. `--warmup-resolutions` does not warm the resolution.** Upstream's `_synthetic_warmup_target()`
 (`configs/sample/minimax_h3.py:155`) uses that string *only* to pick the nearest aspect ratio;
@@ -83,9 +83,26 @@ clips/min. What is left (~2.7 s) is the actual transfer at ~350 KB/s over the in
 **If the game runs in-region, that whole 3 s disappears** and you are at the 8.34 s figure.
 
 **3. `output_path` is a directory prefix, not a file prefix.** The server creates
-`<output_path>/<uuid>.mp4` and returns the full path in `file_path` (and `url: null` — there is
-genuinely no download endpoint). `outputs/` therefore accumulates one directory per clip; at ~950 KB
-each on a 27 TB instance store this is not urgent, but a long-running game should sweep it.
+`<output_path>/<uuid>.mp4` and returns the full path in `file_path`. `outputs/` therefore accumulates
+one directory per clip; at ~950 KB each on a 27 TB instance store this is not urgent, but a
+long-running game should sweep it.
+
+**4. There *is* a download endpoint, and it is faster than scp.** `GET /v1/videos/{id}/content` is in
+the server's `openapi.json` — along with `DELETE /v1/videos/{id}`, `GET /v1/videos`, `GET /stats` and
+`GET /server_info`. This repo (and an earlier version of this file) asserted it did not exist, on the
+evidence that the completed job object's `url` field is `null` and `file_path` is a server-side path.
+That was wrong. Measured on a 1.06 MB clip: **1.14–1.48 s over HTTP** through the tunnel that is
+already open, against 2.65–3.4 s for a multiplexed scp and 5.4–6.1 s cold. `game_client.py` fetches
+over HTTP by default now; `--fetch-mode scp` is the fallback for a build without the endpoint. The
+table's 11.32 s "clip on the Mac" figure predates this and is now conservative by roughly 1.5 s.
+
+**5. A keyframe does not have to be a file on the box.** H3's material resolver
+(`material_io.py:760`) accepts local paths, `file://`, `http(s)://`, **`data:`/`base64:`** and
+`tar+offset`. So `data:image/png;base64,…` sends the keyframe in the request body and sidesteps the
+per-replica filesystem problem entirely — verified: 381 KB png → 509 KB URI, rendered, frame 0 at
+**32.88 dB** against the keyframe (vs 33.16 dB for the file-path route). And **an oversized keyframe is
+downscaled, not rejected**: 1920×1080 against a 480p target cost 7.27 s server — no penalty — and came
+back at **33.56 dB**.
 
 ## What it took to stand up (for the next box)
 
@@ -188,10 +205,9 @@ Three shapes work with ~8 s of latency and 14.4 s of output. One does not.
   **8.52 dB** for an unrelated frame. The seam is real, not aspirational.
 
   ```bash
-  # cut the keyframe on the box (the worker resolves URIs, so it must live there)
-  ssh P5-1 'docker exec h3-game bash -lc "ffmpeg -y -sseof -0.05 -i <clip>.mp4 -frames:v 1 \
-      /opt/dlami/nvme/vdn/outputs/prev_last.png"'
-  python3 scripts/game_client.py --keyframe /opt/dlami/nvme/vdn/outputs/prev_last.png "she turns and runs"
+  # cut the last frame of the clip you just fetched, locally -- the client inlines it as a data: URI
+  ffmpeg -y -sseof -0.05 -i out/game/<clip>.mp4 -frames:v 1 last_frame.png
+  python3 scripts/game_client.py --keyframe last_frame.png "she turns and runs"
   ```
 * **A visible wait.** The player types, waits ~11 s, gets a clip. Honest, and it is what the latency is.
 * **Not this:** a clip per player input at interaction latency (<200 ms), or continuous streamed video.
@@ -209,7 +225,7 @@ built a loop around an 8 s call.
 | `scripts/game_push.sh` | Mac | copies the five files each box needs, by ssh alias |
 | `scripts/game_serve.sh` | box | one replica: GPU auto-detect, lattice check, loopback bind |
 | `scripts/game_tunnel.sh` | Mac | one local port per replica, the ControlMaster socket, the replica file |
-| `scripts/game_client.py` | Mac | submit/poll/scp, one worker per replica, `--warm`, `--bench N` |
+| `scripts/game_client.py` | Mac | submit/poll/fetch, one worker per replica, `--warm`, `--bench N` |
 | `docker/h3.sh` | box | the container wrapper; `serve game` is this arm |
 
 `game_serve.sh` is deliberately separate from `scripts/sglang_arm.sh`. That file is the measurement
