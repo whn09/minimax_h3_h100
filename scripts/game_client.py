@@ -351,6 +351,11 @@ def main() -> int:
         if args.warm and not args.bench:
             r.warm()
             print("warmed every replica at this exact shape", file=sys.stderr)
+            # `--warm` with no prompt is a complete, useful invocation -- it is the startup step the
+            # README's quick start tells you to run once, and it used to warm the replicas and THEN
+            # exit 2 on "give a prompt".
+            if not args.prompt:
+                return 0
 
         if args.bench:
             # One discarded clip per replica first: the server cannot warm 480p itself (see
