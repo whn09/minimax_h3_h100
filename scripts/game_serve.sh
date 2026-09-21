@@ -34,6 +34,9 @@ MODEL=${MODEL:-OpenVDN/vdn-minimax-h3}
 PORT=${PORT:-30010}
 FRAMES=${FRAMES:-345}          # 14.375 s at 24 fps -- the shape RESULTS.md measured at 8.02 s
 CANVAS=${CANVAS:-864x480}
+# 127.0.0.1 by default; HOST=0.0.0.0 to let other machines reach it. See the --host note below --
+# there is NO authentication on this API, so the security group is the only thing gating it.
+HOST=${HOST:-127.0.0.1}
 export HF_HOME=${HF_HOME:-$VDNROOT/hf}
 export SGLANG_DIFFUSION_CACHE_ROOT=${SGLANG_DIFFUSION_CACHE_ROOT:-$ROOT/cache}
 
@@ -101,10 +104,17 @@ shift || true
 #                               time against a 6.70 s steady state. Fix it from the client side:
 #                               `game_client.py --warm` / `Renderer.warm()` throws away one clip per
 #                               replica at the real shape.
-# --host 127.0.0.1              loopback ONLY, deliberately. The way in from a laptop is the ssh
-#                               tunnel in game_tunnel.sh; binding 0.0.0.0 would put an unauthenticated
-#                               video generator on the VPC (and on the internet, if the security group
-#                               is ever widened) for no gain, since -L reaches loopback either way.
+# --host $HOST                  127.0.0.1 by default: from a laptop the way in is game_tunnel.sh's
+#                               ssh -L, which reaches loopback anyway, so binding wider buys nothing.
+#                               HOST=0.0.0.0 is for the case -L cannot serve: OTHER MACHINES calling
+#                               this API directly (a game server in the same VPC, a load generator).
+#                               Know what that means before you use it. The container runs
+#                               --network host, so 0.0.0.0 binds the instance's real interfaces, and
+#                               THERE IS NO AUTHENTICATION ON THIS API -- no key, no token, and
+#                               POST /v1/videos with an empty body is accepted and renders. The
+#                               security group is the entire access control. Keep the ingress rule
+#                               scoped to the VPC CIDR or to the caller's own SG; an 0.0.0.0/0 rule on
+#                               this port hands eight H100s to whoever finds the address.
 set -x
 sglang serve \
   --model-path "$MODEL" \
@@ -116,6 +126,6 @@ sglang serve \
   --performance-mode speed \
   --warmup-num-frames "$FRAMES" \
   --warmup-resolutions "$CANVAS" \
-  --host 127.0.0.1 --port "$PORT" \
+  --host "$HOST" --port "$PORT" \
   "$@" 2>&1 | tee "$LOG"
 exit "${PIPESTATUS[0]}"

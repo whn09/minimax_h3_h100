@@ -132,8 +132,40 @@ these run `sha256:d46a59f4b986…`, sglang `0.0.0.dev1+g20518d851`, bundled sour
 **`/opt/dlami/nvme` is instance store: the 78 GiB is gone after a stop/start** and the weights step
 runs again. That is the price of the fast disk, and the reason the image does not bake them in.
 
-The servers bind **127.0.0.1 only**, deliberately: `ssh -L` reaches loopback anyway, and `0.0.0.0`
-would put an unauthenticated video generator on the VPC for no gain.
+## Calling it from another machine (`HOST=0.0.0.0`)
+
+The default bind is **127.0.0.1**: from a laptop the way in is `game_tunnel.sh`'s `ssh -L`, which
+reaches loopback anyway, so binding wider buys nothing. When the caller is *another machine* — a game
+server in the same VPC, a load generator — a tunnel is the wrong shape and the bind has to widen:
+
+```bash
+cd /opt/dlami/nvme/vdn/docker
+bash h3.sh stop
+HOST=0.0.0.0 BASE=lmsysorg/sglang@sha256:d46a59f4b986… FRAMES=345 bash h3.sh serve game
+sudo ss -tlnp | grep 30010          # expect 0.0.0.0:30010, not 127.0.0.1:30010
+```
+
+The container runs `--network host`, so `0.0.0.0` binds the instance's real interfaces directly and no
+`-p` is involved. Then point the client at private IPs instead of tunnelled ports:
+
+```bash
+python3 scripts/game_client.py --replicas P5-1=172.31.45.68:30010,P5-2=172.31.33.181:30010 \
+    --keyframe last_frame.png "she turns and runs"
+```
+
+**In-region the network cost essentially vanishes**, which is the real argument for running the caller
+inside the VPC. Measured P5-2 → P5-1 across 172.31.0.0/16: `/health` in **2 ms**, a full render at
+**6.67 s** server, and the finished 2.6 MB clip downloaded via `/v1/videos/{id}/content` in **12 ms at
+225 MB/s**. Compare the laptop path, where the same download is 2–8 s and a 475 KB inline keyframe can
+take 12 s to *upload*. The 8.3 s on-box figure is what an in-VPC caller actually sees.
+
+**There is no authentication on this API.** No key, no token, and `POST /v1/videos` with an empty body
+`{}` is accepted — the server fills in defaults and renders. So with `0.0.0.0` the **security group is
+the entire access control**, and it is worth checking rather than assuming. Verified on this
+deployment: port 30010 answers from inside the VPC and is **filtered from the internet** — 8 s timeouts
+from both a laptop and an instance in us-west-1 against the public IPs, on `launch-wizard-1`. Keep the
+ingress rule scoped to the VPC CIDR or to the caller's own security group; an `0.0.0.0/0` rule on this
+port hands eight H100s to whoever finds the address, and the first symptom would be a rendering bill.
 
 ## GPU count, if you ever run this on a smaller box
 
